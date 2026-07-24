@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>结算与开票管理子系统 · UI 原型</title>
+<style>
+/* ============ Design Tokens（源自合同管理系统 UI 设计规范 V1.0） ============ */
+:root{
+  --primary:#2563EB; --primary-light:#3B82F6; --primary-dark:#1D4ED8; --primary-bg:#EFF6FF;
+  --accent:#059669;  --accent-bg:#ECFDF5;
+  --warning:#F59E0B; --warning-bg:#FEF3C7;
+  --danger:#DC2626;  --danger-bg:#FEF2F2;
+  --purple:#8B5CF6;  --purple-bg:#F5F3FF;
+  --bg:#F8FAFC; --card:#FFFFFF; --card-border:#E4ECFC;
+  --sidebar:#0F172A; --sidebar-active:#1E3A5F; --sidebar-hover:#1E293B;
+  --text:#0F172A; --text-secondary:#475569; --text-muted:#64748B; --text-placeholder:#94A3B8;
+  --radius-sm:6px; --radius:8px; --radius-md:10px; --radius-lg:12px; --radius-xl:16px;
+  --shadow-sm:0 1px 3px rgba(0,0,0,.06); --shadow-md:0 2px 6px rgba(0,0,0,.04); --shadow-lg:0 4px 20px rgba(0,0,0,.08);
+  --font:'PingFang SC','Microsoft YaHei',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font);font-size:14px;color:var(--text);background:var(--bg);-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-thumb{background:#CBD5E1;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#94A3B8}
+button{font-family:inherit;cursor:pointer}
+a{color:var(--primary);text-decoration:none}
+
+/* ============ Layout ============ */
+.app{display:flex;min-height:100vh}
+.sidebar{width:232px;flex-shrink:0;background:var(--sidebar);color:#CBD5E1;display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:10px;padding:18px 20px;border-bottom:1px solid rgba(255,255,255,.06)}
+.brand .logo{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--primary),var(--primary-dark));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:15px}
+.brand .name{color:#fff;font-size:14px;font-weight:600;line-height:1.2}
+.brand .sub{color:#64748B;font-size:11px}
+.nav{padding:12px 12px;flex:1;overflow-y:auto}
+.nav-group{font-size:11px;color:#64748B;padding:14px 12px 6px;letter-spacing:.04em}
+.nav-item{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:var(--radius);color:#CBD5E1;font-size:13.5px;cursor:pointer;transition:background .15s,color .15s;position:relative;margin-bottom:2px}
+.nav-item svg{width:18px;height:18px;flex-shrink:0}
+.nav-item:hover{background:var(--sidebar-hover);color:#fff}
+.nav-item.active{background:var(--sidebar-active);color:#fff}
+.nav-item.active::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);width:3px;height:20px;background:var(--primary-light);border-radius:0 3px 3px 0}
+.sidebar-foot{padding:14px 20px;border-top:1px solid rgba(255,255,255,.06);font-size:11px;color:#64748B}
+
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+.topbar{height:60px;background:var(--card);border-bottom:1px solid var(--card-border);display:flex;align-items:center;justify-content:space-between;padding:0 24px;position:sticky;top:0;z-index:20}
+.crumbs{font-size:13px;color:var(--text-muted)}
+.crumbs b{color:var(--text-secondary);font-weight:600}
+.top-right{display:flex;align-items:center;gap:14px}
+.icon-btn{width:34px;height:34px;border-radius:var(--radius);border:1px solid var(--card-border);background:#fff;display:flex;align-items:center;justify-content:center;color:var(--text-muted);position:relative}
+.icon-btn:hover{color:var(--primary);border-color:var(--primary-light)}
+.icon-btn .dot{position:absolute;top:7px;right:8px;width:7px;height:7px;border-radius:50%;background:var(--danger);border:2px solid #fff}
+.avatar{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--purple),#6D28D9);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
+.content{padding:24px;flex:1}
+
+/* ============ Page header ============ */
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:20px;gap:16px;flex-wrap:wrap}
+.page-head h1{font-size:20px;font-weight:700;color:var(--text)}
+.page-head .desc{font-size:13px;color:var(--text-muted);margin-top:4px}
+.head-actions{display:flex;gap:10px}
+
+/* ============ Buttons ============ */
+.btn{display:inline-flex;align-items:center;gap:6px;border:none;border-radius:var(--radius);font-size:13px;font-weight:500;padding:8px 14px;transition:all .15s;white-space:nowrap}
+.btn svg{width:15px;height:15px}
+.btn.primary{background:var(--primary);color:#fff}
+.btn.primary:hover{background:var(--primary-dark);box-shadow:var(--shadow-md);transform:translateY(-1px)}
+.btn.default{background:var(--bg);color:var(--text-secondary);border:1px solid var(--card-border)}
+.btn.default:hover{color:var(--primary);border-color:var(--primary-light);background:var(--primary-bg)}
+.btn.danger{background:var(--danger);color:#fff}
+.btn.danger:hover{background:#B91C1C;box-shadow:var(--shadow-md)}
+.btn.sm{padding:6px 10px;font-size:12px}
+.btn.ghost{background:transparent;color:var(--primary);padding:6px 10px;font-size:12.5px}
+.btn.ghost:hover{background:var(--primary-bg)}
+
+/* ============ Card ============ */
+.card{background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);margin-bottom:16px}
+.card-body{padding:20px 22px}
+.card-title{font-size:15px;font-weight:600;margin:0 0 14px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.card-title .meta{font-size:12px;color:var(--text-muted);font-weight:400}
+.card-title .acts{display:flex;gap:8px}
+
+/* ============ Stat cards ============ */
+.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-lg);padding:18px 20px;box-shadow:var(--shadow-sm);position:relative;overflow:hidden;transition:transform .2s,box-shadow .2s}
+.stat::before{content:"";position:absolute;top:0;left:0;width:4px;height:100%}
+.stat.blue::before{background:var(--primary)}
+.stat.green::before{background:var(--accent)}
+.stat.orange::before{background:var(--warning)}
+.stat.purple::before{background:var(--purple)}
+.stat:hover{transform:translateY(-2px);box-shadow:var(--shadow-md)}
+.stat .label{font-size:12px;color:var(--text-muted)}
+.stat .value{font-size:27px;font-weight:700;color:var(--text);margin:6px 0 4px;letter-spacing:-.01em}
+.stat .value .unit{font-size:14px;font-weight:500;color:var(--text-muted);margin-left:2px}
+.stat .trend{font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:3px}
+.trend.up{color:var(--accent)} .trend.down{color:var(--danger)} .trend.flat{color:var(--text-muted)}
+
+/* ============ Dashboard grid ============ */
+.dashboard-grid{display:grid;grid-template-columns:2fr 1fr;gap:16px;align-items:start}
+
+/* ============ Badges ============ */
+.badge{display:inline-flex;align-items:center;font-size:12px;font-weight:600;padding:3px 9px;border-radius:var(--radius-sm);line-height:1.4}
+.badge.success{background:var(--accent-bg);color:var(--accent)}
+.badge.info{background:var(--primary-bg);color:var(--primary)}
+.badge.warning{background:var(--warning-bg);color:#D97706}
+.badge.danger{background:var(--danger-bg);color:var(--danger)}
+.badge.purple{background:var(--purple-bg);color:var(--purple)}
+.badge.gray{background:#F1F5F9;color:var(--text-placeholder)}
+
+/* ============ Table ============ */
+.table-wrap{background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-lg);overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{background:#F8FAFC;color:var(--text-muted);font-weight:600;text-align:left;padding:12px 16px;font-size:12.5px;border-bottom:1px solid var(--card-border);white-space:nowrap}
+tbody td{padding:12px 16px;border-bottom:1px solid #F1F5F9;color:var(--text-secondary);vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:#FAFCFF}
+.rank{width:22px;height:22px;border-radius:50%;background:var(--bg);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--text-muted)}
+.rank.top{background:var(--danger-bg);color:var(--danger)}
+.mono{font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
+.tlink{color:var(--primary);cursor:pointer}
+.tlink:hover{text-decoration:underline}
+.row-actions{display:flex;gap:6px}
+.empty{padding:48px 20px;text-align:center;color:var(--text-placeholder);font-size:13px}
+
+/* ============ Search bar ============ */
+.searchbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.searchbar .field{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--card-border);border-radius:var(--radius-md);padding:8px 12px}
+.searchbar .field svg{width:15px;height:15px;color:var(--text-placeholder)}
+.searchbar input,.searchbar select{background:transparent;border:none;outline:none;font-size:13px;color:var(--text);font-family:inherit}
+.searchbar input{width:200px}
+.searchbar select{min-width:130px;cursor:pointer}
+
+/* ============ Aging bars ============ */
+.aging-row{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #F1F5F9}
+.aging-row:last-child{border-bottom:none}
+.aging-row .seg{width:84px;font-size:13px;color:var(--text-secondary);flex-shrink:0}
+.aging-bar{flex:1;height:10px;background:var(--bg);border-radius:6px;overflow:hidden}
+.aging-bar i{display:block;height:100%;border-radius:6px}
+.aging-row .amt{width:120px;text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
+.aging-row .pct{width:46px;text-align:right;font-size:12px;color:var(--text-muted)}
+
+/* ============ Tabs ============ */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--card-border);margin-bottom:16px}
+.tab{padding:10px 16px;font-size:13.5px;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color .15s}
+.tab:hover{color:var(--text-secondary)}
+.tab.active{color:var(--primary);border-bottom-color:var(--primary);font-weight:600}
+
+/* ============ Todo list ============ */
+.todo{display:flex;align-items:center;gap:12px;padding:12px 4px;border-bottom:1px solid #F1F5F9}
+.todo:last-child{border-bottom:none}
+.todo .ic{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.todo .ic.blue{background:var(--primary-bg);color:var(--primary)}
+.todo .ic.orange{background:var(--warning-bg);color:#D97706}
+.todo .ic.purple{background:var(--purple-bg);color:var(--purple)}
+.todo .ic.green{background:var(--accent-bg);color:var(--accent)}
+.todo .txt{flex:1;min-width:0}
+.todo .txt .t{font-size:13.5px;color:var(--text);font-weight:500}
+.todo .txt .s{font-size:12px;color:var(--text-muted);margin-top:2px}
+
+/* ============ Modal ============ */
+.overlay{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;z-index:100;padding:20px}
+.overlay.show{display:flex}
+.modal{background:#fff;border-radius:var(--radius-xl);width:480px;max-width:100%;box-shadow:var(--shadow-lg);animation:pop .2s ease-out}
+@keyframes pop{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:none}}
+.modal-head{padding:18px 22px;border-bottom:1px solid var(--card-border);display:flex;align-items:center;justify-content:space-between}
+.modal-head h3{font-size:16px;font-weight:600}
+.modal-head .x{width:30px;height:30px;border-radius:8px;border:none;background:var(--bg);color:var(--text-muted);font-size:18px;line-height:1}
+.modal-head .x:hover{background:var(--danger-bg);color:var(--danger)}
+.modal-body{padding:22px;max-height:60vh;overflow-y:auto}
+.modal-foot{padding:16px 22px;border-top:1px solid var(--card-border);display:flex;justify-content:flex-end;gap:10px}
+.form-row{display:flex;align-items:center;gap:14px;margin-bottom:16px}
+.form-row label{width:96px;font-size:13px;color:var(--text-secondary);flex-shrink:0}
+.form-row .val{font-size:13.5px;color:var(--text);font-weight:500}
+.form-row input,.form-row select{flex:1;padding:9px 12px;border:1px solid var(--card-border);border-radius:var(--radius);font-size:13px;font-family:inherit;outline:none;transition:border .15s,box-shadow .15s}
+.form-row input:focus,.form-row select:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+.note{font-size:12px;color:var(--text-muted);background:var(--bg);border-radius:var(--radius);padding:10px 12px;margin-top:4px;line-height:1.6}
+
+/* ============ View transition ============ */
+.view{display:none;animation:fade .25s ease-out}
+.view.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* ============ Edit / Detail pages ============ */
+.section-bar{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.back-link{display:inline-flex;align-items:center;gap:5px;color:var(--text-muted);font-size:13px;padding:6px 10px;border-radius:var(--radius);cursor:pointer;transition:.15s;font-weight:500}
+.back-link:hover{background:var(--bg);color:var(--primary)}
+.back-link svg{width:15px;height:15px}
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.kv{display:flex;align-items:flex-start;gap:12px;padding:11px 0;border-bottom:1px solid #F1F5F9;font-size:13.5px}
+.kv:last-child{border-bottom:none}
+.kv .k{color:var(--text-muted);width:108px;flex-shrink:0}
+.kv .v{color:var(--text);font-weight:500;flex:1;word-break:break-all}
+.kv .v.mono{font-variant-numeric:tabular-nums}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px}
+.form-grid .full{grid-column:1/-1}
+.form-row textarea{width:100%;padding:9px 12px;border:1px solid var(--card-border);border-radius:var(--radius);font-size:13px;font-family:inherit;outline:none;resize:vertical;transition:border .15s,box-shadow .15s;line-height:1.6}
+.form-row textarea:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+.verify{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-radius:var(--radius);font-size:13px;line-height:1.6;margin-top:4px}
+.verify.ok{background:var(--accent-bg);color:#065F46}
+.verify.warn{background:var(--warning-bg);color:#92400E}
+.verify svg{width:16px;height:16px;flex-shrink:0;margin-top:2px}
+.timeline{position:relative;padding-left:22px}
+.timeline::before{content:"";position:absolute;left:6px;top:4px;bottom:4px;width:2px;background:var(--card-border)}
+.timeline .tl{position:relative;padding:0 0 16px}
+.timeline .tl:last-child{padding-bottom:0}
+.timeline .tl::before{content:"";position:absolute;left:-19px;top:3px;width:11px;height:11px;border-radius:50%;background:#fff;border:2px solid var(--primary)}
+.timeline .tl.ok::before{border-color:var(--accent);background:var(--accent)}
+.timeline .tl.warn::before{border-color:var(--warning);background:var(--warning)}
+.timeline .tl .tl-t{font-size:13.5px;font-weight:500;color:var(--text)}
+.timeline .tl .tl-s{font-size:12px;color:var(--text-muted);margin-top:2px;line-height:1.6}
+
+/* ============ Upload ============ */
+.upload-drop{border:2px dashed var(--card-border);border-radius:var(--radius-lg);background:var(--bg);padding:30px 20px;text-align:center;cursor:pointer;transition:border .15s,background .15s,color .15s;color:var(--text-muted)}
+.upload-drop:hover,.upload-drop.drag{border-color:var(--primary);background:var(--primary-bg);color:var(--primary)}
+.upload-drop svg{width:34px;height:34px;margin-bottom:8px;opacity:.7}
+.upload-drop .t{font-size:13.5px;font-weight:500;color:var(--text-secondary)}
+.upload-drop .meta{font-size:12px;color:var(--text-muted);margin-top:4px}
+.upload-file{display:flex;align-items:center;gap:10px;padding:12px 14px;border:1px solid var(--card-border);border-radius:var(--radius);background:#fff;margin-top:10px}
+.upload-file .fic{width:32px;height:32px;border-radius:8px;background:var(--primary-bg);color:var(--primary);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.upload-file .fn{flex:1;font-size:13px;color:var(--text);font-weight:500;word-break:break-all}
+.upload-file .x{width:26px;height:26px;border-radius:6px;border:none;background:var(--bg);color:var(--text-muted);font-size:16px;line-height:1;flex-shrink:0}
+.upload-file .x:hover{background:var(--danger-bg);color:var(--danger)}
+
+/* ============ Responsive ============ */
+@media(max-width:900px){.detail-grid{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}}
+@media(max-width:1280px){
+  .stat-row{grid-template-columns:repeat(2,1fr)}
+  .dashboard-grid{grid-template-columns:1fr}
+}
+@media(max-width:768px){
+  .sidebar{width:64px}
+  .brand .name,.brand .sub,.nav-group,.nav-item span,.sidebar-foot{display:none}
+  .nav-item{justify-content:center}
+  .content{padding:16px}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ============ Sidebar ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">结</div>
+      <div>
+        <div class="name">结算与开票</div>
+        <div class="sub">测评业务全生命周期</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <div class="nav-group">工作台</div>
+      <div class="nav-item active" data-view="dashboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+        <span>经营看板</span>
+      </div>
+      <div class="nav-group">结算管理</div>
+      <div class="nav-item" data-view="plan">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/></svg>
+        <span>收款计划</span>
+      </div>
+      <div class="nav-item" data-view="invoice">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 2h9l5 5v15H6z"/><path d="M14 2v6h6M9 13h6M9 17h6"/></svg>
+        <span>开票管理</span>
+      </div>
+      <div class="nav-item" data-view="invoice-detail">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>
+        <span>发票详情</span>
+      </div>
+      <div class="nav-item" data-view="reconcile">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 12a8 8 0 0 1 13-6.3M20 12a8 8 0 0 1-13 6.3"/><path d="M17 3v3h-3M7 21v-3h3"/></svg>
+        <span>回款核销</span>
+      </div>
+      <div class="nav-item" data-view="aging">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v18M5 8h14M5 13h14M7 3h10"/></svg>
+        <span>账龄催收</span>
+      </div>
+      <div class="nav-group">业务操作</div>
+      <div class="nav-item" data-view="edit-plan">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+        <span>收款计划编辑</span>
+      </div>
+      <div class="nav-item" data-view="edit-invoice">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M12 12v6M9 15h6"/></svg>
+        <span>开票申请</span>
+      </div>
+      <div class="nav-item" data-view="edit-receipt">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h18v13H3zM3 7l2-3h14l2 3M12 11v5M9 13h6"/></svg>
+        <span>登记回款</span>
+      </div>
+    </nav>
+    <div class="sidebar-foot">V1.1 · 设计规范对齐合同管理系统</div>
+  </aside>
+
+  <!-- ============ Main ============ -->
+  <div class="main">
+    <header class="topbar">
+      <div class="crumbs">结算与开票管理 / <b id="crumb">经营看板</b></div>
+      <div class="top-right">
+        <button class="icon-btn" title="提醒"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="17" height="17"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg><span class="dot"></span></button>
+        <button class="icon-btn" title="刷新"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="17" height="17"><path d="M21 12a9 9 0 1 1-3-6.7M21 4v5h-5"/></svg></button>
+        <div class="avatar">财</div>
+      </div>
+    </header>
+
+    <main class="content">
+      <!-- ===================== 经营看板 ===================== -->
+      <section class="view active" id="dashboard">
+        <div class="page-head">
+          <div><h1>经营看板</h1><div class="desc">应收、开票、回款与逾期全景视图 · 数据截至 2026-07-15</div></div>
+          <div class="head-actions"><button class="btn default"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>导出报表</button><button class="btn primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"/></svg>发起开票</button></div>
+        </div>
+
+        <div class="stat-row">
+          <div class="stat blue"><div class="label">应收总额（未结清）</div><div class="value">¥780<span class="unit">万</span></div><div class="trend up">▲ 较上月 +12%</div></div>
+          <div class="stat green"><div class="label">本月已回款</div><div class="value">¥326<span class="unit">万</span></div><div class="trend up">▲ +8.4%</div></div>
+          <div class="stat orange"><div class="label">待开票金额</div><div class="value">¥200<span class="unit">万</span></div><div class="trend flat">— 11 笔待处理</div></div>
+          <div class="stat purple"><div class="label">逾期金额</div><div class="value">¥130<span class="unit">万</span></div><div class="trend down">▼ 需催收 6 笔</div></div>
+        </div>
+
+        <div class="dashboard-grid">
+          <div>
+            <div class="card">
+              <div class="card-body">
+                <div class="card-title">待办事项 <span class="meta">需我处理</span></div>
+                <div class="todo"><div class="ic orange"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="18" height="18"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18"/></svg></div><div class="txt"><div class="t">2 笔收款计划待销售确认</div><div class="s">YS-2026-0002 / YS-2026-0005 · 时间金额可编辑</div></div><button class="btn ghost" onclick="go('plan')">去确认</button></div>
+                <div class="todo"><div class="ic blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="18" height="18"><path d="M6 2h9l5 5v15H6z"/></svg></div><div class="txt"><div class="t">3 笔开票申请待财务审核</div><div class="s">INV-2026-0031 等 · 校验税号/金额一致性</div></div><button class="btn ghost" onclick="go('invoice')">去审核</button></div>
+                <div class="todo"><div class="ic purple"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="18" height="18"><path d="M4 12a8 8 0 0 1 13-6.3M20 12a8 8 0 0 1-13 6.3"/></svg></div><div class="txt"><div class="t">4 笔核销单待会计确认</div><div class="s">HX-2026-0005 等 · 确认后更新回款状态</div></div><button class="btn ghost" onclick="go('reconcile')">去核销</button></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-body">
+                <div class="card-title">应收账款账龄分布 <span class="meta">单位：万元</span></div>
+                <div class="aging-row"><div class="seg">0–30 天</div><div class="aging-bar"><i style="width:45%;background:var(--accent)"></i></div><div class="amt">¥350</div><div class="pct">45%</div></div>
+                <div class="aging-row"><div class="seg">31–60 天</div><div class="aging-bar"><i style="width:23%;background:var(--primary-light)"></i></div><div class="amt">¥180</div><div class="pct">23%</div></div>
+                <div class="aging-row"><div class="seg">61–90 天</div><div class="aging-bar"><i style="width:15%;background:var(--warning)"></i></div><div class="amt">¥120</div><div class="pct">15%</div></div>
+                <div class="aging-row"><div class="seg">90 天以上</div><div class="aging-bar"><i style="width:17%;background:var(--danger)"></i></div><div class="amt">¥130</div><div class="pct">17%</div></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="card-title">开票未回款 TOP10</div>
+              <table>
+                <thead><tr><th style="width:36px">#</th><th>客户</th><th>应收单</th><th style="text-align:right">金额</th><th>状态</th></tr></thead>
+                <tbody id="top10"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 收款计划 ===================== -->
+      <section class="view" id="plan">
+        <div class="page-head">
+          <div><h1>收款计划</h1><div class="desc">合同生效按付款节点自动生成应收单，销售确认后纳入催收口径</div></div>
+          <div class="head-actions"><button class="btn default"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="15" height="15"><path d="M21 12a9 9 0 1 1-3-6.7M21 4v5h-5"/></svg>刷新</button><button class="btn primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="15" height="15"><path d="M12 5v14M5 12h14"/></svg>人工发起</button></div>
+        </div>
+
+        <div class="searchbar">
+          <div class="field"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input placeholder="搜索合同号 / 客户 / 应收单号" /></div>
+          <select><option>全部确认状态</option><option>待确认</option><option>已确认</option></select>
+          <select><option>全部状态</option><option>未到期</option><option>即将到期</option><option>逾期</option><option>已结清</option></select>
+          <button class="btn default sm">查询</button>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>应收单号</th><th>合同号</th><th>客户</th><th>期次</th><th>计划收款日</th><th style="text-align:right">计划金额</th><th>确认状态</th><th>状态</th><th style="width:120px">操作</th></tr></thead>
+            <tbody id="planBody"></tbody>
+          </table>
+        </div>
+        <div class="pagination-box"></div>
+      </section>
+
+      <!-- ===================== 开票管理 ===================== -->
+      <section class="view" id="invoice">
+        <div class="page-head">
+          <div><h1>开票管理</h1><div class="desc">关联合同发起开票申请，财务审核通过后驱动金税开票并回填</div></div>
+          <div class="head-actions"><button class="btn primary" onclick="goEditInvoice('new')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="15" height="15"><path d="M12 5v14M5 12h14"/></svg>发起开票申请</button></div>
+        </div>
+
+        <div class="tabs">
+          <div class="tab active" data-tab="inv-req">开票申请</div>
+          <div class="tab" data-tab="inv-list">发票台账</div>
+        </div>
+
+        <div class="tab-panel" id="inv-req">
+          <div class="searchbar">
+            <div class="field"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input placeholder="搜索申请号 / 合同号 / 购方" /></div>
+            <select><option>全部状态</option><option>待审核</option><option>已通过</option><option>已驳回</option><option>已开票</option></select>
+            <button class="btn default sm">查询</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>申请号</th><th>合同号</th><th>购方名称</th><th>税号</th><th style="text-align:right">金额</th><th>税率</th><th>状态</th><th style="width:130px">操作</th></tr></thead>
+              <tbody id="invReqBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="tab-panel" id="inv-list" style="display:none">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>发票号</th><th>类型</th><th style="text-align:right">金额</th><th>开票日期</th><th>红冲关联</th><th style="width:110px">操作</th></tr></thead>
+              <tbody id="invListBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 回款核销 ===================== -->
+      <section class="view" id="reconcile">
+        <div class="page-head">
+          <div><h1>回款核销</h1><div class="desc">会计录入回款，系统按客户+合同+金额自动匹配生成核销单，确认后生效</div></div>
+          <div class="head-actions"><button class="btn primary" onclick="goReceipt()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="15" height="15"><path d="M12 5v14M5 12h14"/></svg>登记回款</button></div>
+        </div>
+
+        <div class="tabs">
+          <div class="tab active" data-tab="rcpt">回款记录</div>
+          <div class="tab" data-tab="hx">核销单</div>
+        </div>
+
+        <div class="tab-panel" id="rcpt">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>回款号</th><th>客户</th><th style="text-align:right">金额</th><th>回款日期</th><th>方式</th><th>银行凭证号</th><th>状态</th></tr></thead>
+              <tbody id="rcptBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="tab-panel" id="hx" style="display:none">
+          <div class="searchbar">
+            <select><option>全部状态</option><option>待确认</option><option>已确认</option><option>已驳回</option></select>
+            <button class="btn default sm">查询</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>核销单号</th><th>回款号</th><th>应收单号</th><th style="text-align:right">核销金额</th><th>匹配方式</th><th>确认人</th><th>状态</th><th style="width:110px">操作</th></tr></thead>
+              <tbody id="hxBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 账龄催收 ===================== -->
+      <section class="view" id="aging">
+        <div class="page-head">
+          <div><h1>账龄催收</h1><div class="desc">按账龄区间统计应收，逾期自动提醒销售，超期上报法务/管理层</div></div>
+          <div class="head-actions"><button class="btn default"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="15" height="15"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>导出账龄表</button></div>
+        </div>
+
+        <div class="stat-row">
+          <div class="stat blue"><div class="label">应收总额</div><div class="value">¥780<span class="unit">万</span></div><div class="trend flat">— 4 个区间</div></div>
+          <div class="stat orange"><div class="label">逾期笔数</div><div class="value">6<span class="unit">笔</span></div><div class="trend down">▼ 含 2 笔超 90 天</div></div>
+          <div class="stat green"><div class="label">已提醒销售</div><div class="value">6<span class="unit">次</span></div><div class="trend up">▲ 100% 覆盖</div></div>
+          <div class="stat purple"><div class="label">已升级法务</div><div class="value">2<span class="unit">笔</span></div><div class="trend flat">— 逾期 30 天+</div></div>
+        </div>
+
+        <div class="card">
+          <div class="card-body">
+            <div class="card-title">账龄区间报表 <span class="meta">单位：万元</span></div>
+            <table>
+              <thead><tr><th>账龄区间</th><th style="text-align:right">金额</th><th style="text-align:right">占比</th><th style="text-align:right">笔数</th><th>状态</th></tr></thead>
+              <tbody id="agingBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-body">
+            <div class="card-title">催收提醒记录 <span class="meta">仅内部提醒，不向客户发送</span></div>
+            <div class="table-wrap" style="border:none">
+              <table>
+                <thead><tr><th>记录ID</th><th>应收单号</th><th>渠道</th><th>发送时间</th><th>接收人</th><th>升级标记</th></tr></thead>
+                <tbody id="dunBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 收款计划编辑页 ===================== -->
+      <section class="view" id="edit-plan">
+        <div class="section-bar"><div class="back-link" onclick="go('plan')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>返回收款计划</div></div>
+        <div class="page-head">
+          <div><h1>收款计划编辑</h1><div class="desc">销售确认收款计划，可编辑计划收款日与金额，修改将留痕</div></div>
+          <div class="head-actions"><button class="btn default" onclick="goEditPlan()">重置</button><button class="btn primary" onclick="savePlan()">确认并保存</button></div>
+        </div>
+        <div class="detail-grid">
+          <div class="card">
+            <div class="card-body">
+              <div class="card-title">基本信息 <span class="meta">只读</span></div>
+              <div class="kv"><span class="k">应收单号</span><span class="v mono" id="ep-no">—</span></div>
+              <div class="kv"><span class="k">合同号</span><span class="v mono" id="ep-ht">—</span></div>
+              <div class="kv"><span class="k">客户 / 期次</span><span class="v" id="ep-cust">—</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-body">
+              <div class="card-title">计划内容 <span class="meta">可编辑</span></div>
+              <div class="form-row"><label>计划收款日</label><input type="date" id="ep-date" /></div>
+              <div class="form-row"><label>计划金额(元)</label><input type="number" id="ep-amt" /></div>
+              <div class="note">金额单位为元。修改后将记录原值与新值，确认后纳入催收与账龄统计口径。</div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <div class="card-title">修改留痕 <span class="meta">操作审计</span></div>
+            <div class="timeline" id="ep-audit"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 开票申请编辑页 ===================== -->
+      <section class="view" id="edit-invoice">
+        <div class="section-bar"><div class="back-link" onclick="go('invoice')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>返回开票管理</div></div>
+        <div class="page-head">
+          <div><h1 id="ei-title">开票申请</h1><div class="desc">关联合同填写购方与开票信息，系统自动校验一致性并查重</div></div>
+          <div class="head-actions"><button class="btn default" onclick="goEditInvoice('new')">暂存草稿</button><button class="btn primary" onclick="saveInvoice()">提交审核</button></div>
+        </div>
+        <div class="detail-grid">
+          <div class="card">
+            <div class="card-body">
+              <div class="card-title">关联合同与申请</div>
+              <div class="form-row"><label>申请号</label><div class="val" id="ei-no">—</div></div>
+              <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>关联合同</label>
+                <select id="ei-ht"><option>HT-2026-0123（杭州某科技公司）</option><option>HT-2026-0145（宁波检测中心）</option><option>HT-2026-0158（温州质检院）</option><option>HT-2026-0160（绍兴测评所）</option></select>
+              </div>
+              <div class="note">开票须关联有效合同，系统将带出合同付款进度用于金额校验。</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-body">
+              <div class="card-title">购方信息</div>
+              <div class="form-grid">
+                <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>购方名称</label><input id="ei-cust" placeholder="请输入购方全称" /></div>
+                <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>纳税人识别号</label><input id="ei-tax" placeholder="15–20 位税号" /></div>
+                <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>地址 / 电话</label><input id="ei-addr" placeholder="注册地址及电话" /></div>
+                <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>开户行 / 账号</label><input id="ei-bank" placeholder="开户行及银行账号" /></div>
+              </div>
+              <div class="verify ok" id="ei-verify-tax">系统已校验税号格式合法、与购方名称匹配。</div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <div class="card-title">开票内容</div>
+            <div class="form-grid">
+              <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>货物或应税劳务</label><input id="ei-item" value="测评技术服务费" /></div>
+              <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>金额(不含税)</label><input type="number" id="ei-amt" value="113207" oninput="recomputeInvoice()" /></div>
+              <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>税率</label><select id="ei-rate" onchange="recomputeInvoice()"><option>6%</option><option>3%</option><option>13%</option></select></div>
+              <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>价税合计</label><div class="val" id="ei-total" style="font-size:18px;color:var(--primary);font-weight:700">¥120,000</div></div>
+            </div>
+            <div class="verify ok" id="ei-verify-amount">校验通过：金额未超出合同已确认应收，且无重复开票申请。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 登记回款页 ===================== -->
+      <section class="view" id="edit-receipt">
+        <div class="section-bar"><div class="back-link" onclick="go('reconcile')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>返回回款核销</div></div>
+        <div class="page-head">
+          <div><h1>登记回款</h1><div class="desc">会计录入客户回款，提交后系统自动匹配生成核销单待确认</div></div>
+          <div class="head-actions"><button class="btn default" onclick="go('reconcile')">取消</button><button class="btn primary" onclick="saveReceipt()">提交登记</button></div>
+        </div>
+        <div class="detail-grid">
+          <div class="card">
+            <div class="card-body">
+              <div class="card-title">回款信息</div>
+              <div class="form-grid">
+                <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>回款客户</label><select id="er-cust"><option>宁波检测中心</option><option>杭州某科技公司</option><option>温州质检院</option><option>绍兴测评所</option><option>嘉兴检测公司</option></select></div>
+                <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>回款金额(元)</label><input type="number" id="er-amt" placeholder="请输入回款金额" /></div>
+                <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>回款日期</label><input type="date" id="er-date" value="2026-07-15" /></div>
+                <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>回款方式</label><select id="er-way"><option>电汇</option><option>承兑</option><option>支票</option><option>现金</option></select></div>
+                <div class="form-row full" style="flex-direction:column;align-items:stretch;gap:6px"><label>银行凭证号</label><input id="er-bk" placeholder="银行回单流水号" /></div>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-body">
+              <div class="card-title">自动匹配预览</div>
+              <div class="note">提交后系统按「客户 + 合同 + 金额」自动匹配应收单，生成核销单（状态=待确认），由会计确认后生效；支持部分核销与手动指定。</div>
+              <div class="timeline" id="er-preview"></div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <div class="card-title">备注</div>
+            <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px"><label>备注说明</label><textarea id="er-remark" rows="3" placeholder="长款 / 短款 / 不明款项可在此说明，将进入差异处理流程"></textarea></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 发票详情页 ===================== -->
+      <section class="view" id="invoice-detail">
+        <div class="section-bar"><div class="back-link" onclick="go('invoice')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>返回发票台账</div></div>
+        <div class="page-head">
+          <div><h1>发票详情</h1><div class="desc">电子发票交付与红冲管理</div></div>
+          <div class="head-actions">
+            <button class="btn default" onclick="openUpload(currentInvoiceNo)">上传电子发票</button>
+            <button class="btn default" id="id-redflush" onclick="alert('已发起红冲，将生成红票并关联原蓝票')">红冲</button>
+            <button class="btn primary" onclick="alert('开始下载电子发票')">下载电子发票</button>
+          </div>
+        </div>
+        <div class="stat-row" style="grid-template-columns:repeat(3,1fr)">
+          <div class="stat blue"><div class="label">发票号码</div><div class="value" style="font-size:18px" id="id-no">—</div></div>
+          <div class="stat green"><div class="label">价税合计</div><div class="value" id="id-amt">—</div></div>
+          <div class="stat purple"><div class="label">状态</div><div class="value" style="font-size:18px" id="id-st">—</div></div>
+        </div>
+        <div class="detail-grid">
+          <div class="card"><div class="card-body"><div class="card-title">发票信息</div>
+            <div class="kv"><span class="k">发票类型</span><span class="v" id="id-type">—</span></div>
+            <div class="kv"><span class="k">开票日期</span><span class="v mono" id="id-date">—</span></div>
+            <div class="kv"><span class="k">税率</span><span class="v" id="id-rate">—</span></div>
+            <div class="kv"><span class="k">红冲关联</span><span class="v mono" id="id-ref">—</span></div>
+          </div></div>
+          <div class="card"><div class="card-body"><div class="card-title">购方信息</div>
+            <div class="kv"><span class="k">购方名称</span><span class="v" id="id-cust">—</span></div>
+            <div class="kv"><span class="k">纳税人识别号</span><span class="v mono" id="id-tax">—</span></div>
+            <div class="kv"><span class="k">开户行 / 账号</span><span class="v" id="id-bank">—</span></div>
+          </div></div>
+          <div class="card"><div class="card-body"><div class="card-title">交付信息</div>
+            <div class="kv"><span class="k">交付状态</span><span class="v" id="id-deliver">—</span></div>
+            <div class="kv"><span class="k">电子发票</span><span class="v"><a href="#" onclick="alert('已复制电子发票下载链接');return false">下载链接</a></span></div>
+            <div class="kv"><span class="k">关联申请 / 合同</span><span class="v mono" id="id-req">—</span></div>
+          </div></div>
+          <div class="card"><div class="card-body"><div class="card-title">开票记录</div>
+            <div class="timeline" id="id-timeline"></div>
+          </div></div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- ============ Modal: 收款计划确认/编辑 ============ -->
+<div class="overlay" id="modalPlan">
+  <div class="modal">
+    <div class="modal-head"><h3>收款计划确认 / 编辑</h3><button class="x" onclick="closeModal('modalPlan')">×</button></div>
+    <div class="modal-body">
+      <div class="form-row"><label>应收单号</label><div class="val" id="mp-no">—</div></div>
+      <div class="form-row"><label>合同号</label><div class="val" id="mp-ht">—</div></div>
+      <div class="form-row"><label>客户 / 期次</label><div class="val" id="mp-cust">—</div></div>
+      <div class="form-row"><label>计划收款日</label><input type="date" id="mp-date" value="2026-07-20" /></div>
+      <div class="form-row"><label>计划金额</label><input type="number" id="mp-amt" value="120000" /></div>
+      <div class="note">说明：销售可编辑时间与金额，修改将留痕（操作人 / 时间 / 原值）。确认后该应收单纳入催收与账龄统计口径。</div>
+    </div>
+    <div class="modal-foot"><button class="btn default" onclick="closeModal('modalPlan')">取消</button><button class="btn primary" onclick="confirmPlan()">确认并保存</button></div>
+  </div>
+</div>
+
+<!-- ============ Modal: 开票审核 ============ -->
+<div class="overlay" id="modalInvoice">
+  <div class="modal">
+    <div class="modal-head"><h3>开票申请审核</h3><button class="x" onclick="closeModal('modalInvoice')">×</button></div>
+    <div class="modal-body">
+      <div class="form-row"><label>申请号</label><div class="val" id="mi-no">—</div></div>
+      <div class="form-row"><label>合同号</label><div class="val" id="mi-ht">—</div></div>
+      <div class="form-row"><label>购方名称</label><div class="val" id="mi-cust">—</div></div>
+      <div class="form-row"><label>税号</label><div class="val" id="mi-tax">—</div></div>
+      <div class="form-row"><label>金额 / 税率</label><div class="val" id="mi-amt">—</div></div>
+      <div class="note">系统已自动校验抬头、税号、金额与合同/付款进度一致性及查重。审核通过后将驱动金税自动开票并回填发票号；若未集成金税系统，审核通过后可手动上传电子发票归档。驳回需填写原因。</div>
+    </div>
+    <div class="modal-foot"><button class="btn danger" onclick="closeModal('modalInvoice')">驳回</button><button class="btn primary" onclick="closeModal('modalInvoice')">审核通过</button></div>
+  </div>
+</div>
+
+<!-- ============ Modal: 发票上传 ============ -->
+<div class="overlay" id="modalUpload">
+  <div class="modal">
+    <div class="modal-head"><h3>上传电子发票</h3><button class="x" onclick="closeModal('modalUpload')">×</button></div>
+    <div class="modal-body">
+      <div class="form-row"><label>发票号</label><div class="val" id="mu-no">—</div></div>
+      <input type="file" id="mu-input" accept=".pdf,.ofd,.jpg,.jpeg,.png" style="display:none" />
+      <div class="upload-drop" id="mu-drop">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 16V4M7 9l5-5 5 5M5 20h14"/></svg>
+        <div class="t">点击选择，或将文件拖拽到此处</div>
+        <div class="meta">支持 PDF / OFD / JPG / PNG，单个文件 ≤ 10MB</div>
+      </div>
+      <div class="upload-file" id="mu-file" style="display:none">
+        <span class="fic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16"><path d="M6 2h9l5 5v15H6z"/><path d="M14 2v6h6"/></svg></span>
+        <span class="fn" id="mu-fname">—</span>
+        <button class="x" onclick="clearUpload()">×</button>
+      </div>
+      <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px;margin-top:12px"><label>交付说明</label><textarea id="mu-note" rows="2" placeholder="可选：交付给销售时的备注说明"></textarea></div>
+      <div class="note">上传后将登记电子发票并生成下载链接提供给销售；如为金税直连开具，也可在此上传版式文件归档。</div>
+    </div>
+    <div class="modal-foot"><button class="btn default" onclick="closeModal('modalUpload')">取消</button><button class="btn primary" onclick="confirmUpload()">确认上传</button></div>
+  </div>
+</div>
+
+<script>
+/* ============ Mock 数据（字段取自需求数据字典） ============ */
+const plans=[
+  {no:'YS-2026-0001',ht:'HT-2026-0123',cust:'杭州某科技公司',inst:'第1期',date:'2026-07-20',amt:120000,cf:'已确认',st:'未到期'},
+  {no:'YS-2026-0002',ht:'HT-2026-0123',cust:'杭州某科技公司',inst:'第2期',date:'2026-07-10',amt:80000,cf:'待确认',st:'即将到期'},
+  {no:'YS-2026-0003',ht:'HT-2026-0145',cust:'宁波检测中心',inst:'第1期',date:'2026-06-28',amt:200000,cf:'已确认',st:'逾期'},
+  {no:'YS-2026-0004',ht:'HT-2026-0158',cust:'温州质检院',inst:'第1期',date:'2026-08-05',amt:60000,cf:'已确认',st:'未到期'},
+  {no:'YS-2026-0005',ht:'HT-2026-0160',cust:'绍兴测评所',inst:'第2期',date:'2026-07-12',amt:90000,cf:'待确认',st:'即将到期'},
+  {no:'YS-2026-0006',ht:'HT-2026-0110',cust:'嘉兴检测公司',inst:'第1期',date:'2026-05-30',amt:150000,cf:'已确认',st:'已结清'},
+];
+const invReqs=[
+  {no:'INV-2026-0031',ht:'HT-2026-0123',cust:'杭州某科技公司',tax:'9133010****K',amt:120000,rate:'6%',st:'待审核'},
+  {no:'INV-2026-0032',ht:'HT-2026-0145',cust:'宁波检测中心',tax:'9133020****X',amt:200000,rate:'6%',st:'已通过'},
+  {no:'INV-2026-0033',ht:'HT-2026-0158',cust:'温州质检院',tax:'9133030****L',amt:60000,rate:'6%',st:'已驳回'},
+  {no:'INV-2026-0034',ht:'HT-2026-0160',cust:'绍兴测评所',tax:'9133060****P',amt:90000,rate:'6%',st:'已开票'},
+];
+const invList=[
+  {no:'FP-2026-0001',type:'蓝票',amt:120000,date:'2026-07-05',ref:'—'},
+  {no:'FP-2026-0002',type:'蓝票',amt:200000,date:'2026-07-04',ref:'—'},
+  {no:'FP-2026-0003',type:'红票',amt:30000,date:'2026-07-08',ref:'FP-2026-0001'},
+];
+const rcpts=[
+  {no:'HK-2026-0006',cust:'宁波检测中心',amt:200000,date:'2026-07-04',way:'电汇',bk:'BK260704001',st:'已核销'},
+  {no:'HK-2026-0007',cust:'杭州某科技公司',amt:120000,date:'2026-07-06',way:'电汇',bk:'BK260706001',st:'已核销'},
+  {no:'HK-2026-0008',cust:'嘉兴检测公司',amt:150000,date:'2026-06-02',way:'承兑',bk:'BK260602007',st:'已核销'},
+  {no:'HK-2026-0009',cust:'绍兴测评所',amt:30000,date:'2026-07-10',way:'电汇',bk:'BK260710003',st:'挂账'},
+];
+const hxs=[
+  {no:'HX-2026-0005',rcpt:'HK-2026-0009',plan:'YS-2026-0005',amt:30000,mode:'自动',by:'—',st:'待确认'},
+  {no:'HX-2026-0006',rcpt:'HK-2026-0007',plan:'YS-2026-0001',amt:120000,mode:'自动',by:'李会计',st:'已确认'},
+  {no:'HX-2026-0007',rcpt:'HK-2026-0006',plan:'YS-2026-0003',amt:200000,mode:'自动',by:'李会计',st:'已确认'},
+  {no:'HX-2026-0008',rcpt:'HK-2026-0008',plan:'YS-2026-0006',amt:150000,mode:'手动',by:'李会计',st:'已确认'},
+];
+const aging=[
+  {seg:'0–30 天',amt:350,pct:45,n:14,st:'正常'},
+  {seg:'31–60 天',amt:180,pct:23,n:8,st:'关注'},
+  {seg:'61–90 天',amt:120,pct:15,n:5,st:'预警'},
+  {seg:'90 天以上',amt:130,pct:17,n:4,st:'逾期'},
+];
+const duns=[
+  {no:'DN-2026-0001',plan:'YS-2026-0003',ch:'站内消息',time:'2026-06-29 09:12',rcv:'张销售',esc:'—'},
+  {no:'DN-2026-0002',plan:'YS-2026-0003',ch:'邮件',time:'2026-07-06 09:10',rcv:'张销售',esc:'已升级法务'},
+  {no:'DN-2026-0003',plan:'YS-2026-0005',ch:'站内消息',time:'2026-07-13 09:15',rcv:'王销售',esc:'—'},
+  {no:'DN-2026-0004',plan:'YS-2026-0004',ch:'企微',time:'2026-07-14 09:08',rcv:'赵销售',esc:'—'},
+];
+const top10=[
+  {cust:'宁波检测中心',plan:'YS-2026-0003',amt:200000,st:'逾期'},
+  {cust:'绍兴测评所',plan:'YS-2026-0005',amt:90000,st:'即将到期'},
+  {cust:'温州质检院',plan:'YS-2026-0004',amt:60000,st:'未到期'},
+  {cust:'杭州某科技公司',plan:'YS-2026-0002',amt:80000,st:'即将到期'},
+  {cust:'嘉兴检测公司',plan:'YS-2026-0006',amt:0,st:'已结清'},
+];
+
+/* ============ Badge 映射 ============ */
+const stBadge={
+  '未到期':['info','未到期'],'即将到期':['warning','即将到期'],'逾期':['danger','逾期'],'已结清':['gray','已结清'],
+  '待确认':['warning','待确认'],'已确认':['success','已确认'],'待审核':['warning','待审核'],'已通过':['success','已通过'],
+  '已驳回':['danger','已驳回'],'已开票':['success','已开票'],'已核销':['success','已核销'],'挂账':['purple','挂账'],
+  '正常':['info','正常'],'关注':['info','关注'],'预警':['warning','预警'],
+};
+function badge(s){const[a,t]=stBadge[s]||['gray',s];return `<span class="badge ${a}">${t}</span>`}
+const fmt=n=>'¥'+n.toLocaleString('zh-CN');
+
+/* ============ 渲染 ============ */
+function render(){
+  document.getElementById('planBody').innerHTML=plans.map(p=>`
+    <tr><td class="mono tlink">${p.no}</td><td class="mono">${p.ht}</td><td>${p.cust}</td><td>${p.inst}</td>
+    <td class="mono">${p.date}</td><td class="mono" style="text-align:right">${fmt(p.amt)}</td>
+    <td>${badge(p.cf)}</td><td>${badge(p.st)}</td>
+    <td><div class="row-actions"><button class="btn default sm" onclick="goEditPlan('${p.no}')">确认/编辑</button></div></td></tr>`).join('');
+
+  document.getElementById('invReqBody').innerHTML=invReqs.map(r=>`
+    <tr><td class="mono tlink">${r.no}</td><td class="mono">${r.ht}</td><td>${r.cust}</td><td class="mono">${r.tax}</td>
+    <td class="mono" style="text-align:right">${fmt(r.amt)}</td><td>${r.rate}</td><td>${badge(r.st)}</td>
+    <td><div class="row-actions">${r.st==='待审核'?`<button class="btn primary sm" onclick="goEditInvoice('${r.no}')">审核</button>`:`<button class="btn ghost" onclick="goEditInvoice('${r.no}')">查看</button>`}</div></td></tr>`).join('');
+
+  document.getElementById('invListBody').innerHTML=invList.map(r=>`
+    <tr><td class="mono tlink">${r.no}</td><td>${badge(r.type==='红票'?'danger':'info')} ${r.type}</td>
+    <td class="mono" style="text-align:right">${fmt(r.amt)}</td><td class="mono">${r.date}</td><td class="mono">${r.ref}</td>
+    <td><div class="row-actions">${r.type==='蓝票'?`<button class="btn ghost" onclick="openUpload('${r.no}')">上传</button>`:''}<button class="btn ghost" onclick="goInvoiceDetail('${r.no}')">查看</button></div></td></tr>`).join('');
+
+  document.getElementById('rcptBody').innerHTML=rcpts.map(r=>`
+    <tr><td class="mono tlink">${r.no}</td><td>${r.cust}</td><td class="mono" style="text-align:right">${fmt(r.amt)}</td>
+    <td class="mono">${r.date}</td><td>${r.way}</td><td class="mono">${r.bk}</td><td>${badge(r.st)}</td></tr>`).join('');
+
+  document.getElementById('hxBody').innerHTML=hxs.map(h=>`
+    <tr><td class="mono tlink">${h.no}</td><td class="mono">${h.rcpt}</td><td class="mono">${h.plan}</td>
+    <td class="mono" style="text-align:right">${fmt(h.amt)}</td><td>${h.mode}</td><td>${h.by}</td><td>${badge(h.st)}</td>
+    <td><div class="row-actions">${h.st==='待确认'?`<button class="btn primary sm" onclick="alert('已确认核销单 ${h.no}')">确认</button>`:`<span class="crm-text-muted" style="font-size:12px">已处理</span>`}</div></td></tr>`).join('');
+
+  document.getElementById('agingBody').innerHTML=aging.map(a=>`
+    <tr><td>${a.seg}</td><td class="mono" style="text-align:right">${fmt(a.amt*10000)}</td>
+    <td class="mono" style="text-align:right">${a.pct}%</td><td class="mono" style="text-align:right">${a.n}</td><td>${badge(a.st)}</td></tr>`).join('');
+
+  document.getElementById('dunBody').innerHTML=duns.map(d=>`
+    <tr><td class="mono">${d.no}</td><td class="mono">${d.plan}</td><td>${d.ch}</td><td class="mono">${d.time}</td><td>${d.rcv}</td><td>${d.esc==='—'?'<span class="crm-text-muted" style="font-size:12px">—</span>':badge('逾期')+' '+d.esc}</td></tr>`).join('');
+
+  document.getElementById('top10').innerHTML=top10.map((t,i)=>`
+    <tr><td><span class="rank ${i<2?'top':''}">${i+1}</span></td><td>${t.cust}</td><td class="mono">${t.plan}</td>
+    <td class="mono" style="text-align:right">${t.amt?fmt(t.amt):'—'}</td><td>${t.amt?badge(t.st):badge('已结清')}</td></tr>`).join('');
+}
+
+/* ============ 导航 ============ */
+const crumbMap={dashboard:'经营看板',plan:'收款计划',invoice:'开票管理','invoice-detail':'发票详情',reconcile:'回款核销',aging:'账龄催收','edit-plan':'收款计划 / 编辑','edit-invoice':'开票管理 / 开票申请','edit-receipt':'回款核销 / 登记回款'};
+function go(v){
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===v));
+  document.querySelectorAll('.view').forEach(s=>s.classList.toggle('active',s.id===v));
+  document.getElementById('crumb').textContent=crumbMap[v];
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+const editViews={'edit-plan':()=>goEditPlan(),'edit-invoice':()=>goEditInvoice('new'),'edit-receipt':()=>goReceipt(),'invoice-detail':()=>goInvoiceDetail()};
+document.querySelectorAll('.nav-item').forEach(n=>{
+  const v=n.dataset.view;
+  if(editViews[v]) n.addEventListener('click',editViews[v]);
+  else n.addEventListener('click',()=>go(v));
+});
+
+/* ============ Tabs ============ */
+document.querySelectorAll('#invoice .tab').forEach(t=>t.addEventListener('click',()=>{
+  document.querySelectorAll('#invoice .tab').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('inv-req').style.display=t.dataset.tab==='inv-req'?'block':'none';
+  document.getElementById('inv-list').style.display=t.dataset.tab==='inv-list'?'block':'none';
+}));
+document.querySelectorAll('#reconcile .tab').forEach(t=>t.addEventListener('click',()=>{
+  document.querySelectorAll('#reconcile .tab').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('rcpt').style.display=t.dataset.tab==='rcpt'?'block':'none';
+  document.getElementById('hx').style.display=t.dataset.tab==='hx'?'block':'none';
+}));
+
+/* ============ Modals ============ */
+function openModal(id){document.getElementById(id).classList.add('show')}
+function closeModal(id){document.getElementById(id).classList.remove('show')}
+document.querySelectorAll('.overlay').forEach(o=>o.addEventListener('click',e=>{if(e.target===o)o.classList.remove('show')}));
+function openPlan(no){const p=plans.find(x=>x.no===no);
+  document.getElementById('mp-no').textContent=p.no;
+  document.getElementById('mp-ht').textContent=p.ht;
+  document.getElementById('mp-cust').textContent=p.cust+' / '+p.inst;
+  document.getElementById('mp-date').value=p.date;
+  document.getElementById('mp-amt').value=p.amt;
+  openModal('modalPlan');
+}
+function confirmPlan(){closeModal('modalPlan');alert('收款计划已确认并留痕');}
+function openInvoice(no){const r=invReqs.find(x=>x.no===no);
+  document.getElementById('mi-no').textContent=r.no;
+  document.getElementById('mi-ht').textContent=r.ht;
+  document.getElementById('mi-cust').textContent=r.cust;
+  document.getElementById('mi-tax').textContent=r.tax;
+  document.getElementById('mi-amt').textContent=fmt(r.amt)+' / '+r.rate;
+  openModal('modalInvoice');
+}
+
+render();
+
+/* ============ 新增：编辑 / 详情页逻辑 ============ */
+function recomputeInvoice(){
+  const amt=parseFloat(document.getElementById('ei-amt').value)||0;
+  const rate=parseFloat(document.getElementById('ei-rate').value)/100;
+  document.getElementById('ei-total').textContent=fmt(Math.round(amt*(1+rate)));
+}
+function goEditPlan(no){
+  const p=(no&&plans.find(x=>x.no===no))||plans.find(x=>x.cf==='待确认')||plans[0];
+  document.getElementById('ep-no').textContent=p.no;
+  document.getElementById('ep-ht').textContent=p.ht;
+  document.getElementById('ep-cust').textContent=p.cust+' / '+p.inst;
+  document.getElementById('ep-date').value=p.date;
+  document.getElementById('ep-amt').value=p.amt;
+  const aud=[
+    ['ok','系统自动生成',p.date+' 合同生效按'+p.inst+'节点生成，金额 '+fmt(p.amt)],
+    [p.cf==='已确认'?'ok':'',(p.cf==='已确认'?'销售已确认':'待确认'),(p.cf==='已确认'?'已纳入催收与账龄统计口径':'销售可编辑时间/金额后确认')]
+  ];
+  document.getElementById('ep-audit').innerHTML=aud.map(a=>`<div class="tl ${a[0]}"><div class="tl-t">${a[1]}</div><div class="tl-s">${a[2]}</div></div>`).join('');
+  go('edit-plan');
+}
+function goEditInvoice(no){
+  const isNew=!no||no==='new';
+  if(isNew){
+    document.getElementById('ei-title').textContent='新建开票申请';
+    document.getElementById('ei-no').textContent='保存后自动分配';
+    document.getElementById('ei-ht').selectedIndex=0;
+    document.getElementById('ei-cust').value='';
+    document.getElementById('ei-tax').value='';
+    document.getElementById('ei-addr').value='';
+    document.getElementById('ei-bank').value='';
+    document.getElementById('ei-item').value='测评技术服务费';
+    document.getElementById('ei-amt').value=113207;
+    document.getElementById('ei-rate').value='6%';
+    document.getElementById('ei-verify-tax').className='verify ok';
+    document.getElementById('ei-verify-tax').innerHTML='新建申请：请填写购方信息，保存后系统校验税号与金额。';
+    document.getElementById('ei-verify-amount').className='verify ok';
+    document.getElementById('ei-verify-amount').innerHTML='填写金额后系统将校验是否超出合同已确认应收并查重。';
+  }else{
+    const r=invReqs.find(x=>x.no===no);
+    document.getElementById('ei-title').textContent='开票申请 · '+no;
+    document.getElementById('ei-no').textContent=r.no;
+    document.getElementById('ei-ht').value=r.ht;
+    document.getElementById('ei-cust').value=r.cust;
+    document.getElementById('ei-tax').value=r.tax;
+    document.getElementById('ei-addr').value='浙江省杭州市示范路 188 号 / 0571-8888xxxx';
+    document.getElementById('ei-bank').value='工行杭州分行 6212 **** **** 1234';
+    document.getElementById('ei-item').value='测评技术服务费';
+    document.getElementById('ei-amt').value=Math.round(r.amt/1.06);
+    document.getElementById('ei-rate').value=r.rate;
+    document.getElementById('ei-verify-tax').className='verify ok';
+    document.getElementById('ei-verify-tax').innerHTML='系统已校验税号格式合法、与购方名称「'+r.cust+'」匹配。';
+    document.getElementById('ei-verify-amount').className='verify ok';
+    document.getElementById('ei-verify-amount').innerHTML='校验通过：金额 '+fmt(r.amt)+' 未超出合同已确认应收，且无重复开票申请。';
+  }
+  recomputeInvoice();
+  go('edit-invoice');
+}
+function goReceipt(){renderReceiptPreview();go('edit-receipt');}
+function renderReceiptPreview(){
+  document.getElementById('er-preview').innerHTML=`
+    <div class="tl ok"><div class="tl-t">匹配应收单 YS-2026-0003</div><div class="tl-s">客户：宁波检测中心 · 金额 ¥200,000 · 状态：逾期 · 合同 HT-2026-0145</div></div>
+    <div class="tl"><div class="tl-t">生成核销单（待确认）</div><div class="tl-s">由会计确认后更新回款状态；支持部分核销与手动指定应收单。</div></div>`;
+}
+const invDetails={
+  'FP-2026-0001':{cust:'杭州某科技公司',tax:'9133010****K',bank:'工行杭州分行 6212 **** 1234',deliver:'已交付',req:'INV-2026-0031',ht:'HT-2026-0123',rate:'6%',timeline:[['ok','开具完成','2026-07-05 14:20 驱动金税开具蓝票，回填发票号'],['ok','交付销售','2026-07-05 15:00 上传电子发票，下载链接已发送至销售']]},
+  'FP-2026-0002':{cust:'宁波检测中心',tax:'9133020****X',bank:'中行宁波分行 6217 **** 5678',deliver:'已交付',req:'INV-2026-0032',ht:'HT-2026-0145',rate:'6%',timeline:[['ok','开具完成','2026-07-04 10:05 驱动金税开具蓝票'],['ok','交付销售','2026-07-04 10:40 电子发票已交付']]},
+  'FP-2026-0003':{cust:'杭州某科技公司',tax:'9133010****K',bank:'工行杭州分行 6212 **** 1234',deliver:'已交付',req:'INV-2026-0031',ht:'HT-2026-0123',rate:'6%',timeline:[['warn','红冲开具','2026-07-08 10:15 针对 FP-2026-0001 开具红票，金额冲减']]},
+};
+function goInvoiceDetail(no){
+  const info=(no&&invList.find(x=>x.no===no))||invList[0];
+  currentInvoiceNo=info.no;
+  const r=invDetails[info.no]||invDetails['FP-2026-0001'];
+  document.getElementById('id-no').textContent=info.no;
+  document.getElementById('id-amt').textContent=fmt(info.amt);
+  document.getElementById('id-st').textContent=info.type==='红票'?'已红冲':'正常';
+  document.getElementById('id-type').textContent=info.type;
+  document.getElementById('id-date').textContent=info.date;
+  document.getElementById('id-rate').textContent=r.rate;
+  document.getElementById('id-ref').textContent=info.ref;
+  document.getElementById('id-cust').textContent=r.cust;
+  document.getElementById('id-tax').textContent=r.tax;
+  document.getElementById('id-bank').textContent=r.bank;
+  document.getElementById('id-deliver').textContent=r.deliver;
+  document.getElementById('id-req').textContent=r.req+' / '+r.ht;
+  document.getElementById('id-timeline').innerHTML=r.timeline.map(t=>`<div class="tl ${t[0]}"><div class="tl-t">${t[1]}</div><div class="tl-s">${t[2]}</div></div>`).join('');
+  document.getElementById('id-redflush').style.display=info.type==='红票'?'none':'';
+  go('invoice-detail');
+}
+function savePlan(){alert('收款计划已确认并留痕');go('plan');}
+function saveInvoice(){alert('开票申请已提交，进入财务审核');go('invoice');}
+function saveReceipt(){alert('回款已登记，已生成核销单待确认');go('reconcile');}
+
+/* ============ 发票上传 ============ */
+let currentInvoiceNo='';
+let uploadFileName='';
+function openUpload(no){
+  currentInvoiceNo=no||currentInvoiceNo||'FP-2026-0001';
+  document.getElementById('mu-no').textContent=currentInvoiceNo;
+  document.getElementById('mu-note').value='';
+  clearUpload();
+  openModal('modalUpload');
+}
+function clearUpload(){
+  uploadFileName='';
+  document.getElementById('mu-file').style.display='none';
+  document.getElementById('mu-fname').textContent='';
+  const fi=document.getElementById('mu-input'); if(fi) fi.value='';
+  document.getElementById('mu-drop').style.display='';
+}
+function handleUploadFile(f){
+  if(!f) return;
+  if(!/\.(pdf|ofd|jpe?g|png)$/i.test(f.name)){alert('仅支持 PDF / OFD / JPG / PNG 格式');return;}
+  if(f.size>10*1024*1024){alert('文件大小不能超过 10MB');return;}
+  uploadFileName=f.name;
+  document.getElementById('mu-fname').textContent=f.name+'（'+(f.size/1024).toFixed(0)+' KB）';
+  document.getElementById('mu-file').style.display='flex';
+  document.getElementById('mu-drop').style.display='none';
+}
+function confirmUpload(){
+  if(!uploadFileName){alert('请先选择要上传的电子发票文件');return;}
+  closeModal('modalUpload');
+  alert('电子发票「'+uploadFileName+'」已上传并登记，下载链接已生成并提供给销售');
+  if(currentInvoiceNo && document.getElementById('id-no').textContent===currentInvoiceNo){
+    document.getElementById('id-deliver').textContent='已上传待交付';
+  }
+}
+(function(){
+  const muDrop=document.getElementById('mu-drop');
+  const muInput=document.getElementById('mu-input');
+  if(!muDrop||!muInput) return;
+  muDrop.addEventListener('click',()=>muInput.click());
+  muInput.addEventListener('change',e=>handleUploadFile(e.target.files[0]));
+  ['dragenter','dragover'].forEach(ev=>muDrop.addEventListener(ev,e=>{e.preventDefault();muDrop.classList.add('drag')}));
+  ['dragleave','drop'].forEach(ev=>muDrop.addEventListener(ev,e=>{e.preventDefault();muDrop.classList.remove('drag')}));
+  muDrop.addEventListener('drop',e=>handleUploadFile(e.dataTransfer.files[0]));
+})();
+
+</script>
+</body>
+</html>
