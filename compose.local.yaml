@@ -1,0 +1,49 @@
+services:
+  settlement-db:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: settlement
+      MYSQL_USER: settlement
+      MYSQL_PASSWORD: settlement-local
+      MYSQL_ROOT_PASSWORD: settlement-root-local
+    volumes:
+      - settlement-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-psettlement-root-local"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  settlement-migrate:
+    build: .
+    entrypoint: ["/usr/local/bin/settlement-migrate"]
+    environment:
+      SETTLEMENT_MYSQL_DSN: settlement:settlement-local@tcp(settlement-db:3306)/settlement?parseTime=true&charset=utf8mb4&loc=UTC
+    depends_on:
+      settlement-db:
+        condition: service_healthy
+  settlement-api:
+    build: .
+    environment:
+      SETTLEMENT_MYSQL_DSN: settlement:settlement-local@tcp(settlement-db:3306)/settlement?parseTime=true&charset=utf8mb4&loc=UTC
+      SETTLEMENT_HTTP_ADDR: :8085
+      SETTLEMENT_PUBLIC_ORIGIN: http://localhost:5173
+      SETTLEMENT_DEVELOPMENT_AUTH: "true"
+      SETTLEMENT_INTEGRATION_ENABLED: "false"
+      OIDC_SESSION_COOKIE_SECURE: "false"
+    ports:
+      - "18085:8085"
+    depends_on:
+      settlement-migrate:
+        condition: service_completed_successfully
+  settlement-worker:
+    build: .
+    entrypoint: ["/usr/local/bin/settlement-worker"]
+    environment:
+      SETTLEMENT_MYSQL_DSN: settlement:settlement-local@tcp(settlement-db:3306)/settlement?parseTime=true&charset=utf8mb4&loc=UTC
+      PLATFORM_BASE_URL: ${PLATFORM_BASE_URL:-http://host.docker.internal:8080}
+      PLATFORM_ENVIRONMENT_CODE: ${PLATFORM_ENVIRONMENT_CODE:-dev}
+    depends_on:
+      settlement-migrate:
+        condition: service_completed_successfully
+volumes:
+  settlement-db-data:
