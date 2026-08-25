@@ -1,0 +1,23 @@
+CREATE TABLE IF NOT EXISTS settlement_report_export_job (
+  id CHAR(32) NOT NULL,
+  tenant_id VARCHAR(64) NOT NULL,
+  requested_by VARCHAR(128) NOT NULL,
+  idempotency_key VARCHAR(128) NOT NULL,
+  report_type VARCHAR(64) NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  locked_by VARCHAR(128) NOT NULL DEFAULT '',
+  locked_until DATETIME(3) NULL,
+  error_message VARCHAR(500) NOT NULL DEFAULT '',
+  file_name VARCHAR(255) NOT NULL DEFAULT '',
+  content_type VARCHAR(128) NOT NULL DEFAULT 'text/csv; charset=utf-8',
+  file_content MEDIUMBLOB NULL,
+  expires_at DATETIME(3) NULL,
+  created_at DATETIME(3) NOT NULL,
+  started_at DATETIME(3) NULL,
+  completed_at DATETIME(3) NULL,
+  updated_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_settlement_report_export_idempotency (tenant_id, requested_by, idempotency_key),
+  KEY idx_settlement_report_export_lease (status, locked_until, created_at),
+  KEY idx_settlement_report_export_owner (tenant_id, requested_by, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
