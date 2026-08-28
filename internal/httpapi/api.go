@@ -29,12 +29,18 @@ type API struct {
 	directory platform.PersonnelDirectory
 }
 
-func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Authenticator, machine *platform.ServiceTokenVerifier, directories ...platform.PersonnelDirectory) http.Handler {
+func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Authenticator, machine *platform.ServiceTokenVerifier, dependencies ...any) http.Handler {
 	var directory platform.PersonnelDirectory
-	if len(directories) > 0 {
-		directory = directories[0]
+	var publisher service.CreditEventPublisher
+	for _, dependency := range dependencies {
+		if value, ok := dependency.(platform.PersonnelDirectory); ok {
+			directory = value
+		}
+		if value, ok := dependency.(service.CreditEventPublisher); ok {
+			publisher = value
+		}
 	}
-	return &API{service: &service.Service{DB: db}, cfg: cfg, logger: logger, auth: auth, machine: machine, directory: directory}
+	return &API{service: &service.Service{DB: db, CreditPublisher: publisher}, cfg: cfg, logger: logger, auth: auth, machine: machine, directory: directory}
 }
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
@@ -91,6 +97,13 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.auth.LogoutLocal(w, r)
 		}
 		return
+	case r.URL.Path == "/auth/backchannel-logout" && r.Method == http.MethodPost:
+		if a.auth == nil {
+			fail(w, http.StatusServiceUnavailable, "SETTLEMENT_OIDC_UNCONFIGURED", "Settlement 身份服务尚未配置")
+		} else {
+			a.auth.BackchannelLogout(w, r)
+		}
+		return
 	case r.URL.Path == "/auth/me" || r.URL.Path == "/api/v1/auth/me":
 		a.me(w, r)
 		return
@@ -99,6 +112,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case r.URL.Path == "/internal/v1/settlement/events/contracts" && r.Method == http.MethodPost:
 		a.contractEvent(w, r)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/credit-sync-events/") && strings.HasSuffix(r.URL.Path, "/retry") && r.Method == http.MethodPost:
+		a.retryCreditSync(w, r)
 		return
 	case r.URL.Path == "/api/v1/dashboard" && r.Method == http.MethodGet:
 		a.dashboard(w, r)
@@ -200,6 +216,27 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		fail(w, http.StatusNotFound, "SETTLEMENT_NOT_FOUND", "未找到接口")
 	}
+}
+
+func (a *API) retryCreditSync(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.credit.resend")
+	if !ok {
+		return
+	}
+	eventID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/credit-sync-events/"), "/retry")
+	if eventID == "" || strings.Contains(eventID, "/") {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", "信用同步事件标识不合法")
+		return
+	}
+	if err := a.service.RetryCreditSync(r.Context(), p.TenantID, eventID); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			fail(w, http.StatusNotFound, "SETTLEMENT_NOT_FOUND", "未找到信用同步事件")
+			return
+		}
+		fail(w, http.StatusServiceUnavailable, "SETTLEMENT_CREDIT_SYNC_FAILED", "CRM 信用同步失败，已保留待重发状态")
+		return
+	}
+	write(w, http.StatusOK, map[string]string{"event_id": eventID, "status": "DELIVERED"})
 }
 
 // Development auth is deliberately explicit and local only. Production must

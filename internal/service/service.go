@@ -19,7 +19,14 @@ var (
 	ErrInvalid  = errors.New("invalid input")
 )
 
-type Service struct{ DB *sql.DB }
+type CreditEventPublisher interface {
+	Publish(ctx context.Context, tenant, eventID string, payload []byte) error
+}
+
+type Service struct {
+	DB              *sql.DB
+	CreditPublisher CreditEventPublisher
+}
 type ContractEvent struct {
 	EventID    string    `json:"event_id"`
 	EventType  string    `json:"event_type"`
@@ -264,15 +271,17 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 		return "", err
 	}
 	defer tx.Rollback()
-	var receiptAvailable, receiptCurrency, receivableOpen, receivableCurrency, receiptCustomer, receivableCustomer string
-	err = tx.QueryRowContext(ctx, `SELECT unallocated_amount,currency,customer_id FROM settlement_receipt WHERE id=? AND tenant_id=? AND status IN ('AVAILABLE','PARTIALLY_ALLOCATED') FOR UPDATE`, in.ReceiptID, p.TenantID).Scan(&receiptAvailable, &receiptCurrency, &receiptCustomer)
+	var receiptAvailable, receiptCurrency, receiptDate, receivableOpen, receivableOriginal, receivableCurrency, receiptCustomer, receivableCustomer string
+	var dueDate, contractNo string
+	var installment int
+	err = tx.QueryRowContext(ctx, `SELECT unallocated_amount,currency,DATE_FORMAT(receipt_date,'%Y-%m-%d'),customer_id FROM settlement_receipt WHERE id=? AND tenant_id=? AND status IN ('AVAILABLE','PARTIALLY_ALLOCATED') FOR UPDATE`, in.ReceiptID, p.TenantID).Scan(&receiptAvailable, &receiptCurrency, &receiptDate, &receiptCustomer)
 	if err == sql.ErrNoRows {
 		return "", ErrConflict
 	}
 	if err != nil {
 		return "", err
 	}
-	err = tx.QueryRowContext(ctx, `SELECT r.open_amount,r.currency,cs.customer_id FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id WHERE r.id=? AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.collection_status IN ('UNPAID','PARTIALLY_SETTLED') FOR UPDATE`, in.ReceivableID, p.TenantID).Scan(&receivableOpen, &receivableCurrency, &receivableCustomer)
+	err = tx.QueryRowContext(ctx, `SELECT r.open_amount,r.original_amount,r.currency,cs.customer_id,DATE_FORMAT(r.due_date,'%Y-%m-%d'),cs.source_contract_no,rp.installment_no FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id JOIN settlement_receivable_plan rp ON rp.id=r.receivable_plan_id WHERE r.id=? AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.collection_status IN ('UNPAID','PARTIALLY_SETTLED') FOR UPDATE`, in.ReceivableID, p.TenantID).Scan(&receivableOpen, &receivableOriginal, &receivableCurrency, &receivableCustomer, &dueDate, &contractNo, &installment)
 	if err == sql.ErrNoRows {
 		return "", ErrConflict
 	}
@@ -304,7 +313,30 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 	if err != nil {
 		return "", err
 	}
-	return id, tx.Commit()
+	var creditEventID string
+	if receivableOpen == a {
+		creditEventID = newID()
+		payload, marshalErr := json.Marshal(map[string]any{
+			"event_id": creditEventID, "event_type": "customer.credit.payment.completed.v1",
+			"tenant_id": p.TenantID, "payment_id": id, "receipt_id": in.ReceiptID,
+			"allocation_id": id, "customer_id": receivableCustomer, "contract_no": contractNo,
+			"period_no": installment, "due_date": dueDate, "paid_date": receiptDate,
+			"due_amount": receivableOriginal, "paid_amount": a, "source_system": "settlement",
+		})
+		if marshalErr != nil {
+			return "", marshalErr
+		}
+		if err = insertCreditSync(ctx, tx, p.TenantID, creditEventID, id, in.ReceivableID, payload); err != nil {
+			return "", err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	if creditEventID != "" && s.CreditPublisher != nil {
+		_ = s.RetryCreditSync(ctx, p.TenantID, creditEventID)
+	}
+	return id, nil
 }
 
 func decimalGreater(left, right string) bool {

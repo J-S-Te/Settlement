@@ -12,6 +12,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/j-s-te/settlement/internal/config"
+	"github.com/j-s-te/settlement/internal/creditclient"
 	"github.com/j-s-te/settlement/internal/httpapi"
 	"github.com/j-s-te/settlement/internal/platform"
 )
@@ -54,7 +55,15 @@ func main() {
 			}
 		}
 	}
-	server := &http.Server{Addr: cfg.HTTPAddress, Handler: httpapi.New(db, cfg, slog.Default(), auth, machine, personnelDirectory), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	var creditPublisher *creditclient.Client
+	if cfg.CRMCreditSyncEnabled {
+		creditPublisher, err = creditclient.New(cfg.CRMCreditEndpoint, cfg.CRMCreditTokenEndpoint, cfg.CRMCreditClientID, cfg.CRMCreditClientSecret, cfg.CRMCreditScope, &http.Client{Timeout: 8 * time.Second})
+		if err != nil {
+			slog.Error("initialize CRM credit client", "error", err)
+			os.Exit(1)
+		}
+	}
+	server := &http.Server{Addr: cfg.HTTPAddress, Handler: httpapi.New(db, cfg, slog.Default(), auth, machine, personnelDirectory, creditPublisher), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	slog.Info("settlement API started", "address", cfg.HTTPAddress, "development_auth", cfg.DevelopmentAuth)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

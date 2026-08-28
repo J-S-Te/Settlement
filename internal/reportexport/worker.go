@@ -3,17 +3,41 @@ package reportexport
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
 	"time"
 )
 
 const InvoicedReceivablesCSV = "INVOICED_RECEIVABLES_CSV"
 
 type Worker struct {
-	DB        *sql.DB
-	WorkerID  string
-	BatchSize int
+	DB                   *sql.DB
+	WorkerID             string
+	BatchSize            int
+	Gateway              FileGateway
+	GatewayMode          string
+	GatewayApplicationID string
+}
+
+// FileGateway 是报表文件网关的最小适配边界，避免 Worker 依赖具体 HTTP 客户端。
+type FileGateway interface {
+	Upload(context.Context, string, string, string, string, string, io.Reader) (string, error)
+	Bind(context.Context, string, string, string, string, string, string) error
+}
+
+// NormalizeGatewayMode 规范化文件网关模式；空值和未知值均回退到 legacy。
+func NormalizeGatewayMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "dual", "required":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "legacy"
+	}
 }
 
 type job struct{ id, tenantID string }
@@ -72,7 +96,31 @@ func (w *Worker) generate(ctx context.Context, item job) {
 		return
 	}
 	filename := "invoiced-receivables-" + time.Now().UTC().Format("20060102-150405") + ".csv"
-	_, err = w.DB.ExecContext(ctx, `UPDATE settlement_report_export_job SET status='READY',file_name=?,file_content=?,expires_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 7 DAY),completed_at=UTC_TIMESTAMP(3),locked_by='',locked_until=NULL,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND status='PROCESSING' AND locked_by=?`, filename, content, item.id, w.WorkerID)
+	hash := sha256.Sum256(content)
+	fileStatus, fileID := "DISABLED", ""
+	if w.GatewayMode == "dual" || w.GatewayMode == "required" {
+		if w.Gateway == nil {
+			if w.GatewayMode == "required" {
+				w.fail(ctx, item.id, errors.New("file gateway unavailable"))
+				return
+			}
+		} else if id, uploadErr := w.Gateway.Upload(ctx, fmt.Sprintf("settlement-report-%s-%x", item.id, hash[:8]), w.GatewayApplicationID, "REPORT_EXPORT", filename, "text/csv; charset=utf-8", bytes.NewReader(content)); uploadErr != nil {
+			if w.GatewayMode == "required" {
+				w.fail(ctx, item.id, uploadErr)
+				return
+			}
+			fileStatus = "FAILED"
+		} else if bindErr := w.Gateway.Bind(ctx, w.GatewayApplicationID, id, "settlement_report_export", item.id, "REPORT", filename); bindErr != nil {
+			if w.GatewayMode == "required" {
+				w.fail(ctx, item.id, bindErr)
+				return
+			}
+			fileStatus = "FAILED"
+		} else {
+			fileID, fileStatus = id, "READY"
+		}
+	}
+	_, err = w.DB.ExecContext(ctx, `UPDATE settlement_report_export_job SET status='READY',file_name=?,file_content=?,platform_file_id=?,platform_file_version=CASE WHEN ?<>'' THEN 1 ELSE 0 END,platform_file_sha256=?,platform_file_size=?,platform_file_status=?,expires_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 7 DAY),completed_at=UTC_TIMESTAMP(3),locked_by='',locked_until=NULL,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND status='PROCESSING' AND locked_by=?`, filename, content, fileID, fileID, fmt.Sprintf("%x", hash[:]), len(content), fileStatus, item.id, w.WorkerID)
 	if err != nil {
 		w.fail(ctx, item.id, err)
 	}

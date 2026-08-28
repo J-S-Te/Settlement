@@ -37,6 +37,12 @@ type Config struct {
 	PersonnelDirectoryURL          string
 	PersonnelDirectoryClientID     string
 	PersonnelDirectoryClientSecret string
+	CRMCreditSyncEnabled           bool
+	CRMCreditEndpoint              string
+	CRMCreditTokenEndpoint         string
+	CRMCreditClientID              string
+	CRMCreditClientSecret          string
+	CRMCreditScope                 string
 	PublicOrigin                   string
 	OIDCSessionIdleTTL             time.Duration
 	OIDCSessionAbsoluteTTL         time.Duration
@@ -53,7 +59,12 @@ func Load() (Config, error) {
 		ContractClientID: strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_CLIENT_ID")), ContractAudience: strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_AUDIENCE")),
 		PersonnelDirectoryURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_URL")), "/"),
 		PersonnelDirectoryClientID: strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_ID")), PersonnelDirectoryClientSecret: os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_SECRET"),
-		PublicOrigin: env("SETTLEMENT_PUBLIC_ORIGIN", "http://localhost:5173"),
+		CRMCreditEndpoint:      strings.TrimSpace(os.Getenv("CRM_CREDIT_SYNC_ENDPOINT")),
+		CRMCreditTokenEndpoint: strings.TrimSpace(os.Getenv("CRM_CREDIT_TOKEN_URL")),
+		CRMCreditClientID:      strings.TrimSpace(os.Getenv("CRM_CREDIT_CLIENT_ID")),
+		CRMCreditClientSecret:  os.Getenv("CRM_CREDIT_CLIENT_SECRET"),
+		CRMCreditScope:         env("CRM_CREDIT_SCOPE", "crm.credit.payment.ingest"),
+		PublicOrigin:           env("SETTLEMENT_PUBLIC_ORIGIN", "http://localhost:5173"),
 	}
 	var err error
 	if c.DevelopmentAuth, err = boolEnv("SETTLEMENT_DEVELOPMENT_AUTH", false); err != nil {
@@ -63,6 +74,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.OutboxWorkerEnabled, err = boolEnv("SETTLEMENT_OUTBOX_WORKER_ENABLED", true); err != nil {
+		return c, err
+	}
+	if c.CRMCreditSyncEnabled, err = boolEnv("SETTLEMENT_CRM_CREDIT_SYNC_ENABLED", false); err != nil {
 		return c, err
 	}
 	if c.OIDCSessionSecure, err = boolEnv("OIDC_SESSION_COOKIE_SECURE", true); err != nil {
@@ -91,6 +105,16 @@ func Load() (Config, error) {
 	}
 	if c.IntegrationEnabled && c.DevelopmentAuth && c.IntegrationBearerToken == "" {
 		return c, fmt.Errorf("development integration token is required when development integration is enabled")
+	}
+	if c.CRMCreditSyncEnabled {
+		for name, value := range map[string]string{"CRM_CREDIT_SYNC_ENDPOINT": c.CRMCreditEndpoint, "CRM_CREDIT_CLIENT_ID": c.CRMCreditClientID, "CRM_CREDIT_CLIENT_SECRET": c.CRMCreditClientSecret, "CRM_CREDIT_SCOPE": c.CRMCreditScope} {
+			if value == "" {
+				return c, fmt.Errorf("%s is required when SETTLEMENT_CRM_CREDIT_SYNC_ENABLED=true", name)
+			}
+		}
+		if c.CRMCreditTokenEndpoint == "" {
+			c.CRMCreditTokenEndpoint = strings.TrimRight(c.PlatformBaseURL, "/") + "/oauth2/token"
+		}
 	}
 	if !c.DevelopmentAuth {
 		for name, value := range map[string]string{"PLATFORM_BASE_URL": c.PlatformBaseURL, "OIDC_ISSUER": c.OIDCIssuer, "OIDC_CLIENT_ID": c.OIDCClientID, "OIDC_CLIENT_SECRET": c.OIDCClientSecret, "OIDC_REDIRECT_URI": c.OIDCRedirectURI, "OIDC_TENANT_ID": c.OIDCTenantID} {
