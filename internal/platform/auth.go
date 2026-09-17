@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -35,26 +34,6 @@ type Authenticator struct {
 	client     *http.Client
 	codec      cipher.AEAD
 	endSession string
-}
-type oidcClaims struct {
-	Subject           string `json:"sub"`
-	IdentityID        string `json:"identity_id"`
-	TenantID          string `json:"tenant_id"`
-	PersonID          string `json:"person_id"`
-	Nonce             string `json:"nonce"`
-	TokenUse          string `json:"token_use"`
-	Name              string `json:"name"`
-	PreferredUsername string `json:"preferred_username"`
-}
-type authorizationContext struct {
-	Subject               string   `json:"sub"`
-	IdentityID            string   `json:"identity_id"`
-	TenantID              string   `json:"tenant_id"`
-	ClientID              string   `json:"client_id"`
-	ApplicationCode       string   `json:"application_code"`
-	EnvironmentCode       string   `json:"environment_code"`
-	Permissions           []string `json:"permissions"`
-	AuthorizationRevision uint64   `json:"authorization_revision"`
 }
 
 func NewAuthenticator(ctx context.Context, db *sql.DB, cfg config.Config) (*Authenticator, error) {
@@ -161,11 +140,14 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	authz, err := a.resolveAuthorization(ctx, token.AccessToken)
-	if err != nil || authz.Subject != claims.Subject || authz.IdentityID != claims.IdentityID || authz.TenantID != claims.TenantID || authz.ClientID != a.cfg.OIDCClientID || authz.ApplicationCode != "settlement" || authz.EnvironmentCode != a.cfg.OIDCEnvironmentCode || authz.AuthorizationRevision == 0 {
+	platformSubjectID, subjectErr := canonicalSubjectID(authz.SubjectID, authz.IdentityID)
+	compatibilityErr := validateSettlementCatalogCompatibility(authz)
+	if err != nil || subjectErr != nil || compatibilityErr != nil || authz.Subject != claims.Subject || authz.IdentityID != claims.IdentityID || authz.TenantID != claims.TenantID || authz.ClientID != a.cfg.OIDCClientID || authz.ApplicationCode != "settlement" || authz.EnvironmentCode != a.cfg.OIDCEnvironmentCode || authz.AuthorizationRevision == 0 {
 		http.Error(w, "application authorization denied", 403)
 		return
 	}
 	p := principal(authz, claims)
+	p.UserID = platformSubjectID
 	principalJSON, _ := json.Marshal(p)
 	tokenJSON, _ := json.Marshal(token)
 	rawSession, _ := random(48)
@@ -207,14 +189,16 @@ func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (serv
 		return service.Principal{}, ErrUnauthenticated
 	}
 	authz, err := a.resolveAuthorization(ctx, token.AccessToken)
-	if err != nil || authz.TenantID != tenant || authz.IdentityID != identity || authz.ClientID != a.cfg.OIDCClientID || authz.ApplicationCode != "settlement" || authz.EnvironmentCode != a.cfg.OIDCEnvironmentCode {
+	platformSubjectID, subjectErr := canonicalSubjectID(authz.SubjectID, authz.IdentityID)
+	compatibilityErr := validateSettlementCatalogCompatibility(authz)
+	if err != nil || subjectErr != nil || compatibilityErr != nil || authz.TenantID != tenant || platformSubjectID != identity || authz.ClientID != a.cfg.OIDCClientID || authz.ApplicationCode != "settlement" || authz.EnvironmentCode != a.cfg.OIDCEnvironmentCode {
 		return service.Principal{}, ErrUnauthenticated
 	}
 	var stored service.Principal
 	if json.Unmarshal(principalJSON, &stored) != nil {
 		return service.Principal{}, ErrUnauthenticated
 	}
-	current := principal(authz, oidcClaims{IdentityID: identity, Name: stored.UserID})
+	current := principal(authz, oidcClaims{IdentityID: identity, PersonID: stored.PersonID, Name: stored.DisplayName, PreferredUsername: stored.Username})
 	_, _ = a.db.ExecContext(ctx, `UPDATE settlement_oidc_session SET principal_json=?,authorization_revision=?,authorization_checked_at=UTC_TIMESTAMP(3),last_seen_at=UTC_TIMESTAMP(3) WHERE session_id_hash=?`, mustJSON(current), authz.AuthorizationRevision, digest(cookie.Value))
 	return current, nil
 }
@@ -235,32 +219,6 @@ func (a *Authenticator) LogoutLocal(w http.ResponseWriter, r *http.Request) {
 	expired.MaxAge = -1
 	http.SetCookie(w, expired)
 	w.WriteHeader(http.StatusNoContent)
-}
-func (a *Authenticator) resolveAuthorization(ctx context.Context, token string) (authorizationContext, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.cfg.PlatformBaseURL, "/")+"/oauth2/authorization-context", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return authorizationContext{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return authorizationContext{}, fmt.Errorf("authorization HTTP %d", resp.StatusCode)
-	}
-	var value authorizationContext
-	d := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
-	d.DisallowUnknownFields()
-	if err := d.Decode(&value); err != nil {
-		return authorizationContext{}, err
-	}
-	return value, nil
-}
-func principal(a authorizationContext, c oidcClaims) service.Principal {
-	permissions := map[string]bool{}
-	for _, v := range a.Permissions {
-		permissions[v] = true
-	}
-	return service.Principal{TenantID: a.TenantID, UserID: a.IdentityID, Permissions: permissions}
 }
 func (a *Authenticator) cookie(value string, expires time.Time) *http.Cookie {
 	return &http.Cookie{Name: a.cfg.OIDCSessionCookieName, Value: value, Path: "/settlement", Expires: expires, HttpOnly: true, Secure: a.cfg.OIDCSessionSecure, SameSite: http.SameSiteLaxMode}

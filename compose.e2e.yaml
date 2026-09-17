@@ -1,0 +1,4 @@
+services:
+  settlement-db:
+    ports:
+      - "127.0.0.1:13306:3306"

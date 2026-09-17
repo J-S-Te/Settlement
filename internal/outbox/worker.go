@@ -66,13 +66,43 @@ func (s *Store) Acquire(ctx context.Context, destination string, limit int) ([]E
 }
 func (s *Store) Delivered(ctx context.Context, events []Event) error {
 	for _, e := range events {
-		result, err := s.DB.ExecContext(ctx, `UPDATE settlement_outbox_event SET status='DELIVERED',delivered_at=UTC_TIMESTAMP(3),locked_by=NULL,locked_until=NULL,last_error_code='',last_error_summary='',updated_at=UTC_TIMESTAMP(3) WHERE id=? AND status='PROCESSING' AND locked_by=?`, e.ID, s.WorkerID)
+		tx, err := s.DB.BeginTx(ctx, nil)
 		if err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE settlement_outbox_event SET status='DELIVERED',delivered_at=UTC_TIMESTAMP(3),locked_by=NULL,locked_until=NULL,last_error_code='',last_error_summary='',updated_at=UTC_TIMESTAMP(3) WHERE id=? AND status='PROCESSING' AND locked_by=?`, e.ID, s.WorkerID)
+		if err != nil {
+			tx.Rollback()
 			return err
 		}
 		n, _ := result.RowsAffected()
 		if n != 1 {
+			tx.Rollback()
 			return ErrLeaseLost
+		}
+		if e.Destination == "TAX_INVOICE_COMMAND" {
+			var payload struct {
+				AttemptID         string `json:"attempt_id"`
+				RedFlushAttemptID string `json:"red_flush_attempt_id"`
+			}
+			if err = json.Unmarshal(e.Payload, &payload); err != nil {
+				tx.Rollback()
+				return errors.New("invalid tax command payload")
+			}
+			if payload.AttemptID != "" {
+				_, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_issue_attempt SET status='ACCEPTED',accepted_at=COALESCE(accepted_at,UTC_TIMESTAMP(3)),next_reconcile_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 1 MINUTE) WHERE id=? AND tenant_id=? AND status='PENDING'`, payload.AttemptID, e.TenantID)
+			} else if payload.RedFlushAttemptID != "" {
+				_, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_red_flush_attempt SET status='ACCEPTED',accepted_at=COALESCE(accepted_at,UTC_TIMESTAMP(3)),next_reconcile_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 1 MINUTE) WHERE id=? AND tenant_id=? AND status='PENDING'`, payload.RedFlushAttemptID, e.TenantID)
+			} else {
+				err = errors.New("tax command is missing attempt id")
+			}
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -219,6 +249,20 @@ func (w *Worker) deliver(ctx context.Context, d Destination, events []Event) err
 }
 
 func payloadFor(d Destination, event Event) (json.RawMessage, error) {
+	if d.Name == "TAX_INVOICE_COMMAND" {
+		var payload map[string]any
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return nil, errors.New("invalid tax command outbox payload")
+		}
+		payload["event_id"] = event.EventID
+		payload["event_type"] = event.EventType
+		payload["tenant_id"] = event.TenantID
+		payload["occurred_at"] = event.CreatedAt.UTC()
+		if _, exists := payload["schema_version"]; !exists {
+			payload["schema_version"] = 1
+		}
+		return json.Marshal(payload)
+	}
 	if d.Name != "PLATFORM_AUDIT" {
 		return event.Payload, nil
 	}

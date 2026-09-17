@@ -16,16 +16,16 @@ type Scanner struct {
 	BatchSize int
 }
 type candidate struct {
-	ReceivableID, Number, Customer, PolicyID, ActionType, RecipientRule, Channel, Priority string
-	PolicyVersion, RepeatDays, AgingDays                                                   int
+	TenantID, ReceivableID, Number, Customer, PolicyID, ActionType, RecipientRule, Channel, Priority string
+	PolicyVersion, RepeatDays, AgingDays                                                             int
 }
 
 func (s *Scanner) RunOnce(ctx context.Context) error {
 	if s.BatchSize < 1 || s.BatchSize > 200 {
 		s.BatchSize = 50
 	}
-	_, _ = s.DB.ExecContext(ctx, `UPDATE settlement_dunning_case dc JOIN settlement_receivable r ON r.id=dc.receivable_id SET dc.status='CLOSED',dc.closed_reason='RECEIVABLE_SETTLED',dc.updated_at=UTC_TIMESTAMP(3) WHERE dc.status='ACTIVE' AND r.open_amount=0`)
-	rows, err := s.DB.QueryContext(ctx, `SELECT r.id,r.receivable_no,cs.customer_name_snapshot,p.id,p.version,p.action_type,p.recipient_rule,p.channel,p.priority,p.repeat_interval_days,DATEDIFF(CURDATE(),r.due_date) FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id JOIN settlement_dunning_policy p ON p.tenant_id=r.tenant_id AND p.enabled=TRUE AND DATEDIFF(CURDATE(),r.due_date) BETWEEN p.aging_from_days AND p.aging_to_days LEFT JOIN settlement_dunning_case dc ON dc.receivable_id=r.id AND dc.dunning_policy_id=p.id AND dc.policy_version=p.version WHERE r.open_amount>0 AND r.due_date<CURDATE() AND dc.id IS NULL ORDER BY r.due_date LIMIT ?`, s.BatchSize)
+	_, _ = s.DB.ExecContext(ctx, `UPDATE settlement_dunning_case dc JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id SET dc.status='CLOSED',dc.closed_reason='RECEIVABLE_SETTLED',dc.updated_at=UTC_TIMESTAMP(3) WHERE dc.status='ACTIVE' AND r.open_amount=0`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT r.tenant_id,r.id,r.receivable_no,cs.customer_name_snapshot,p.id,p.version,p.action_type,p.recipient_rule,p.channel,p.priority,p.repeat_interval_days,DATEDIFF(CURDATE(),r.due_date) FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id JOIN settlement_dunning_policy p ON p.tenant_id=r.tenant_id AND p.enabled=TRUE AND DATEDIFF(CURDATE(),r.due_date) BETWEEN p.aging_from_days AND p.aging_to_days LEFT JOIN settlement_dunning_case dc ON dc.receivable_id=r.id AND dc.tenant_id=r.tenant_id AND dc.dunning_policy_id=p.id AND dc.policy_version=p.version WHERE r.open_amount>0 AND r.due_date<CURDATE() AND dc.id IS NULL ORDER BY r.due_date LIMIT ?`, s.BatchSize)
 	if err != nil {
 		return err
 	}
@@ -33,7 +33,7 @@ func (s *Scanner) RunOnce(ctx context.Context) error {
 	items := []candidate{}
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.ReceivableID, &c.Number, &c.Customer, &c.PolicyID, &c.PolicyVersion, &c.ActionType, &c.RecipientRule, &c.Channel, &c.Priority, &c.RepeatDays, &c.AgingDays); err != nil {
+		if err := rows.Scan(&c.TenantID, &c.ReceivableID, &c.Number, &c.Customer, &c.PolicyID, &c.PolicyVersion, &c.ActionType, &c.RecipientRule, &c.Channel, &c.Priority, &c.RepeatDays, &c.AgingDays); err != nil {
 			return err
 		}
 		items = append(items, c)
@@ -59,7 +59,7 @@ func (s *Scanner) create(ctx context.Context, c candidate) error {
 	}
 	defer tx.Rollback()
 	caseID, eventID := id(), id()
-	result, err := tx.ExecContext(ctx, `INSERT IGNORE INTO settlement_dunning_case(id,tenant_id,receivable_id,dunning_policy_id,policy_version,current_escalation_level,status,next_action_at,created_at,updated_at) SELECT ?,tenant_id,id,?,?,1,'ACTIVE',DATE_ADD(UTC_TIMESTAMP(3),INTERVAL ? DAY),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3) FROM settlement_receivable WHERE id=? AND open_amount>0`, caseID, c.PolicyID, c.PolicyVersion, c.RepeatDays, c.ReceivableID)
+	result, err := tx.ExecContext(ctx, `INSERT IGNORE INTO settlement_dunning_case(id,tenant_id,receivable_id,dunning_policy_id,policy_version,current_escalation_level,status,next_action_at,created_at,updated_at) SELECT ?,tenant_id,id,?,?,1,'ACTIVE',DATE_ADD(UTC_TIMESTAMP(3),INTERVAL ? DAY),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3) FROM settlement_receivable WHERE id=? AND tenant_id=? AND open_amount>0`, caseID, c.PolicyID, c.PolicyVersion, c.RepeatDays, c.ReceivableID, c.TenantID)
 	if err != nil {
 		return err
 	}
@@ -68,7 +68,7 @@ func (s *Scanner) create(ctx context.Context, c candidate) error {
 		return tx.Commit()
 	}
 	var tenant string
-	if err = tx.QueryRowContext(ctx, `SELECT tenant_id FROM settlement_receivable WHERE id=?`, c.ReceivableID).Scan(&tenant); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT tenant_id FROM settlement_receivable WHERE id=? AND tenant_id=?`, c.ReceivableID, c.TenantID).Scan(&tenant); err != nil {
 		return err
 	}
 	title := "应收逾期提醒"

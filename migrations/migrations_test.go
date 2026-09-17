@@ -48,9 +48,24 @@ func TestAllMigrationsKeepIDAndControlPlaneContracts(t *testing.T) {
 		"settlement_oidc_session", "last_seen_at", "settlement_invoice_request_item",
 		"settlement_tax_invoice", "settlement_dunning_policy", "settlement_local_notification",
 		"locked_by", "locked_until", "dead_lettered_at", "settlement_contract_stream",
+		"settlement_tax_result_inbox", "payload_hash", "processing_status",
+		"settlement_invoice_red_flush_attempt", "settlement_invoice_allocation_reversal",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("migrations missing %s", required)
+		}
+	}
+}
+
+func TestInvoiceDocumentAndRedFlushMigrationKeepsControlledWorkflow(t *testing.T) {
+	body, err := Files.ReadFile("000009_invoice_documents_red_flush_requests.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, required := range []string{"original_name", "media_type", "match_confidence", "settlement_invoice_red_flush_request", "idempotency_key", "requested_by", "reviewed_by", "review_reason", "version", "status"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("invoice workflow migration missing %s", required)
 		}
 	}
 }

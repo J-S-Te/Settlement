@@ -15,6 +15,15 @@ type ServiceIdentity struct{ TenantID, ApplicationCode, EnvironmentCode string }
 type ServiceTokenVerifier struct {
 	verifier                                                    *oidc.IDTokenVerifier
 	clientID, audience, tenant, application, environment, scope string
+	strict                                                      bool
+}
+
+func NewStrictServiceTokenVerifier(ctx context.Context, issuer, clientID, audience, tenant, application, environment, scope string) (*ServiceTokenVerifier, error) {
+	verifier, err := NewServiceTokenVerifier(ctx, issuer, clientID, audience, tenant, application, environment, scope)
+	if err == nil {
+		verifier.strict = true
+	}
+	return verifier, err
 }
 
 func NewServiceTokenVerifier(ctx context.Context, issuer, clientID, audience, tenant, application, environment, scope string) (*ServiceTokenVerifier, error) {
@@ -38,7 +47,9 @@ func (v *ServiceTokenVerifier) Verify(ctx context.Context, raw string) (ServiceI
 		Environment string `json:"environment_code"`
 		Scope       string `json:"scope"`
 	}
-	if token.Claims(&c) != nil || !strings.EqualFold(c.Type, "bearer") || c.AZP != v.clientID || !audience(token.Audience, v.audience) || (c.TokenUse != "" && c.TokenUse != "access_token") || (c.Tenant != "" && c.Tenant != v.tenant) || (c.Application != "" && c.Application != v.application) || (c.Environment != "" && c.Environment != v.environment) || !hasScope(c.Scope, v.scope) {
+	claimsErr := token.Claims(&c)
+	missingStrictClaims := v.strict && (c.Tenant == "" || c.Application == "" || c.Environment == "" || c.TokenUse == "")
+	if claimsErr != nil || missingStrictClaims || !strings.EqualFold(c.Type, "bearer") || c.AZP != v.clientID || !audience(token.Audience, v.audience) || (c.TokenUse != "" && c.TokenUse != "access_token") || (c.Tenant != "" && c.Tenant != v.tenant) || (c.Application != "" && c.Application != v.application) || (c.Environment != "" && c.Environment != v.environment) || !hasScope(c.Scope, v.scope) {
 		return ServiceIdentity{}, fmt.Errorf("%w: claims", ErrInvalidServiceToken)
 	}
 	return ServiceIdentity{v.tenant, v.application, v.environment}, nil
