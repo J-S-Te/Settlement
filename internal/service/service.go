@@ -24,9 +24,26 @@ type CreditEventPublisher interface {
 }
 
 type Service struct {
-	DB              *sql.DB
-	CreditPublisher CreditEventPublisher
+	DB                  *sql.DB
+	CreditPublisher     CreditEventPublisher
+	InvoiceIssuanceMode string
+	TaxProviderCode     string
 }
+
+func (s *Service) taxProviderCode() string {
+	if value := strings.TrimSpace(s.TaxProviderCode); value != "" {
+		return value
+	}
+	return "default"
+}
+
+func (s *Service) invoiceIssuanceMode() string {
+	if s.InvoiceIssuanceMode == "tax_adapter" {
+		return "tax_adapter"
+	}
+	return "manual"
+}
+
 type ContractEvent struct {
 	EventID    string    `json:"event_id"`
 	EventType  string    `json:"event_type"`
@@ -55,8 +72,14 @@ type PaymentTerm struct {
 	Amount        string `json:"amount"`
 }
 type Principal struct {
-	TenantID, UserID string
-	Permissions      map[string]bool
+	TenantID, UserID      string
+	Permissions           map[string]bool
+	IdentityID            string
+	PersonID              string
+	DisplayName           string
+	Username              string
+	CatalogVersion        string
+	AuthorizationRevision uint64
 }
 
 func (p Principal) Allows(permission string) bool {
@@ -192,25 +215,65 @@ func (s *Service) IngestContract(ctx context.Context, source string, event Contr
 	return true, tx.Commit()
 }
 
-func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, version int) error {
+type PlanConfirmationInput struct {
+	Version       int    `json:"version"`
+	DueDate       string `json:"due_date"`
+	PlannedAmount string `json:"planned_amount"`
+	Reason        string `json:"reason"`
+}
+
+// ConfirmPlan applies the last permitted edits to a pending plan and records
+// both old and new values in the audit outbox before creating the receivable.
+func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, in PlanConfirmationInput) error {
+	if in.Version < 1 {
+		return fmt.Errorf("%w: version must be positive", ErrInvalid)
+	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var snapshot, due, planned, currency string
-	err = tx.QueryRowContext(ctx, `SELECT rp.contract_snapshot_id,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,cs.currency FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id WHERE rp.id=? AND rp.tenant_id=? AND rp.confirmation_status='PENDING_CONFIRMATION' AND rp.version=? FOR UPDATE`, id, p.TenantID, version).Scan(&snapshot, &due, &planned, &currency)
+	err = tx.QueryRowContext(ctx, `SELECT rp.contract_snapshot_id,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,cs.currency FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.id=? AND rp.tenant_id=? AND rp.confirmation_status='PENDING_CONFIRMATION' AND rp.version=? FOR UPDATE`, id, p.TenantID, in.Version).Scan(&snapshot, &due, &planned, &currency)
 	if err == sql.ErrNoRows {
 		return ErrConflict
 	}
 	if err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE settlement_receivable_plan SET confirmation_status='CONFIRMED',version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=? AND version=?`, id, p.TenantID, version); err != nil {
+	confirmedDue := strings.TrimSpace(in.DueDate)
+	if confirmedDue == "" {
+		confirmedDue = due
+	}
+	if _, parseErr := time.Parse("2006-01-02", confirmedDue); parseErr != nil {
+		return fmt.Errorf("%w: due_date must be YYYY-MM-DD", ErrInvalid)
+	}
+	confirmedAmount := strings.TrimSpace(in.PlannedAmount)
+	if confirmedAmount == "" {
+		confirmedAmount = planned
+	} else if confirmedAmount, err = amount(confirmedAmount); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receivable(id,tenant_id,receivable_no,contract_snapshot_id,receivable_plan_id,due_date,original_amount,open_amount,currency,recognition_status,collection_status,invoice_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, newID(), p.TenantID, "AR-"+newID()[:12], snapshot, id, due, planned, planned, currency, "CONFIRMED", "UNPAID", "NOT_INVOICED")
+	reason := strings.TrimSpace(in.Reason)
+	if len(reason) > 500 {
+		return fmt.Errorf("%w: reason is too long", ErrInvalid)
+	}
+	if (confirmedDue != due || confirmedAmount != planned) && reason == "" {
+		return fmt.Errorf("%w: reason is required when plan values change", ErrInvalid)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE settlement_receivable_plan SET due_date=?,planned_amount=?,confirmation_status='CONFIRMED',confirmation_reason=?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=? AND version=?`, confirmedDue, confirmedAmount, reason, id, p.TenantID, in.Version); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receivable(id,tenant_id,receivable_no,contract_snapshot_id,receivable_plan_id,due_date,original_amount,open_amount,currency,recognition_status,collection_status,invoice_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, newID(), p.TenantID, "AR-"+newID()[:12], snapshot, id, confirmedDue, confirmedAmount, confirmedAmount, currency, "CONFIRMED", "UNPAID", "NOT_INVOICED")
 	if err != nil {
+		return err
+	}
+	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_RECEIVABLE_PLAN_CONFIRMED", "receivable_plan", id, map[string]any{
+		"actor_id": p.UserID, "result": "SUCCESS", "risk_level": "HIGH",
+		"old_due_date": due, "new_due_date": confirmedDue,
+		"old_planned_amount": planned, "new_planned_amount": confirmedAmount,
+		"reason": reason,
+	}); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -234,28 +297,57 @@ func (s *Service) CreateReceipt(ctx context.Context, p Principal, key string, in
 	if _, err = required(key, "Idempotency-Key"); err != nil {
 		return "", err
 	}
+	if in.CustomerID, err = required(in.CustomerID, "customer_id"); err != nil {
+		return "", err
+	}
+	if in.CustomerName, err = required(in.CustomerName, "customer_name"); err != nil {
+		return "", err
+	}
+	if in.BankReference, err = required(in.BankReference, "bank_transaction_reference"); err != nil {
+		return "", err
+	}
+	in.Currency = strings.ToUpper(strings.TrimSpace(in.Currency))
+	if len(in.Currency) != 3 {
+		return "", fmt.Errorf("%w: currency must be a three-letter code", ErrInvalid)
+	}
+	in.PaymentMethod = strings.ToUpper(strings.TrimSpace(in.PaymentMethod))
+	if !map[string]bool{"TRANSFER": true, "BANK_ACCEPTANCE": true, "CHEQUE": true, "CASH": true}[in.PaymentMethod] {
+		return "", fmt.Errorf("%w: invalid payment_method", ErrInvalid)
+	}
 	if _, err = time.Parse("2006-01-02", in.ReceiptDate); err != nil {
 		return "", fmt.Errorf("%w: receipt_date must be YYYY-MM-DD", ErrInvalid)
 	}
 	id := newID()
 	no := "RC-" + id[:12]
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO settlement_receipt(id,tenant_id,receipt_no,customer_id,customer_name_snapshot,amount,unallocated_amount,currency,receipt_date,payment_method,bank_transaction_reference,source_type,status,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, no, in.CustomerID, in.CustomerName, a, a, strings.ToUpper(in.Currency), in.ReceiptDate, in.PaymentMethod, in.BankReference, "MANUAL", "AVAILABLE", key)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receipt(id,tenant_id,receipt_no,customer_id,customer_name_snapshot,amount,unallocated_amount,currency,receipt_date,payment_method,bank_transaction_reference,source_type,status,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, no, in.CustomerID, in.CustomerName, a, a, in.Currency, in.ReceiptDate, in.PaymentMethod, in.BankReference, "MANUAL", "AVAILABLE", key)
 	if err != nil {
 		if mysqlDuplicate(err) {
 			var existing string
-			lookup := s.DB.QueryRowContext(ctx, `SELECT id FROM settlement_receipt WHERE tenant_id=? AND idempotency_key=?`, p.TenantID, key).Scan(&existing)
-			return existing, lookup
+			lookup := tx.QueryRowContext(ctx, `SELECT id FROM settlement_receipt WHERE tenant_id=? AND idempotency_key=?`, p.TenantID, key).Scan(&existing)
+			if lookup == nil {
+				return existing, tx.Commit()
+			}
+			return "", ErrConflict
 		}
 		return "", err
 	}
-	return id, nil
+	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_RECEIPT_RECORDED", "receipt", id, map[string]any{"actor_id": p.UserID, "source_type": "MANUAL", "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
+		return "", err
+	}
+	return id, tx.Commit()
 }
 
 type AllocationInput struct {
-	ReceiptID    string `json:"receipt_id"`
-	ReceivableID string `json:"receivable_id"`
-	Amount       string `json:"amount"`
-	MatchMode    string `json:"match_mode"`
+	ReceiptID       string `json:"receipt_id"`
+	ReceivableID    string `json:"receivable_id"`
+	Amount          string `json:"amount"`
+	MatchMode       string `json:"match_mode"`
+	MatchConfidence int    `json:"match_confidence"`
 }
 
 func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string, in AllocationInput) (string, error) {
@@ -265,6 +357,13 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 	}
 	if _, err = required(key, "Idempotency-Key"); err != nil {
 		return "", err
+	}
+	in.MatchMode = strings.ToUpper(strings.TrimSpace(in.MatchMode))
+	if in.MatchMode != "MANUAL" && in.MatchMode != "SUGGESTED" {
+		return "", fmt.Errorf("%w: invalid match_mode", ErrInvalid)
+	}
+	if in.MatchConfidence < 0 || in.MatchConfidence > 100 || (in.MatchMode == "SUGGESTED" && in.MatchConfidence == 0) {
+		return "", fmt.Errorf("%w: match_confidence must be between 1 and 100 for suggested matches", ErrInvalid)
 	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -281,7 +380,7 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 	if err != nil {
 		return "", err
 	}
-	err = tx.QueryRowContext(ctx, `SELECT r.open_amount,r.original_amount,r.currency,cs.customer_id,DATE_FORMAT(r.due_date,'%Y-%m-%d'),cs.source_contract_no,rp.installment_no FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id JOIN settlement_receivable_plan rp ON rp.id=r.receivable_plan_id WHERE r.id=? AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.collection_status IN ('UNPAID','PARTIALLY_SETTLED') FOR UPDATE`, in.ReceivableID, p.TenantID).Scan(&receivableOpen, &receivableOriginal, &receivableCurrency, &receivableCustomer, &dueDate, &contractNo, &installment)
+	err = tx.QueryRowContext(ctx, `SELECT r.open_amount,r.original_amount,r.currency,cs.customer_id,DATE_FORMAT(r.due_date,'%Y-%m-%d'),cs.source_contract_no,rp.installment_no FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id JOIN settlement_receivable_plan rp ON rp.id=r.receivable_plan_id AND rp.tenant_id=r.tenant_id WHERE r.id=? AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.collection_status IN ('UNPAID','PARTIALLY_SETTLED') FOR UPDATE`, in.ReceivableID, p.TenantID).Scan(&receivableOpen, &receivableOriginal, &receivableCurrency, &receivableCustomer, &dueDate, &contractNo, &installment)
 	if err == sql.ErrNoRows {
 		return "", ErrConflict
 	}
@@ -298,7 +397,7 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 		return "", ErrConflict
 	}
 	id := newID()
-	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receipt_allocation(id,tenant_id,allocation_no,receipt_id,receivable_id,allocated_amount,currency,status,match_mode,confirmed_by,confirmed_at,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),?,UTC_TIMESTAMP(3))`, id, p.TenantID, "AL-"+id[:12], in.ReceiptID, in.ReceivableID, a, receiptCurrency, "CONFIRMED", in.MatchMode, p.UserID, key)
+	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receipt_allocation(id,tenant_id,allocation_no,receipt_id,receivable_id,allocated_amount,currency,status,match_mode,match_confidence,confirmed_by,confirmed_at,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),?,UTC_TIMESTAMP(3))`, id, p.TenantID, "AL-"+id[:12], in.ReceiptID, in.ReceivableID, a, receiptCurrency, "CONFIRMED", in.MatchMode, in.MatchConfidence, p.UserID, key)
 	if err != nil {
 		if mysqlDuplicate(err) {
 			return "", ErrConflict
@@ -329,6 +428,9 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 		if err = insertCreditSync(ctx, tx, p.TenantID, creditEventID, id, in.ReceivableID, payload); err != nil {
 			return "", err
 		}
+	}
+	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_ALLOCATION_CONFIRMED", "receipt_allocation", id, map[string]any{"actor_id": p.UserID, "receipt_id": in.ReceiptID, "receivable_id": in.ReceivableID, "match_mode": in.MatchMode, "match_confidence": in.MatchConfidence, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
+		return "", err
 	}
 	if err = tx.Commit(); err != nil {
 		return "", err

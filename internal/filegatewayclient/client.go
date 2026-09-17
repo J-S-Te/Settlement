@@ -93,6 +93,43 @@ func (c *Client) Bind(ctx context.Context, applicationID, fileID, resourceType, 
 	return c.do(ctx, http.MethodPost, "/api/v1/files/"+url.PathEscape(fileID)+"/bindings", "", bytes.NewReader(payload), "application/json", nil)
 }
 
+// Download reads a READY file after the settlement API has already verified
+// the caller's business-resource access. The bounded buffer prevents a file
+// gateway response from exhausting API memory.
+func (c *Client) Download(ctx context.Context, fileID string) ([]byte, error) {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return nil, errors.New("file ID is required")
+	}
+	token, err := c.token(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get file gateway token: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/files/"+url.PathEscape(fileID)+"/content", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/octet-stream")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("download file gateway object: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		return nil, fmt.Errorf("file gateway returned HTTP %d", resp.StatusCode)
+	}
+	content, err := io.ReadAll(io.LimitReader(resp.Body, maxUploadBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read file gateway response: %w", err)
+	}
+	if int64(len(content)) > maxUploadBytes {
+		return nil, errors.New("file gateway response exceeds 20 MiB")
+	}
+	return content, nil
+}
+
 func (c *Client) do(ctx context.Context, method, path, requestID string, body io.Reader, contentType string, target any) error {
 	token, err := c.token(ctx)
 	if err != nil {

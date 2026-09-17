@@ -21,13 +21,18 @@ type oidcClaims struct {
 }
 
 // principal 将已通过平台授权上下文校验的身份和权限转换为结算业务使用的主体。
-func principal(a authorizationContext, _ oidcClaims) service.Principal {
+func principal(a authorizationContext, claims oidcClaims) service.Principal {
 	permissions := make(map[string]bool, len(a.Permissions))
 	for _, permission := range a.Permissions {
 		permissions[permission] = true
 	}
 	subjectID, _ := canonicalSubjectID(a.SubjectID, a.IdentityID)
-	return service.Principal{TenantID: a.TenantID, UserID: subjectID, Permissions: permissions}
+	return service.Principal{
+		TenantID: a.TenantID, UserID: subjectID, Permissions: permissions,
+		IdentityID: a.IdentityID, PersonID: claims.PersonID,
+		DisplayName: strings.TrimSpace(claims.Name), Username: strings.TrimSpace(claims.PreferredUsername),
+		CatalogVersion: a.CatalogVersion, AuthorizationRevision: a.AuthorizationRevision,
+	}
 }
 
 func canonicalSubjectID(subjectID, identityID string) (string, error) {

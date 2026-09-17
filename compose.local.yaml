@@ -29,6 +29,7 @@ services:
       SETTLEMENT_PUBLIC_ORIGIN: http://localhost:5173
       SETTLEMENT_DEVELOPMENT_AUTH: "true"
       SETTLEMENT_INTEGRATION_ENABLED: "false"
+      SETTLEMENT_INVOICE_ISSUANCE_MODE: manual
       OIDC_SESSION_COOKIE_SECURE: "false"
     ports:
       - "18085:8085"
@@ -42,6 +43,7 @@ services:
       SETTLEMENT_MYSQL_DSN: settlement:settlement-local@tcp(settlement-db:3306)/settlement?parseTime=true&charset=utf8mb4&loc=UTC
       PLATFORM_BASE_URL: ${PLATFORM_BASE_URL:-http://host.docker.internal:8080}
       PLATFORM_ENVIRONMENT_CODE: ${PLATFORM_ENVIRONMENT_CODE:-dev}
+      SETTLEMENT_INVOICE_ISSUANCE_MODE: manual
     depends_on:
       settlement-migrate:
         condition: service_completed_successfully

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -55,7 +56,7 @@ func TestInvoiceFlow(t *testing.T) {
 	const tenant = "dev"
 	source := "integration-test"
 	suffix := time.Now().UTC().Format("20060102150405.000000000")
-	eventID := "E2E-INVOICE-" + strings.ReplaceAll(suffix, ".", "")
+	eventID := "E2E-" + strings.ReplaceAll(suffix, ".", "")
 	contractID := "E2E-CONTRACT-" + strings.ReplaceAll(suffix, ".", "")
 	contractNo := "E2E-HT-" + strings.ReplaceAll(suffix, ".", "")
 	defer cleanupInvoiceFlow(t, db, tenant, source, eventID, contractID)
@@ -103,7 +104,7 @@ func TestInvoiceFlow(t *testing.T) {
 		t.Fatalf("receivable must not exist before confirmation: count=%d err=%v", count, err)
 	}
 
-	if err := svc.ConfirmPlan(ctx, service.Principal{TenantID: tenant, UserID: "dev-finance", Permissions: map[string]bool{"settlement.admin": true}}, planID, planVersion); err != nil {
+	if err := svc.ConfirmPlan(ctx, service.Principal{TenantID: tenant, UserID: "dev-finance", Permissions: map[string]bool{"settlement.admin": true}}, planID, service.PlanConfirmationInput{Version: planVersion}); err != nil {
 		t.Fatalf("confirm receivable plan: %v", err)
 	}
 	var receivableID string
@@ -111,7 +112,7 @@ func TestInvoiceFlow(t *testing.T) {
 		t.Fatalf("find confirmed receivable: %v", err)
 	}
 
-	handler := httpapi.New(db, config.Config{DevelopmentAuth: true, PublicOrigin: "http://localhost:5173"}, slog.Default(), nil, nil)
+	handler := httpapi.New(db, config.Config{DevelopmentAuth: true, PublicOrigin: "http://localhost:5173"}, slog.Default(), nil, nil, nil)
 	assertEligibleAmount(t, handler, "120000.00", receivableID)
 
 	firstRequest := createInvoiceRequest(t, handler, snapshotID, receivableID, "50000.00", "e2e-invoice-1")
@@ -130,10 +131,115 @@ func TestInvoiceFlow(t *testing.T) {
 		t.Fatalf("second invoice request id=%q is invalid", secondRequest)
 	}
 	assertNoEligibleReceivable(t, handler)
+	// A lost success response after the final reservation must still be safely
+	// replayable even though no invoiceable balance remains.
+	if got := createInvoiceRequest(t, handler, snapshotID, receivableID, "70000.00", "e2e-invoice-2"); got != secondRequest {
+		t.Fatalf("full-balance idempotent retry returned %q, want %q", got, secondRequest)
+	}
+	assertInvoiceRequestStatus(t, handler, snapshotID, receivableID, "1.00", "e2e-invoice-2", http.StatusConflict)
 
-	// The backend must reject any amount beyond the confirmed and unreserved
-	// balance, even if a caller bypasses the UI.
-	assertInvoiceRequestStatus(t, handler, snapshotID, receivableID, "1.00", "e2e-invoice-over-limit", http.StatusConflict)
+	manualService := &service.Service{DB: db, InvoiceIssuanceMode: "manual"}
+	if _, err := manualService.ApproveInvoiceRequest(ctx, service.Principal{TenantID: tenant, UserID: "reviewer-1"}, firstRequest, 1); err != nil {
+		t.Fatalf("approve manual invoice request: %v", err)
+	}
+	assertIssueChannelAndTaxCommands(t, db, tenant, firstRequest, "MANUAL", 0)
+	manualInvoiceID, err := manualService.RegisterManualInvoice(ctx, service.Principal{TenantID: tenant, UserID: "issuer-1"}, firstRequest, service.ManualInvoiceInput{InvoiceCode: "E2E-CODE", InvoiceNo: "E2E-NO-" + firstRequest[:8], IssueDate: time.Now().UTC().Format("2006-01-02")})
+	if err != nil || manualInvoiceID == "" {
+		t.Fatalf("register manual invoice: id=%q err=%v", manualInvoiceID, err)
+	}
+	if _, err = manualService.RegisterManualInvoice(ctx, service.Principal{TenantID: tenant, UserID: "issuer-1"}, firstRequest, service.ManualInvoiceInput{InvoiceCode: "E2E-CODE", InvoiceNo: "E2E-DUP-" + firstRequest[:8], IssueDate: time.Now().UTC().Format("2006-01-02")}); !errors.Is(err, service.ErrConflict) {
+		t.Fatalf("duplicate manual issue err=%v, want conflict", err)
+	}
+
+	adapterService := &service.Service{DB: db, InvoiceIssuanceMode: "tax_adapter", TaxProviderCode: "e2e-provider"}
+	adapterAttemptID, err := adapterService.ApproveInvoiceRequest(ctx, service.Principal{TenantID: tenant, UserID: "reviewer-2"}, secondRequest, 1)
+	if err != nil {
+		t.Fatalf("approve adapter invoice request: %v", err)
+	}
+	assertIssueChannelAndTaxCommands(t, db, tenant, secondRequest, "TAX_ADAPTER", 1)
+	if _, err = adapterService.RegisterManualInvoice(ctx, service.Principal{TenantID: tenant, UserID: "issuer-1"}, secondRequest, service.ManualInvoiceInput{InvoiceCode: "E2E-CODE", InvoiceNo: "E2E-ADAPTER-" + secondRequest[:8], IssueDate: time.Now().UTC().Format("2006-01-02")}); !errors.Is(err, service.ErrConflict) {
+		t.Fatalf("adapter request accepted manual invoice: %v", err)
+	}
+	unknown := service.TaxCallbackEvent{EventID: "tax-unknown-" + adapterAttemptID, EventType: service.TaxInvoiceIssueUnknownEvent, TenantID: tenant, ProviderCode: "e2e-provider", OccurredAt: time.Now().UTC(), ResultSequence: 1, AttemptID: adapterAttemptID, ExternalRequestID: adapterAttemptID, FailureCode: "TIMEOUT", FailureMessage: "result temporarily unknown"}
+	if result, callbackErr := adapterService.ApplyTaxCallback(ctx, tenant, unknown); callbackErr != nil || result != "APPLIED" {
+		t.Fatalf("apply unknown tax result: result=%q err=%v", result, callbackErr)
+	}
+	invoiceResult := &service.TaxInvoiceResult{ExternalInvoiceID: "EXT-" + adapterAttemptID, InvoiceCode: "E2E-TAX", InvoiceNo: "NO-" + adapterAttemptID[:12], InvoiceType: "VAT_SPECIAL", Currency: "CNY", AmountExclTax: "70000.00", TaxAmount: "0.00", AmountInclTax: "70000.00", IssueDate: time.Now().UTC().Format("2006-01-02"), SellerProfile: map[string]any{"name": "E2E seller"}, Items: []service.InvoiceItemInput{{ItemName: "集成测试服务", Quantity: "1", UnitPriceExclTax: "70000.00", AmountExclTax: "70000.00", TaxRate: "0", TaxAmount: "0", AmountInclTax: "70000.00"}}}
+	issued := service.TaxCallbackEvent{EventID: "tax-issued-" + adapterAttemptID, EventType: service.TaxInvoiceIssuedEvent, TenantID: tenant, ProviderCode: "e2e-provider", OccurredAt: time.Now().UTC(), ResultSequence: 2, AttemptID: adapterAttemptID, ExternalRequestID: adapterAttemptID, ExternalOperationID: "OP-" + adapterAttemptID, Invoice: invoiceResult}
+	if result, callbackErr := adapterService.ApplyTaxCallback(ctx, tenant, issued); callbackErr != nil || result != "APPLIED" {
+		t.Fatalf("apply issued tax result: result=%q err=%v", result, callbackErr)
+	}
+	if result, callbackErr := adapterService.ApplyTaxCallback(ctx, tenant, issued); callbackErr != nil || result != "APPLIED" {
+		t.Fatalf("duplicate issued tax result: result=%q err=%v", result, callbackErr)
+	}
+	conflicting := issued
+	conflicting.FailureMessage = "tampered replay"
+	if _, callbackErr := adapterService.ApplyTaxCallback(ctx, tenant, conflicting); !errors.Is(callbackErr, service.ErrConflict) {
+		t.Fatalf("conflicting tax result err=%v, want conflict", callbackErr)
+	}
+	stale := unknown
+	stale.EventID = "tax-stale-" + adapterAttemptID
+	if result, callbackErr := adapterService.ApplyTaxCallback(ctx, tenant, stale); callbackErr != nil || result != "IGNORED_STALE" {
+		t.Fatalf("stale tax result: result=%q err=%v", result, callbackErr)
+	}
+	taxHandler := httpapi.New(db, config.Config{DevelopmentAuth: true, TaxResultIngestEnabled: true, TaxResultBearerToken: "e2e-tax-secret", OIDCTenantID: tenant, PublicOrigin: "http://localhost:5173", TaxProviderCode: "e2e-provider"}, slog.Default(), nil, nil, nil)
+	httpStale := stale
+	httpStale.EventID = "tax-http-stale-" + adapterAttemptID
+	unauthorized := httptest.NewRequest(http.MethodPost, "/internal/v1/settlement/events/tax-results", jsonBody(t, httpStale))
+	unauthorizedResponse := httptest.NewRecorder()
+	taxHandler.ServeHTTP(unauthorizedResponse, unauthorized)
+	if unauthorizedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("tax callback without machine token status=%d, want 401", unauthorizedResponse.Code)
+	}
+	authorized := httptest.NewRequest(http.MethodPost, "/internal/v1/settlement/events/tax-results", jsonBody(t, httpStale))
+	authorized.Header.Set("Authorization", "Bearer e2e-tax-secret")
+	authorizedResponse := httptest.NewRecorder()
+	taxHandler.ServeHTTP(authorizedResponse, authorized)
+	if authorizedResponse.Code != http.StatusAccepted {
+		t.Fatalf("tax callback with machine token status=%d body=%s, want 202", authorizedResponse.Code, authorizedResponse.Body.String())
+	}
+	var adapterInvoiceID string
+	if err = db.QueryRowContext(ctx, `SELECT id FROM settlement_tax_invoice WHERE tenant_id=? AND invoice_request_id=? AND issued_by_channel='TAX_ADAPTER'`, tenant, secondRequest).Scan(&adapterInvoiceID); err != nil {
+		t.Fatalf("find adapter invoice: %v", err)
+	}
+	redRequestID, err := adapterService.RequestInvoiceRedFlush(ctx, service.Principal{TenantID: tenant, UserID: "red-requester"}, "e2e-red-"+adapterInvoiceID, adapterInvoiceID, service.InvoiceRedFlushInput{ReasonCode: "INVOICE_ERROR", ReasonDetail: "E2E red flush"})
+	if err != nil {
+		t.Fatalf("request red flush: %v", err)
+	}
+	if err = adapterService.ReviewInvoiceRedFlush(ctx, service.Principal{TenantID: tenant, UserID: "red-reviewer"}, redRequestID, true, service.InvoiceRedFlushReviewInput{Version: 1}); err != nil {
+		t.Fatalf("approve red flush: %v", err)
+	}
+	var redAttemptID string
+	if err = db.QueryRowContext(ctx, `SELECT id FROM settlement_invoice_red_flush_attempt WHERE tenant_id=? AND red_flush_request_id=?`, tenant, redRequestID).Scan(&redAttemptID); err != nil {
+		t.Fatalf("find red flush attempt: %v", err)
+	}
+	redResult := *invoiceResult
+	redResult.ExternalInvoiceID = "RED-EXT-" + redAttemptID
+	redResult.InvoiceCode = "E2E-RED"
+	redResult.InvoiceNo = "RED-" + redAttemptID[:12]
+	redIssued := service.TaxCallbackEvent{EventID: "tax-red-" + redAttemptID, EventType: service.TaxInvoiceRedFlushedEvent, TenantID: tenant, ProviderCode: "e2e-provider", OccurredAt: time.Now().UTC(), ResultSequence: 1, RedFlushAttemptID: redAttemptID, RedFlushRequestID: redRequestID, ExternalRequestID: redAttemptID, ExternalOperationID: "RED-OP-" + redAttemptID, Invoice: &redResult}
+	if result, callbackErr := adapterService.ApplyTaxCallback(ctx, tenant, redIssued); callbackErr != nil || result != "APPLIED" {
+		t.Fatalf("apply red tax result: result=%q err=%v", result, callbackErr)
+	}
+	if err = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM settlement_invoice_red_flush_relation WHERE tenant_id=? AND red_flush_request_id=?`, tenant, redRequestID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("red flush relation count=%d err=%v", count, err)
+	}
+
+	// The red invoice appends a reversal fact and restores only the red-flushed
+	// 70,000 allocation; the manually issued 50,000 remains invoiced.
+	assertEligibleAmount(t, handler, "70000.00", receivableID)
+}
+
+func assertIssueChannelAndTaxCommands(t *testing.T, db *sql.DB, tenant, requestID, wantChannel string, wantCommands int) {
+	t.Helper()
+	var channel string
+	if err := db.QueryRow(`SELECT channel FROM settlement_invoice_issue_attempt WHERE tenant_id=? AND invoice_request_id=? ORDER BY attempt_no DESC LIMIT 1`, tenant, requestID).Scan(&channel); err != nil || channel != wantChannel {
+		t.Fatalf("issue channel=%q err=%v, want %q", channel, err, wantChannel)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM settlement_outbox_event WHERE tenant_id=? AND destination='TAX_INVOICE_COMMAND' AND aggregate_id=?`, tenant, requestID).Scan(&count); err != nil || count != wantCommands {
+		t.Fatalf("tax commands=%d err=%v, want %d", count, err, wantCommands)
+	}
 }
 
 func createInvoiceRequest(t *testing.T, handler http.Handler, snapshotID, receivableID, amount, key string) string {
@@ -204,7 +310,7 @@ func assertNoEligibleReceivable(t *testing.T, handler http.Handler) {
 	}
 }
 
-func eligibleReceivables(t *testing.T, handler http.Handler) []map[string]string {
+func eligibleReceivables(t *testing.T, handler http.Handler) []map[string]any {
 	t.Helper()
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/invoice-eligible-receivables", nil)
 	response := httptest.NewRecorder()
@@ -213,7 +319,7 @@ func eligibleReceivables(t *testing.T, handler http.Handler) []map[string]string
 		t.Fatalf("eligible receivables status=%d body=%s", response.Code, response.Body.String())
 	}
 	var envelope struct {
-		Data []map[string]string `json:"data"`
+		Data []map[string]any `json:"data"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
 		t.Fatal(err)
@@ -256,11 +362,25 @@ func cleanupInvoiceFlow(t *testing.T, db *sql.DB, tenant, source, eventID, contr
 		}
 	}
 	for _, id := range receivableIDs {
-		_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_request_allocation WHERE tenant_id=? AND receivable_id=?`, tenant, id)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_allocation_reversal WHERE tenant_id=? AND original_allocation_id IN (SELECT id FROM settlement_invoice_request_allocation WHERE tenant_id=? AND receivable_id=?)`, tenant, tenant, id)
 	}
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_tax_result_inbox WHERE tenant_id=? AND aggregate_id IN (SELECT id FROM settlement_invoice_issue_attempt WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?) UNION SELECT id FROM settlement_invoice_red_flush_attempt WHERE tenant_id=? AND original_invoice_id IN (SELECT id FROM settlement_tax_invoice WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?)))`, tenant, tenant, tenant, snapshotID, tenant, tenant, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_red_flush_relation WHERE tenant_id=? AND original_invoice_id IN (SELECT id FROM settlement_tax_invoice WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?))`, tenant, tenant, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_red_flush_attempt WHERE tenant_id=? AND original_invoice_id IN (SELECT id FROM settlement_tax_invoice WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?))`, tenant, tenant, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_red_flush_request WHERE tenant_id=? AND original_invoice_id IN (SELECT id FROM settlement_tax_invoice WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?))`, tenant, tenant, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_document WHERE tenant_id=? AND tax_invoice_id IN (SELECT id FROM settlement_tax_invoice WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?))`, tenant, tenant, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_tax_invoice_item WHERE tenant_id=? AND tax_invoice_id IN (SELECT id FROM settlement_tax_invoice WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?))`, tenant, tenant, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `UPDATE settlement_invoice_issue_attempt SET tax_invoice_id=NULL WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?)`, tenant, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_tax_invoice WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?)`, tenant, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_issue_attempt WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?)`, tenant, tenant, snapshotID)
 	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_request_item WHERE tenant_id=? AND invoice_request_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?)`, tenant, tenant, snapshotID)
 	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_outbox_event WHERE tenant_id=? AND aggregate_id IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?)`, tenant, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_outbox_event WHERE tenant_id=? AND aggregate_id NOT IN (SELECT id FROM settlement_invoice_request WHERE tenant_id=?) AND payload_json LIKE ?`, tenant, tenant, "%"+snapshotID+"%")
+	for _, id := range receivableIDs {
+		_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_request_allocation WHERE tenant_id=? AND receivable_id=?`, tenant, id)
+	}
 	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=?`, tenant, snapshotID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_idempotency_record WHERE tenant_id=? AND command_type='CREATE_INVOICE_REQUEST' AND idempotency_key LIKE 'e2e-invoice-%'`, tenant)
 	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_receivable WHERE tenant_id=? AND contract_snapshot_id=?`, tenant, snapshotID)
 	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_receivable_plan WHERE tenant_id=? AND contract_snapshot_id=?`, tenant, snapshotID)
 	_, _ = tx.ExecContext(ctx, `DELETE FROM settlement_contract_snapshot WHERE tenant_id=? AND id=?`, tenant, snapshotID)

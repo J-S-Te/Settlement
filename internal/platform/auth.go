@@ -198,7 +198,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (serv
 	if json.Unmarshal(principalJSON, &stored) != nil {
 		return service.Principal{}, ErrUnauthenticated
 	}
-	current := principal(authz, oidcClaims{IdentityID: identity, Name: stored.UserID})
+	current := principal(authz, oidcClaims{IdentityID: identity, PersonID: stored.PersonID, Name: stored.DisplayName, PreferredUsername: stored.Username})
 	_, _ = a.db.ExecContext(ctx, `UPDATE settlement_oidc_session SET principal_json=?,authorization_revision=?,authorization_checked_at=UTC_TIMESTAMP(3),last_seen_at=UTC_TIMESTAMP(3) WHERE session_id_hash=?`, mustJSON(current), authz.AuthorizationRevision, digest(cookie.Value))
 	return current, nil
 }

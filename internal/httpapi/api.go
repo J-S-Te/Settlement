@@ -1,7 +1,10 @@
 package httpapi
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
@@ -10,7 +13,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -21,17 +26,26 @@ import (
 )
 
 type API struct {
-	service   *service.Service
-	cfg       config.Config
-	logger    *slog.Logger
-	auth      *platform.Authenticator
-	machine   *platform.ServiceTokenVerifier
-	directory platform.PersonnelDirectory
+	service    *service.Service
+	cfg        config.Config
+	logger     *slog.Logger
+	auth       *platform.Authenticator
+	machine    *platform.ServiceTokenVerifier
+	taxMachine *platform.ServiceTokenVerifier
+	directory  platform.PersonnelDirectory
+	files      InvoiceFileGateway
 }
 
-func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Authenticator, machine *platform.ServiceTokenVerifier, dependencies ...any) http.Handler {
+type InvoiceFileGateway interface {
+	Upload(context.Context, string, string, string, string, string, io.Reader) (string, error)
+	Bind(context.Context, string, string, string, string, string, string) error
+	Download(context.Context, string) ([]byte, error)
+}
+
+func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Authenticator, machine, taxMachine *platform.ServiceTokenVerifier, dependencies ...any) http.Handler {
 	var directory platform.PersonnelDirectory
 	var publisher service.CreditEventPublisher
+	var files InvoiceFileGateway
 	for _, dependency := range dependencies {
 		if value, ok := dependency.(platform.PersonnelDirectory); ok {
 			directory = value
@@ -39,8 +53,11 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 		if value, ok := dependency.(service.CreditEventPublisher); ok {
 			publisher = value
 		}
+		if value, ok := dependency.(InvoiceFileGateway); ok {
+			files = value
+		}
 	}
-	return &API{service: &service.Service{DB: db, CreditPublisher: publisher}, cfg: cfg, logger: logger, auth: auth, machine: machine, directory: directory}
+	return &API{service: &service.Service{DB: db, CreditPublisher: publisher, InvoiceIssuanceMode: cfg.InvoiceIssuanceMode, TaxProviderCode: cfg.TaxProviderCode}, cfg: cfg, logger: logger, auth: auth, machine: machine, taxMachine: taxMachine, directory: directory, files: files}
 }
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
@@ -113,6 +130,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/internal/v1/settlement/events/contracts" && r.Method == http.MethodPost:
 		a.contractEvent(w, r)
 		return
+	case r.URL.Path == "/internal/v1/settlement/events/tax-results" && r.Method == http.MethodPost:
+		a.taxResult(w, r)
+		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/credit-sync-events/") && strings.HasSuffix(r.URL.Path, "/retry") && r.Method == http.MethodPost:
 		a.retryCreditSync(w, r)
 		return
@@ -125,17 +145,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/v1/reports/invoiced-receivables/export" && r.Method == http.MethodPost:
 		a.createInvoicedReceivablesExport(w, r)
 		return
-	case strings.HasPrefix(r.URL.Path, "/api/v1/reports/exports/") && strings.HasSuffix(r.URL.Path, "/download") && r.Method == http.MethodGet:
-		a.downloadReportExport(w, r)
-		return
-	case strings.HasPrefix(r.URL.Path, "/api/v1/reports/exports/") && r.Method == http.MethodGet:
-		a.reportExport(w, r)
-		return
-	case r.URL.Path == "/api/v1/reports/invoiced-receivables-top10" && r.Method == http.MethodGet:
-		a.invoicedReceivablesTop10(w, r)
-		return
-	case r.URL.Path == "/api/v1/reports/invoiced-receivables/export" && r.Method == http.MethodPost:
-		a.createInvoicedReceivablesExport(w, r)
+	case r.URL.Path == "/api/v1/reports/aging/export" && r.Method == http.MethodPost:
+		a.createAgingReceivablesExport(w, r)
 		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/reports/exports/") && strings.HasSuffix(r.URL.Path, "/download") && r.Method == http.MethodGet:
 		a.downloadReportExport(w, r)
@@ -162,6 +173,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/v1/receipts" && r.Method == http.MethodPost:
 		a.createReceipt(w, r)
 		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/receipts/") && strings.HasSuffix(r.URL.Path, "/matches") && r.Method == http.MethodGet:
+		a.receiptMatches(w, r)
+		return
 	case r.URL.Path == "/api/v1/receipt-allocations" && r.Method == http.MethodPost:
 		a.createAllocation(w, r)
 		return
@@ -177,6 +191,21 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/v1/tax-invoices" && r.Method == http.MethodGet:
 		a.listTaxInvoices(w, r)
 		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/tax-invoices/") && strings.HasSuffix(r.URL.Path, "/documents") && r.Method == http.MethodPost:
+		a.uploadInvoiceDocument(w, r)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/tax-invoices/") && strings.HasSuffix(r.URL.Path, "/download") && r.Method == http.MethodGet:
+		a.downloadInvoiceDocument(w, r)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/tax-invoices/") && strings.HasSuffix(r.URL.Path, "/red-flush") && r.Method == http.MethodPost:
+		a.requestInvoiceRedFlush(w, r)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-red-flush-requests/") && strings.HasSuffix(r.URL.Path, "/approve") && r.Method == http.MethodPost:
+		a.reviewInvoiceRedFlush(w, r, true)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-red-flush-requests/") && strings.HasSuffix(r.URL.Path, "/reject") && r.Method == http.MethodPost:
+		a.reviewInvoiceRedFlush(w, r, false)
+		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/tax-invoices/") && r.Method == http.MethodGet:
 		a.taxInvoiceDetail(w, r)
 		return
@@ -185,6 +214,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/approve") && r.Method == http.MethodPost:
 		a.approveInvoiceRequest(w, r)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/reject") && r.Method == http.MethodPost:
+		a.rejectInvoiceRequest(w, r)
 		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/manual-issue") && r.Method == http.MethodPost:
 		a.manualIssueInvoice(w, r)
@@ -249,7 +281,7 @@ func (a *API) principal(r *http.Request) (service.Principal, error) {
 		}
 		return a.auth.Authenticate(r.Context(), r)
 	}
-	return service.Principal{TenantID: "dev", UserID: "dev-finance", Permissions: map[string]bool{"settlement.admin": true}}, nil
+	return service.Principal{TenantID: "dev", UserID: "dev-finance", IdentityID: "dev-finance", DisplayName: "本地结算管理员", Username: "dev-finance", CatalogVersion: "development", AuthorizationRevision: 1, Permissions: map[string]bool{"settlement.admin": true}}, nil
 }
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	if a.cfg.DevelopmentAuth {
@@ -278,7 +310,12 @@ func (a *API) me(w http.ResponseWriter, r *http.Request) {
 			permissions = append(permissions, permission)
 		}
 	}
-	write(w, http.StatusOK, map[string]any{"tenant_id": p.TenantID, "user_id": p.UserID, "permissions": permissions})
+	write(w, http.StatusOK, map[string]any{
+		"tenant_id": p.TenantID, "user_id": p.UserID, "identity_id": p.IdentityID,
+		"person_id": p.PersonID, "name": p.DisplayName, "preferred_username": p.Username,
+		"permissions": permissions, "catalog_version": p.CatalogVersion,
+		"authorization_revision": p.AuthorizationRevision,
+	})
 }
 func (a *API) integration(r *http.Request) bool {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -310,6 +347,44 @@ func (a *API) contractEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusAccepted, map[string]any{"event_id": event.EventID, "accepted": true, "duplicate": !created})
 }
+func (a *API) taxResult(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !a.cfg.TaxResultIngestEnabled || token == "" {
+		fail(w, http.StatusUnauthorized, "SETTLEMENT_TAX_MACHINE_UNAUTHENTICATED", "税控结果服务令牌无效")
+		return
+	}
+	trustedTenant := a.cfg.OIDCTenantID
+	if a.cfg.DevelopmentAuth {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(a.cfg.TaxResultBearerToken)) != 1 {
+			fail(w, http.StatusUnauthorized, "SETTLEMENT_TAX_MACHINE_UNAUTHENTICATED", "税控结果服务令牌无效")
+			return
+		}
+	} else {
+		if a.taxMachine == nil {
+			fail(w, http.StatusUnauthorized, "SETTLEMENT_TAX_MACHINE_UNAUTHENTICATED", "税控结果服务令牌无效")
+			return
+		}
+		identity, err := a.taxMachine.Verify(r.Context(), token)
+		if err != nil {
+			fail(w, http.StatusUnauthorized, "SETTLEMENT_TAX_MACHINE_UNAUTHENTICATED", "税控结果服务令牌无效")
+			return
+		}
+		trustedTenant = identity.TenantID
+	}
+	var event service.TaxCallbackEvent
+	if !decode(w, r, &event) {
+		return
+	}
+	if trustedTenant == "" {
+		trustedTenant = event.TenantID
+	}
+	result, err := a.service.ApplyTaxCallback(r.Context(), trustedTenant, event)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusAccepted, map[string]any{"event_id": event.EventID, "accepted": true, "processing_status": result, "duplicate": result != "APPLIED"})
+}
 func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.report.read")
 	if !ok {
@@ -335,7 +410,7 @@ func (a *API) invoicedReceivablesTop10(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id WHERE r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.open_amount DESC,r.due_date ASC,r.id ASC LIMIT 10`, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.open_amount DESC,r.due_date ASC,r.id ASC LIMIT 10`, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -357,6 +432,12 @@ func (a *API) invoicedReceivablesTop10(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]any{"as_of_date": time.Now().UTC().Format("2006-01-02"), "items": items})
 }
 func (a *API) createInvoicedReceivablesExport(w http.ResponseWriter, r *http.Request) {
+	a.createReportExport(w, r, "INVOICED_RECEIVABLES_CSV")
+}
+func (a *API) createAgingReceivablesExport(w http.ResponseWriter, r *http.Request) {
+	a.createReportExport(w, r, "AGING_RECEIVABLES_CSV")
+}
+func (a *API) createReportExport(w http.ResponseWriter, r *http.Request, reportType string) {
 	p, ok := a.user(w, r, "settlement.report.export")
 	if !ok {
 		return
@@ -366,11 +447,15 @@ func (a *API) createInvoicedReceivablesExport(w http.ResponseWriter, r *http.Req
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", "需要有效的 Idempotency-Key")
 		return
 	}
-	var id string
-	err := a.service.DB.QueryRowContext(r.Context(), `SELECT id FROM settlement_report_export_job WHERE tenant_id=? AND requested_by=? AND idempotency_key=?`, p.TenantID, p.UserID, key).Scan(&id)
+	var id, existingType string
+	err := a.service.DB.QueryRowContext(r.Context(), `SELECT id,report_type FROM settlement_report_export_job WHERE tenant_id=? AND requested_by=? AND idempotency_key=?`, p.TenantID, p.UserID, key).Scan(&id, &existingType)
+	if err == nil && existingType != reportType {
+		fail(w, http.StatusConflict, "SETTLEMENT_IDEMPOTENCY_CONFLICT", "幂等键已用于其他导出任务")
+		return
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		id = newRequestID()
-		_, err = a.service.DB.ExecContext(r.Context(), `INSERT INTO settlement_report_export_job(id,tenant_id,requested_by,report_type,idempotency_key,status,created_at,updated_at) VALUES(?,?,?,?,?,'PENDING',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, p.UserID, "INVOICED_RECEIVABLES_CSV", key)
+		_, err = a.service.DB.ExecContext(r.Context(), `INSERT INTO settlement_report_export_job(id,tenant_id,requested_by,report_type,idempotency_key,status,created_at,updated_at) VALUES(?,?,?,?,?,'PENDING',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, p.UserID, reportType, key)
 	}
 	if err != nil {
 		respondError(w, err)
@@ -432,6 +517,10 @@ func (a *API) downloadReportExport(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, "SETTLEMENT_EXPORT_NOT_READY", "导出文件尚未生成完成")
 		return
 	}
+	if err = a.service.AuditAction(r.Context(), p, "SETTLEMENT_REPORT_EXPORT_DOWNLOADED", "report_export", id, map[string]any{"report_type": "AGING_OR_INVOICED", "risk_level": "HIGH"}); err != nil {
+		respondError(w, err)
+		return
+	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+strings.ReplaceAll(filename, `"`, "")+`"`)
 	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
@@ -448,7 +537,7 @@ func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id WHERE rp.tenant_id=? ORDER BY rp.due_date ASC LIMIT 100`, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.tenant_id=? ORDER BY rp.due_date ASC LIMIT 100`, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -464,6 +553,10 @@ func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, map[string]any{"id": id, "contract_no": no, "customer_name": customer, "installment_no": installment, "due_date": due, "planned_amount": planned, "status": status, "version": version})
 	}
+	if err := rows.Err(); err != nil {
+		respondError(w, err)
+		return
+	}
 	write(w, http.StatusOK, items)
 }
 func (a *API) confirmPlan(w http.ResponseWriter, r *http.Request) {
@@ -472,17 +565,44 @@ func (a *API) confirmPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/receivable-plans/"), "/confirm")
-	var body struct {
-		Version int `json:"version"`
-	}
+	var body service.PlanConfirmationInput
 	if !decode(w, r, &body) {
 		return
 	}
-	if err := a.service.ConfirmPlan(r.Context(), p, id, body.Version); err != nil {
+	if err := a.service.ConfirmPlan(r.Context(), p, id, body); err != nil {
 		respondError(w, err)
 		return
 	}
 	write(w, http.StatusOK, map[string]string{"status": "confirmed"})
+}
+
+func (a *API) receiptMatches(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.allocation.confirm")
+	if !ok {
+		return
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/receipts/"), "/matches")
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,LEAST(r.open_amount,rc.unallocated_amount),CASE WHEN r.open_amount=rc.unallocated_amount THEN 100 WHEN r.open_amount>rc.unallocated_amount THEN 80 ELSE 70 END FROM settlement_receipt rc JOIN settlement_receivable r ON r.tenant_id=rc.tenant_id AND r.currency=rc.currency JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id AND cs.customer_id=rc.customer_id WHERE rc.id=? AND rc.tenant_id=? AND rc.unallocated_amount>0 AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY 9 DESC,r.due_date ASC,r.id ASC LIMIT 20`, id, p.TenantID)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var receivableID, no, contract, customer, due, open, currency, suggested string
+		var score int
+		if err := rows.Scan(&receivableID, &no, &contract, &customer, &due, &open, &currency, &suggested, &score); err != nil {
+			respondError(w, err)
+			return
+		}
+		items = append(items, map[string]any{"receivable_id": receivableID, "receivable_no": no, "contract_no": contract, "customer_name": customer, "due_date": due, "open_amount": open, "currency": currency, "suggested_amount": suggested, "score": score})
+	}
+	if err := rows.Err(); err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, items)
 }
 func (a *API) listReceivables(w http.ResponseWriter, r *http.Request, invoiceEligibleOnly bool) {
 	p, ok := a.user(w, r, "settlement.receivable.read")
@@ -505,7 +625,7 @@ func (a *API) listReceivables(w http.ResponseWriter, r *http.Request, invoiceEli
 		like := "%" + keyword + "%"
 		args = append(args, like, like, like)
 	}
-	query := `SELECT r.id,r.receivable_no,r.contract_snapshot_id,cs.source_contract_no,cs.customer_id,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,r.collection_status,r.invoice_status,r.version, r.original_amount-r.invoiced_amount-COALESCE((SELECT SUM(a.reserved_amount-a.invoiced_amount-a.released_amount) FROM settlement_invoice_request_allocation a WHERE a.tenant_id=r.tenant_id AND a.receivable_id=r.id AND a.status='RESERVED'),0) FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id WHERE ` + strings.Join(where, " AND ") + ` ORDER BY r.due_date ASC,r.id ASC LIMIT ? OFFSET ?`
+	query := `SELECT r.id,r.receivable_no,r.contract_snapshot_id,cs.source_contract_no,cs.customer_id,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,r.collection_status,r.invoice_status,r.version, r.original_amount-r.invoiced_amount-COALESCE((SELECT SUM(a.reserved_amount-a.invoiced_amount-a.released_amount) FROM settlement_invoice_request_allocation a WHERE a.tenant_id=r.tenant_id AND a.receivable_id=r.id AND a.status='RESERVED'),0) FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE ` + strings.Join(where, " AND ") + ` ORDER BY r.due_date ASC,r.id ASC LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 	rows, err := a.service.DB.QueryContext(r.Context(), query, args...)
 	if err != nil {
@@ -522,6 +642,10 @@ func (a *API) listReceivables(w http.ResponseWriter, r *http.Request, invoiceEli
 			return
 		}
 		items = append(items, map[string]any{"id": id, "receivable_no": no, "contract_snapshot_id": snapshot, "contract_no": contract, "customer_id": customerID, "customer_name": customer, "due_date": due, "original_amount": original, "open_amount": open, "invoiceable_amount": invoiceable, "currency": currency, "collection_status": collection, "invoice_status": invoice, "version": version})
+	}
+	if err := rows.Err(); err != nil {
+		respondError(w, err)
+		return
 	}
 	write(w, http.StatusOK, items)
 }
@@ -544,6 +668,10 @@ func (a *API) listReceipts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		items = append(items, map[string]any{"id": id, "receipt_no": no, "customer_name": customer, "amount": amount, "unallocated_amount": unallocated, "currency": currency, "receipt_date": date, "payment_method": method, "bank_transaction_reference": reference, "status": status})
+	}
+	if err := rows.Err(); err != nil {
+		respondError(w, err)
+		return
 	}
 	write(w, http.StatusOK, items)
 }
@@ -607,7 +735,7 @@ func (a *API) listAllocations(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT a.id,a.allocation_no,rc.receipt_no,rv.receivable_no,a.allocated_amount,a.currency,a.status,a.confirmed_by,a.confirmed_at FROM settlement_receipt_allocation a JOIN settlement_receipt rc ON rc.id=a.receipt_id JOIN settlement_receivable rv ON rv.id=a.receivable_id WHERE a.tenant_id=? ORDER BY a.confirmed_at DESC LIMIT 100`, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT a.id,a.allocation_no,rc.receipt_no,rv.receivable_no,a.allocated_amount,a.currency,a.status,a.match_mode,a.match_confidence,a.confirmed_by,a.confirmed_at FROM settlement_receipt_allocation a JOIN settlement_receipt rc ON rc.id=a.receipt_id AND rc.tenant_id=a.tenant_id JOIN settlement_receivable rv ON rv.id=a.receivable_id AND rv.tenant_id=a.tenant_id WHERE a.tenant_id=? ORDER BY a.confirmed_at DESC LIMIT 100`, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -615,13 +743,18 @@ func (a *API) listAllocations(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, no, receipt, receivable, amount, currency, status, by string
+		var id, no, receipt, receivable, amount, currency, status, matchMode, by string
+		var matchConfidence int
 		var at any
-		if err := rows.Scan(&id, &no, &receipt, &receivable, &amount, &currency, &status, &by, &at); err != nil {
+		if err := rows.Scan(&id, &no, &receipt, &receivable, &amount, &currency, &status, &matchMode, &matchConfidence, &by, &at); err != nil {
 			respondError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"id": id, "allocation_no": no, "receipt_no": receipt, "receivable_no": receivable, "amount": amount, "currency": currency, "status": status, "confirmed_by": by, "confirmed_at": at})
+		items = append(items, map[string]any{"id": id, "allocation_no": no, "receipt_no": receipt, "receivable_no": receivable, "amount": amount, "currency": currency, "status": status, "match_mode": matchMode, "match_confidence": matchConfidence, "confirmed_by": by, "confirmed_at": at})
+	}
+	if err := rows.Err(); err != nil {
+		respondError(w, err)
+		return
 	}
 	write(w, http.StatusOK, items)
 }
@@ -677,6 +810,25 @@ func (a *API) approveInvoiceRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusAccepted, map[string]string{"id": id, "attempt_id": attempt, "status": "ISSUE_PENDING"})
 }
+func (a *API) rejectInvoiceRequest(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.invoice.approve")
+	if !ok {
+		return
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/invoice-requests/"), "/reject")
+	var in struct {
+		Version int    `json:"version"`
+		Reason  string `json:"reason"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if err := a.service.RejectInvoiceRequest(r.Context(), p, id, in.Version, in.Reason); err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]string{"id": id, "status": "REJECTED"})
+}
 func (a *API) manualIssueInvoice(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.invoice.issue")
 	if !ok {
@@ -695,11 +847,11 @@ func (a *API) manualIssueInvoice(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusCreated, map[string]string{"id": invoiceID, "status": "ISSUED"})
 }
 func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.user(w, r, "settlement.invoice.request")
+	p, ok := a.user(w, r, "settlement.invoice.read")
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id) FROM settlement_invoice_request ir JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id WHERE ir.tenant_id=? ORDER BY ir.created_at DESC LIMIT 100`, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.rejection_reason,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),COALESCE((SELECT ia.channel FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),'') FROM settlement_invoice_request ir JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? ORDER BY ir.created_at DESC LIMIT 100`, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -707,18 +859,18 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, no, contract, kind, excl, tax, incl, status, submitted, approved string
+		var id, no, contract, kind, excl, tax, incl, status, submitted, approved, rejectionReason, issueChannel string
 		var buyer []byte
 		var taxRate sql.NullString
 		var taxRateCount int
 		var version int
 		var created any
-		if err := rows.Scan(&id, &no, &contract, &buyer, &kind, &excl, &tax, &incl, &status, &submitted, &approved, &version, &created, &taxRateCount, &taxRate); err != nil {
+		if err := rows.Scan(&id, &no, &contract, &buyer, &kind, &excl, &tax, &incl, &status, &submitted, &approved, &rejectionReason, &version, &created, &taxRateCount, &taxRate, &issueChannel); err != nil {
 			respondError(w, err)
 			return
 		}
 		buyerName, buyerTaxNo := buyerSummary(buyer)
-		items = append(items, map[string]any{"id": id, "request_no": no, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "tax_rate_display": taxRateDisplay(taxRate.String, taxRateCount), "status": status, "submitted_by": submitted, "approved_by": approved, "version": version, "created_at": created})
+		items = append(items, map[string]any{"id": id, "request_no": no, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "tax_rate_display": taxRateDisplay(taxRate.String, taxRateCount), "status": status, "submitted_by": submitted, "approved_by": approved, "rejection_reason": rejectionReason, "version": version, "created_at": created, "issue_channel": issueChannel})
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -728,11 +880,11 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.user(w, r, "settlement.invoice.request")
+	p, ok := a.user(w, r, "settlement.invoice.read")
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id WHERE ti.tenant_id=? ORDER BY ti.issue_date DESC,ti.created_at DESC LIMIT 100`, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,COALESCE((SELECT rf.status FROM settlement_invoice_red_flush_request rf WHERE rf.tenant_id=ti.tenant_id AND rf.original_invoice_id=ti.id ORDER BY rf.created_at DESC LIMIT 1),'') FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.tenant_id=? ORDER BY ti.issue_date DESC,ti.created_at DESC LIMIT 100`, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -740,14 +892,14 @@ func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, requestID, code, number, contract, kind, amount, issueDate, status, channel string
+		var id, requestID, code, number, contract, kind, amount, issueDate, status, channel, redFlushStatus string
 		var buyer []byte
-		if err := rows.Scan(&id, &requestID, &code, &number, &contract, &buyer, &kind, &amount, &issueDate, &status, &channel); err != nil {
+		if err := rows.Scan(&id, &requestID, &code, &number, &contract, &buyer, &kind, &amount, &issueDate, &status, &channel, &redFlushStatus); err != nil {
 			respondError(w, err)
 			return
 		}
 		buyerName, buyerTaxNo := buyerSummary(buyer)
-		items = append(items, map[string]any{"id": id, "invoice_request_id": requestID, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_incl_tax": amount, "issue_date": issueDate, "status": status, "issued_by_channel": channel})
+		items = append(items, map[string]any{"id": id, "invoice_request_id": requestID, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_incl_tax": amount, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "red_flush_status": redFlushStatus})
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -757,7 +909,7 @@ func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.user(w, r, "settlement.invoice.request")
+	p, ok := a.user(w, r, "settlement.invoice.read")
 	if !ok {
 		return
 	}
@@ -768,7 +920,7 @@ func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	var invoiceID, requestID, requestNo, code, number, contract, kind, excl, tax, incl, issueDate, status, channel string
 	var buyer, seller []byte
-	err := a.service.DB.QueryRowContext(r.Context(), `SELECT ti.id,ti.invoice_request_id,ir.request_no,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.seller_profile_snapshot,ti.invoice_type,ti.amount_excl_tax,ti.tax_amount,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id WHERE ti.id=? AND ti.tenant_id=?`, id, p.TenantID).Scan(&invoiceID, &requestID, &requestNo, &code, &number, &contract, &buyer, &seller, &kind, &excl, &tax, &incl, &issueDate, &status, &channel)
+	err := a.service.DB.QueryRowContext(r.Context(), `SELECT ti.id,ti.invoice_request_id,ir.request_no,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.seller_profile_snapshot,ti.invoice_type,ti.amount_excl_tax,ti.tax_amount,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.id=? AND ti.tenant_id=?`, id, p.TenantID).Scan(&invoiceID, &requestID, &requestNo, &code, &number, &contract, &buyer, &seller, &kind, &excl, &tax, &incl, &issueDate, &status, &channel)
 	if errors.Is(err, sql.ErrNoRows) {
 		fail(w, http.StatusNotFound, "TAX_INVOICE_NOT_FOUND", "发票不存在")
 		return
@@ -799,12 +951,233 @@ func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
-	var documentCount int
-	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM settlement_invoice_document WHERE tenant_id=? AND tax_invoice_id=?`, p.TenantID, invoiceID).Scan(&documentCount); err != nil {
+	documentRows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,document_type,original_name,media_type,archived_at FROM settlement_invoice_document WHERE tenant_id=? AND tax_invoice_id=? ORDER BY archived_at DESC`, p.TenantID, invoiceID)
+	if err != nil {
 		respondError(w, err)
 		return
 	}
-	write(w, http.StatusOK, map[string]any{"id": invoiceID, "invoice_request_id": requestID, "request_no": requestNo, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "seller_name": sellerName, "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "document_count": documentCount, "items": items})
+	defer documentRows.Close()
+	documents := []map[string]any{}
+	for documentRows.Next() {
+		var documentID, documentType, originalName, mediaType string
+		var archivedAt any
+		if err := documentRows.Scan(&documentID, &documentType, &originalName, &mediaType, &archivedAt); err != nil {
+			respondError(w, err)
+			return
+		}
+		documents = append(documents, map[string]any{"id": documentID, "document_type": documentType, "original_name": originalName, "media_type": mediaType, "archived_at": archivedAt})
+	}
+	if err := documentRows.Err(); err != nil {
+		respondError(w, err)
+		return
+	}
+	var redFlushID, redFlushStatus, redFlushReason, redFlushRequestedBy, redFlushReviewReason string
+	var redFlushVersion int
+	redErr := a.service.DB.QueryRowContext(r.Context(), `SELECT id,status,reason_detail,requested_by,review_reason,version FROM settlement_invoice_red_flush_request WHERE tenant_id=? AND original_invoice_id=? ORDER BY created_at DESC LIMIT 1`, p.TenantID, invoiceID).Scan(&redFlushID, &redFlushStatus, &redFlushReason, &redFlushRequestedBy, &redFlushReviewReason, &redFlushVersion)
+	if redErr != nil && !errors.Is(redErr, sql.ErrNoRows) {
+		respondError(w, redErr)
+		return
+	}
+	var redFlush any
+	if redErr == nil {
+		redFlush = map[string]any{"id": redFlushID, "status": redFlushStatus, "reason_detail": redFlushReason, "review_reason": redFlushReviewReason, "version": redFlushVersion, "can_review": redFlushStatus == "SUBMITTED" && redFlushRequestedBy != p.UserID && p.Allows("settlement.invoice.approve")}
+	}
+	write(w, http.StatusOK, map[string]any{"id": invoiceID, "invoice_request_id": requestID, "request_no": requestNo, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "seller_name": sellerName, "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "document_count": len(documents), "documents": documents, "red_flush_request": redFlush, "items": items})
+}
+
+func (a *API) uploadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.invoice.issue")
+	if !ok {
+		return
+	}
+	if a.files == nil || a.cfg.FileGatewayApplicationID == "" {
+		fail(w, http.StatusServiceUnavailable, "SETTLEMENT_FILE_GATEWAY_UNAVAILABLE", "电子发票文件服务尚未配置")
+		return
+	}
+	invoiceID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/tax-invoices/"), "/documents")
+	if invoiceID == "" || strings.Contains(invoiceID, "/") {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", "发票标识不合法")
+		return
+	}
+	var invoiceExists int
+	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM settlement_tax_invoice WHERE id=? AND tenant_id=?`, invoiceID, p.TenantID).Scan(&invoiceExists); err != nil {
+		respondError(w, err)
+		return
+	}
+	if invoiceExists == 0 {
+		fail(w, http.StatusNotFound, "SETTLEMENT_TAX_INVOICE_NOT_FOUND", "发票不存在")
+		return
+	}
+	const maxInvoiceDocumentBytes = 10 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxInvoiceDocumentBytes+(1<<20))
+	if err := r.ParseMultipartForm(maxInvoiceDocumentBytes); err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_DOCUMENT", "电子发票文件不得超过 10 MiB")
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_DOCUMENT", "请选择电子发票文件")
+		return
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, maxInvoiceDocumentBytes+1))
+	if err != nil || len(content) == 0 || len(content) > maxInvoiceDocumentBytes {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_DOCUMENT", "电子发票文件为空或超过 10 MiB")
+		return
+	}
+	originalName := filepath.Base(strings.TrimSpace(header.Filename))
+	extension := strings.ToLower(filepath.Ext(originalName))
+	allowedExtensions := map[string]bool{".pdf": true, ".ofd": true, ".xml": true, ".png": true, ".jpg": true, ".jpeg": true}
+	if originalName == "." || originalName == "" || len(originalName) > 255 || !allowedExtensions[extension] {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_DOCUMENT", "仅支持 PDF、OFD、XML、PNG 或 JPG 电子发票文件")
+		return
+	}
+	detectedType, _, _ := mime.ParseMediaType(http.DetectContentType(content))
+	mediaTypeByExtension := map[string]string{".pdf": "application/pdf", ".ofd": "application/ofd", ".xml": "application/xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+	validContent := map[string]map[string]bool{
+		".pdf":  {"application/pdf": true},
+		".ofd":  {"application/zip": true},
+		".xml":  {"application/xml": true, "text/xml": true, "text/plain": true},
+		".png":  {"image/png": true},
+		".jpg":  {"image/jpeg": true},
+		".jpeg": {"image/jpeg": true},
+	}
+	if !validContent[extension][detectedType] {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_DOCUMENT", "电子发票扩展名与文件内容不一致")
+		return
+	}
+	mediaType := mediaTypeByExtension[extension]
+	documentType := strings.TrimSpace(r.FormValue("document_type"))
+	if documentType == "" {
+		documentType = "ELECTRONIC_INVOICE"
+	}
+	if documentType != "ELECTRONIC_INVOICE" && documentType != "INVOICE_IMAGE" {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_DOCUMENT", "电子发票文件类型不合法")
+		return
+	}
+	checksum := fmt.Sprintf("%x", sha256.Sum256(content))
+	var existingID string
+	err = a.service.DB.QueryRowContext(r.Context(), `SELECT id FROM settlement_invoice_document WHERE tenant_id=? AND tax_invoice_id=? AND document_type=? AND checksum=?`, p.TenantID, invoiceID, documentType, checksum).Scan(&existingID)
+	if err == nil {
+		write(w, http.StatusOK, map[string]string{"id": existingID, "status": "ARCHIVED"})
+		return
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		respondError(w, err)
+		return
+	}
+	requestID := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if requestID == "" {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_IDEMPOTENCY_KEY_REQUIRED", "上传电子发票需要幂等键")
+		return
+	}
+	objectID, err := a.files.Upload(r.Context(), requestID, a.cfg.FileGatewayApplicationID, "INTERNAL", originalName, mediaType, bytes.NewReader(content))
+	if err != nil {
+		fail(w, http.StatusBadGateway, "SETTLEMENT_FILE_UPLOAD_FAILED", "电子发票上传失败，请稍后重试")
+		return
+	}
+	if err = a.files.Bind(r.Context(), a.cfg.FileGatewayApplicationID, objectID, "tax_invoice", invoiceID, "electronic_invoice", originalName); err != nil {
+		fail(w, http.StatusBadGateway, "SETTLEMENT_FILE_BIND_FAILED", "电子发票归档失败，请稍后重试")
+		return
+	}
+	documentID, err := a.service.ArchiveInvoiceDocument(r.Context(), p, invoiceID, documentType, originalName, mediaType, objectID, checksum)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusCreated, map[string]string{"id": documentID, "status": "ARCHIVED"})
+}
+
+func (a *API) downloadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.invoice.read")
+	if !ok {
+		return
+	}
+	if a.files == nil {
+		fail(w, http.StatusServiceUnavailable, "SETTLEMENT_FILE_GATEWAY_UNAVAILABLE", "电子发票文件服务尚未配置")
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/tax-invoices/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 4 || parts[1] != "documents" || parts[3] != "download" {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", "电子发票文件标识不合法")
+		return
+	}
+	var objectID, originalName, mediaType string
+	err := a.service.DB.QueryRowContext(r.Context(), `SELECT storage_object_id,original_name,media_type FROM settlement_invoice_document WHERE tenant_id=? AND tax_invoice_id=? AND id=?`, p.TenantID, parts[0], parts[2]).Scan(&objectID, &originalName, &mediaType)
+	if errors.Is(err, sql.ErrNoRows) {
+		fail(w, http.StatusNotFound, "SETTLEMENT_INVOICE_DOCUMENT_NOT_FOUND", "电子发票文件不存在")
+		return
+	}
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	content, err := a.files.Download(r.Context(), objectID)
+	if err != nil {
+		fail(w, http.StatusBadGateway, "SETTLEMENT_FILE_DOWNLOAD_FAILED", "电子发票下载失败，请稍后重试")
+		return
+	}
+	if err = a.service.AuditAction(r.Context(), p, "SETTLEMENT_INVOICE_DOCUMENT_DOWNLOADED", "invoice_document", parts[2], map[string]any{"invoice_id": parts[0], "risk_level": "HIGH"}); err != nil {
+		respondError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", mediaType)
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": originalName}))
+	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
+}
+
+func (a *API) requestInvoiceRedFlush(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.invoice.issue")
+	if !ok {
+		return
+	}
+	invoiceID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/tax-invoices/"), "/red-flush")
+	if invoiceID == "" || strings.Contains(invoiceID, "/") {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", "发票标识不合法")
+		return
+	}
+	var in service.InvoiceRedFlushInput
+	if !decode(w, r, &in) {
+		return
+	}
+	id, err := a.service.RequestInvoiceRedFlush(r.Context(), p, r.Header.Get("Idempotency-Key"), invoiceID, in)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusAccepted, map[string]string{"id": id, "status": "SUBMITTED"})
+}
+
+func (a *API) reviewInvoiceRedFlush(w http.ResponseWriter, r *http.Request, approve bool) {
+	p, ok := a.user(w, r, "settlement.invoice.approve")
+	if !ok {
+		return
+	}
+	suffix := "/reject"
+	if approve {
+		suffix = "/approve"
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/invoice-red-flush-requests/"), suffix)
+	if id == "" || strings.Contains(id, "/") {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", "红冲申请标识不合法")
+		return
+	}
+	var in service.InvoiceRedFlushReviewInput
+	if !decode(w, r, &in) {
+		return
+	}
+	if err := a.service.ReviewInvoiceRedFlush(r.Context(), p, id, approve, in); err != nil {
+		respondError(w, err)
+		return
+	}
+	status := "REJECTED"
+	if approve {
+		status = "ISSUE_PENDING"
+	}
+	write(w, http.StatusOK, map[string]string{"status": status})
 }
 
 func buyerSummary(raw []byte) (string, string) {
@@ -931,6 +1304,10 @@ func (a *API) listDunningPolicies(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, map[string]any{"id": id, "name": name, "version": version, "aging_from_days": from, "aging_to_days": to, "action_type": action, "recipient_rule": recipient, "channel": channel, "repeat_interval_days": repeat, "priority": priority, "enabled": enabled})
 	}
+	if err := rows.Err(); err != nil {
+		respondError(w, err)
+		return
+	}
 	write(w, http.StatusOK, items)
 }
 func (a *API) listDunningCases(w http.ResponseWriter, r *http.Request) {
@@ -938,7 +1315,7 @@ func (a *API) listDunningCases(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT dc.id,r.receivable_no,cs.customer_name_snapshot,DATEDIFF(CURDATE(),r.due_date),r.open_amount,dc.current_escalation_level,dc.status,dc.next_action_at FROM settlement_dunning_case dc JOIN settlement_receivable r ON r.id=dc.receivable_id JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id WHERE dc.tenant_id=? ORDER BY dc.next_action_at LIMIT 100`, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT dc.id,r.receivable_no,cs.customer_name_snapshot,DATEDIFF(CURDATE(),r.due_date),r.open_amount,dc.current_escalation_level,dc.status,dc.next_action_at FROM settlement_dunning_case dc JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE dc.tenant_id=? ORDER BY dc.next_action_at LIMIT 100`, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -954,6 +1331,10 @@ func (a *API) listDunningCases(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		items = append(items, map[string]any{"id": id, "receivable_no": no, "customer_name": customer, "aging_days": days, "open_amount": open, "level": level, "status": status, "next_action_at": next})
+	}
+	if err := rows.Err(); err != nil {
+		respondError(w, err)
+		return
 	}
 	write(w, http.StatusOK, items)
 }
