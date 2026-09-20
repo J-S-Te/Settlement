@@ -58,6 +58,7 @@ type Config struct {
 	FileGatewayApplicationID       string
 	InvoiceIssuanceMode            string
 	PublicOrigin                   string
+	AllowInsecureHTTPOrigin        bool
 	OIDCSessionIdleTTL             time.Duration
 	OIDCSessionAbsoluteTTL         time.Duration
 }
@@ -110,6 +111,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.OIDCSessionSecure, err = boolEnv("OIDC_SESSION_COOKIE_SECURE", true); err != nil {
+		return c, err
+	}
+	if c.AllowInsecureHTTPOrigin, err = boolEnv("SETTLEMENT_ALLOW_INSECURE_HTTP_ORIGIN", false); err != nil {
 		return c, err
 	}
 	if c.OIDCSessionIdleTTL, err = durationEnv("OIDC_SESSION_IDLE_TTL", 30*time.Minute); err != nil {
@@ -183,8 +187,8 @@ func Load() (Config, error) {
 		if c.OIDCSessionIdleTTL <= 0 || c.OIDCSessionAbsoluteTTL <= c.OIDCSessionIdleTTL {
 			return c, fmt.Errorf("OIDC session absolute TTL must be longer than positive idle TTL")
 		}
-		if !strings.HasPrefix(c.PublicOrigin, "https://") {
-			return c, fmt.Errorf("SETTLEMENT_PUBLIC_ORIGIN must use https in production")
+		if !strings.HasPrefix(c.PublicOrigin, "https://") && !(c.AllowInsecureHTTPOrigin && strings.HasPrefix(c.PublicOrigin, "http://")) {
+			return c, fmt.Errorf("SETTLEMENT_PUBLIC_ORIGIN must use https in production unless SETTLEMENT_ALLOW_INSECURE_HTTP_ORIGIN=true")
 		}
 	}
 	if c.OutboxWorkerBatchSize < 1 || c.OutboxWorkerBatchSize > 200 {
