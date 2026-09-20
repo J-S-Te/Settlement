@@ -56,12 +56,30 @@ jobs:
           : "${ACR_PULL_REGISTRY:?missing ACR_PULL_REGISTRY}"
           : "${ACR_NAMESPACE:?missing ACR_NAMESPACE}"
           : "${ACR_REPOSITORY:?missing ACR_REPOSITORY}"
-          echo "image=${ACR_PUSH_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPOSITORY}" >> "$GITHUB_OUTPUT"
-          echo "deploy_image=${ACR_PULL_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          # docker/login-action accepts a registry host only. Strip an
+          # accidentally configured namespace/repository suffix before both
+          # login and image-reference construction.
+          push_registry="${ACR_PUSH_REGISTRY#https://}"
+          push_registry="${push_registry#http://}"
+          push_registry="${push_registry%%/*}"
+          pull_registry="${ACR_PULL_REGISTRY#https://}"
+          pull_registry="${pull_registry#http://}"
+          pull_registry="${pull_registry%%/*}"
+          [[ "$push_registry" == *.cr.aliyuncs.com ]] || {
+            echo "ACR_PUSH_REGISTRY must contain an Aliyun registry host" >&2
+            exit 1
+          }
+          [[ "$pull_registry" == *.cr.aliyuncs.com ]] || {
+            echo "ACR_PULL_REGISTRY must contain an Aliyun registry host" >&2
+            exit 1
+          }
+          echo "push_registry=${push_registry}" >> "$GITHUB_OUTPUT"
+          echo "image=${push_registry}/${ACR_NAMESPACE}/${ACR_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "deploy_image=${pull_registry}/${ACR_NAMESPACE}/${ACR_REPOSITORY}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          registry: ${{ vars.ACR_PUSH_REGISTRY || 'jszn666test-registry.cn-hangzhou.cr.aliyuncs.com' }}
+          registry: ${{ steps.vars.outputs.push_registry }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
       - id: build
