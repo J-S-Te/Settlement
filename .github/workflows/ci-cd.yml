@@ -26,7 +26,7 @@ jobs:
       - run: go vet ./...
       # Keep the CI boundary aligned with the three binaries that the immutable
       # runtime image and the remote deployment contract actually execute.
-      - run: go build ./cmd/api ./cmd/worker ./cmd/migrate
+      - run: go build ./cmd/api ./cmd/worker ./cmd/migrate ./cmd/catalog-sync
 
   image:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
