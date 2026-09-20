@@ -15,19 +15,31 @@ import (
 // authorizationContext 是基础平台依据 Access Token 返回的、结算系统专属授权上下文。
 // 该结构只在平台适配边界内使用，结算业务不直接解析基础平台响应。
 type authorizationContext struct {
-	Subject                    string   `json:"sub"`
-	SubjectID                  string   `json:"subject_id"`
-	IdentityID                 string   `json:"identity_id"`
-	TenantID                   string   `json:"tenant_id"`
-	ClientID                   string   `json:"client_id"`
-	ApplicationCode            string   `json:"application_code"`
-	EnvironmentCode            string   `json:"environment_code"`
-	Permissions                []string `json:"permissions"`
-	CatalogVersion             string   `json:"catalog_version"`
-	CompatibleCatalogVersions  []string `json:"compatible_catalog_versions"`
-	RoleConfigHash             string   `json:"role_config_hash"`
-	CompatibleRoleConfigHashes []string `json:"compatible_role_config_hashes"`
-	AuthorizationRevision      uint64   `json:"authorization_revision"`
+	Subject                    string                   `json:"sub"`
+	SubjectID                  string                   `json:"subject_id"`
+	IdentityID                 string                   `json:"identity_id"`
+	TenantID                   string                   `json:"tenant_id"`
+	ClientID                   string                   `json:"client_id"`
+	ApplicationCode            string                   `json:"application_code"`
+	EnvironmentCode            string                   `json:"environment_code"`
+	PersonID                   string                   `json:"person_id"`
+	Roles                      []string                 `json:"roles"`
+	Permissions                []string                 `json:"permissions"`
+	DataScopes                 []authorizationDataScope `json:"data_scopes"`
+	CatalogVersion             string                   `json:"catalog_version"`
+	CompatibleCatalogVersions  []string                 `json:"compatible_catalog_versions"`
+	RoleConfigHash             string                   `json:"role_config_hash"`
+	CompatibleRoleConfigHashes []string                 `json:"compatible_role_config_hashes"`
+	AuthorizationRevision      uint64                   `json:"authorization_revision"`
+	UserLoginIP                string                   `json:"user_login_ip,omitempty"`
+	CustomerRef                string                   `json:"customer_ref,omitempty"`
+}
+
+type authorizationDataScope struct {
+	RoleCode        string `json:"role_code"`
+	ScopeType       string `json:"scope_type"`
+	ScopeID         string `json:"scope_id"`
+	EnvironmentCode string `json:"environment_code"`
 }
 
 func validateSettlementCatalogCompatibility(value authorizationContext) error {
