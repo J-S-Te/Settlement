@@ -52,7 +52,15 @@ func (c *Client) Upload(ctx context.Context, requestID, applicationID, classific
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	_ = writer.WriteField("application_id", applicationID)
-	_ = writer.WriteField("classification", classification)
+	classificationValue := strings.ToUpper(strings.TrimSpace(classification))
+	switch classificationValue {
+	case "INVOICE_DOCUMENT", "ELECTRONIC_INVOICE":
+		_ = writer.WriteField("purpose", "settlement.invoice.document")
+		classificationValue = "CONFIDENTIAL"
+	case "REPORT_EXPORT":
+		classificationValue = "INTERNAL"
+	}
+	_ = writer.WriteField("classification", classificationValue)
 	contentType := strings.TrimSpace(mediaType)
 	if contentType == "" {
 		contentType = "application/octet-stream"
