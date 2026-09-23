@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -97,6 +98,17 @@ func Load() (Config, error) {
 	var err error
 	if c.DevelopmentAuth, err = boolEnv("SETTLEMENT_DEVELOPMENT_AUTH", false); err != nil {
 		return c, err
+	}
+	// 安全理由（SEC-D10）：DevelopmentAuth 会把全部结算写操作退化为免鉴权的
+	// dev-finance 全权限主体；它与生产特征组合（本地 .env.local 被拷进生产容器）
+	// 必须在启动期拒绝，而不是依赖部署纪律。失败关闭：命中任一生产特征即报错。
+	if c.DevelopmentAuth {
+		if strings.EqualFold(strings.TrimSpace(c.OIDCEnvironmentCode), "prod") {
+			return c, fmt.Errorf("SETTLEMENT_DEVELOPMENT_AUTH=true is forbidden when PLATFORM_ENVIRONMENT_CODE=prod: development auth bypasses every settlement authentication check")
+		}
+		if origin := strings.ToLower(strings.TrimSpace(c.PublicOrigin)); strings.HasPrefix(origin, "https://") && !isLoopbackHTTPOrigin(origin) {
+			return c, fmt.Errorf("SETTLEMENT_DEVELOPMENT_AUTH=true is forbidden when SETTLEMENT_PUBLIC_ORIGIN is a public https origin: development auth bypasses every settlement authentication check")
+		}
 	}
 	if c.IntegrationEnabled, err = boolEnv("SETTLEMENT_INTEGRATION_ENABLED", false); err != nil {
 		return c, err
@@ -205,6 +217,20 @@ func LoadDatabase() (string, error) {
 		return "", fmt.Errorf("SETTLEMENT_MYSQL_DSN is required")
 	}
 	return dsn, nil
+}
+
+// isLoopbackHTTPOrigin 判断 https origin 是否指向本机（localhost/127.0.0.1/::1），
+// 本地自签 https 调试不视为生产特征；非本机 https 一律按公网生产入口处理。
+func isLoopbackHTTPOrigin(lowerOrigin string) bool {
+	host := strings.TrimPrefix(lowerOrigin, "https://")
+	if idx := strings.IndexAny(host, "/?#"); idx >= 0 {
+		host = host[:idx]
+	}
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	}
+	host = strings.Trim(host, "[]")
+	return host == "localhost" || host == "::1" || host == "127.0.0.1" || strings.HasPrefix(host, "127.")
 }
 
 func env(key, fallback string) string {
