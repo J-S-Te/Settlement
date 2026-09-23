@@ -57,8 +57,49 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 			files = value
 		}
 	}
-	return &API{service: &service.Service{DB: db, CreditPublisher: publisher, InvoiceIssuanceMode: cfg.InvoiceIssuanceMode, TaxProviderCode: cfg.TaxProviderCode}, cfg: cfg, logger: logger, auth: auth, machine: machine, taxMachine: taxMachine, directory: directory, files: files}
+	api := &API{service: &service.Service{DB: db, CreditPublisher: publisher, InvoiceIssuanceMode: cfg.InvoiceIssuanceMode, TaxProviderCode: cfg.TaxProviderCode}, cfg: cfg, logger: logger, auth: auth, machine: machine, taxMachine: taxMachine, directory: directory, files: files}
+	if cfg.DevelopmentAuth && logger != nil {
+		// 响亮警告（SEC-D10）：DevelopmentAuth 让所有结算写接口免鉴权（回退
+		// dev-finance 全权限主体）。它只允许出现在本机调试；与生产特征的组合
+		// 已在 config.Load 启动期拒绝，这里保证任何启用时刻都有醒目日志可告警。
+		logger.Error("!!! settlement DEVELOPMENT AUTH ENABLED: every write API is unauthenticated (dev-finance principal) - SETTLEMENT_DEVELOPMENT_AUTH MUST BE false OUTSIDE LOCAL DEVELOPMENT !!!",
+			"development_auth", true,
+			"public_origin", cfg.PublicOrigin,
+			"environment_code", cfg.OIDCEnvironmentCode,
+		)
+	}
+	return api
 }
+
+// csrfWriteAllowed 判定 /api/v1 写请求的来源是否可信（cookie 会话 CSRF 防线，SEC-D11）。
+//
+// 安全理由：前端 X-CSRF-Token 是常量 "1"，没有会话熵，防护完全落在来源校验上：
+//   - PublicOrigin 为空（本地误配置/模板缺键）必须失败关闭——原来的字符串相等
+//     比较会让“缺失的 Origin 头”与空基准相等，从而放行任何跨站写请求；
+//   - Origin 必须存在且与 PublicOrigin 完全一致（缺失/跨源一律拒绝）；
+//   - Sec-Fetch-Site: cross-site 是浏览器元数据头，直接拒绝（纵深防御，
+//     它不能用于放行缺失 Origin 的请求）。
+//
+// 机器调用走 /internal/v1 Bearer 边界，不经过本校验。
+func (a *API) csrfWriteAllowed(r *http.Request) bool {
+	if r.Header.Get("X-CSRF-Token") != "1" {
+		return false
+	}
+	expected := strings.TrimRight(strings.TrimSpace(a.cfg.PublicOrigin), "/")
+	if expected == "" {
+		// 失败关闭：没有可信来源基准时宁可拒绝全部写请求，也不放行。
+		return false
+	}
+	origin := strings.TrimRight(strings.TrimSpace(r.Header.Get("Origin")), "/")
+	if origin == "" || !strings.EqualFold(origin, expected) {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		return false
+	}
+	return true
+}
+
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
 	if requestID == "" {
@@ -74,7 +115,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/v1/") && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		if r.Header.Get("X-CSRF-Token") != "1" || strings.TrimRight(r.Header.Get("Origin"), "/") != strings.TrimRight(a.cfg.PublicOrigin, "/") {
+		if !a.csrfWriteAllowed(r) {
 			fail(w, http.StatusForbidden, "SETTLEMENT_CSRF_REJECTED", "写请求来源校验失败")
 			return
 		}
