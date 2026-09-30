@@ -9,7 +9,8 @@ services:
     volumes:
       - settlement-db-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-psettlement-root-local"]
+      # 安全（AUD-2026-035，对齐 SEC-F5b 规约）：口令经容器内 MYSQL_PWD 环境变量传递，禁止以 -p 出现在 argv（每 5 秒被 ps 读取）。
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$${MYSQL_ROOT_PASSWORD}\" mysqladmin ping -h 127.0.0.1 -uroot --silent"]
       interval: 5s
       timeout: 3s
       retries: 30
