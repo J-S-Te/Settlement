@@ -358,30 +358,47 @@ func (a *API) me(w http.ResponseWriter, r *http.Request) {
 		"authorization_revision": p.AuthorizationRevision,
 	})
 }
-func (a *API) integration(r *http.Request) bool {
+
+// integration 验证机器令牌并返回其绑定的可信租户。生产模式下来自验签身份
+// （identity.TenantID，与验签器配置租户一致）；DevelopmentAuth 下没有可验签
+// 身份，回退到配置租户（OIDC_TENANT_ID）。返回的可信租户可能为空，调用方
+// 必须对空租户失败关闭（AUD-2026-001），不得回退到报文体声明的租户。
+func (a *API) integration(r *http.Request) (string, bool) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !a.cfg.IntegrationEnabled || token == "" {
-		return false
+		return "", false
 	}
 	if a.cfg.DevelopmentAuth {
-		return subtle.ConstantTimeCompare([]byte(token), []byte(a.cfg.IntegrationBearerToken)) == 1
+		if subtle.ConstantTimeCompare([]byte(token), []byte(a.cfg.IntegrationBearerToken)) != 1 {
+			return "", false
+		}
+		return a.cfg.OIDCTenantID, true
 	}
 	if a.machine == nil {
-		return false
+		return "", false
 	}
-	_, err := a.machine.Verify(r.Context(), token)
-	return err == nil
+	identity, err := a.machine.Verify(r.Context(), token)
+	if err != nil {
+		return "", false
+	}
+	return identity.TenantID, true
 }
 func (a *API) contractEvent(w http.ResponseWriter, r *http.Request) {
-	if !a.integration(r) {
+	trustedTenant, ok := a.integration(r)
+	if !ok {
 		fail(w, http.StatusUnauthorized, "SETTLEMENT_MACHINE_UNAUTHENTICATED", "服务间令牌无效")
+		return
+	}
+	// AUD-2026-001：可信租户缺失时失败关闭，绝不采信请求体声明的租户。
+	if strings.TrimSpace(trustedTenant) == "" {
+		fail(w, http.StatusForbidden, "SETTLEMENT_MACHINE_TENANT_UNRESOLVED", "服务间令牌未绑定可信租户")
 		return
 	}
 	var event service.ContractEvent
 	if !decode(w, r, &event) {
 		return
 	}
-	created, err := a.service.IngestContract(r.Context(), "contract_management", event)
+	created, err := a.service.IngestContract(r.Context(), "contract_management", trustedTenant, event)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -412,12 +429,15 @@ func (a *API) taxResult(w http.ResponseWriter, r *http.Request) {
 		}
 		trustedTenant = identity.TenantID
 	}
+	// AUD-2026-020：税控租户必须来自验签身份或配置；缺失即失败关闭，
+	// 绝不回退到报文体声明的租户。
+	if strings.TrimSpace(trustedTenant) == "" {
+		fail(w, http.StatusForbidden, "SETTLEMENT_TAX_TENANT_UNRESOLVED", "税控回调租户未从验签身份或配置解析")
+		return
+	}
 	var event service.TaxCallbackEvent
 	if !decode(w, r, &event) {
 		return
-	}
-	if trustedTenant == "" {
-		trustedTenant = event.TenantID
 	}
 	result, err := a.service.ApplyTaxCallback(r.Context(), trustedTenant, event)
 	if err != nil {

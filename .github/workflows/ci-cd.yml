@@ -113,7 +113,7 @@ jobs:
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/basic-platform' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/unified-identity-platform' }}
           IMAGE_REF: ${{ needs.image.outputs.image_ref }}
         run: |
           set -Eeuo pipefail

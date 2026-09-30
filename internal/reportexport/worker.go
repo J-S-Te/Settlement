@@ -226,11 +226,22 @@ func invoiceStatusLabel(value string) string {
 	return map[string]string{"NOT_INVOICED": "未开票", "PARTIALLY_INVOICED": "部分开票", "FULLY_INVOICED": "已全部开票"}[value]
 }
 
+// safeCell 对公式注入载荷加前导单引号（对齐平台 SEC-B6 escapeCSVFormulaCell 口径）：
+// 以 =、+、-、@ 开头，或前导含 tab/CR（表格软件会先剥掉这些控制字符再判定公式）
+// 的单元格一律加 ' 前缀，使其按字面文本渲染；普通值原样返回，不改变既有导出内容。
 func safeCell(value string) string {
-	if len(value) > 0 && (value[0] == '=' || value[0] == '+' || value[0] == '-' || value[0] == '@') {
+	if value == "" {
+		return value
+	}
+	if trimmed := strings.TrimLeft(value, "\t\r"); trimmed != value {
 		return "'" + value
 	}
-	return value
+	switch value[0] {
+	case '=', '+', '-', '@':
+		return "'" + value
+	default:
+		return value
+	}
 }
 
 func (w *Worker) fail(ctx context.Context, id string, cause error) {

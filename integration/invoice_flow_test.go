@@ -89,7 +89,7 @@ func TestInvoiceFlow(t *testing.T) {
 	}
 
 	svc := &service.Service{DB: db}
-	accepted, err := svc.IngestContract(ctx, source, event)
+	accepted, err := svc.IngestContract(ctx, source, tenant, event)
 	if err != nil || !accepted {
 		t.Fatalf("ingest contract: accepted=%v err=%v", accepted, err)
 	}

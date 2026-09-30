@@ -17,7 +17,7 @@ func TestLoadRejectsProductionHTTPOriginByDefault(t *testing.T) {
 
 func TestLoadAllowsProductionHTTPOriginWhenExplicitlyEnabled(t *testing.T) {
 	setValidProductionEnvironment(t)
-	t.Setenv("SETTLEMENT_PUBLIC_ORIGIN", "http://47.111.20.119:8081")
+	t.Setenv("SETTLEMENT_PUBLIC_ORIGIN", "http://203.0.113.119:8081")
 	t.Setenv("SETTLEMENT_ALLOW_INSECURE_HTTP_ORIGIN", "true")
 
 	cfg, err := Load()

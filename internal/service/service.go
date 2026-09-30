@@ -111,12 +111,16 @@ func required(value, name string) (string, error) {
 // IngestContract stores the original event before creating financial snapshots.
 // Replayed event IDs are successful no-ops; a version that already exists with
 // another event ID is rejected so an old contract update cannot overwrite facts.
-func (s *Service) IngestContract(ctx context.Context, source string, event ContractEvent) (bool, error) {
+// trustedTenant 是机器令牌验签得到的可信租户（AUD-2026-001）：报文声明的租户
+// 必须与之一致，否则持合法令牌的调用方可声明任意租户写入财务快照与应收计划
+// （对齐 ApplyTaxCallback 的租户一致性校验）。
+func (s *Service) IngestContract(ctx context.Context, source, trustedTenant string, event ContractEvent) (bool, error) {
 	if _, err := required(event.EventID, "event_id"); err != nil {
 		return false, err
 	}
-	if _, err := required(event.TenantID, "tenant_id"); err != nil {
-		return false, err
+	trustedTenant = strings.TrimSpace(trustedTenant)
+	if trustedTenant == "" || event.TenantID != trustedTenant {
+		return false, fmt.Errorf("%w: tenant_id must equal the verified machine tenant", ErrInvalid)
 	}
 	if event.EventType != "contract.financial_effective.v1" {
 		return false, fmt.Errorf("%w: unsupported event_type", ErrInvalid)

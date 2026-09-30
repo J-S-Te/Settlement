@@ -106,8 +106,11 @@ func Load() (Config, error) {
 		if strings.EqualFold(strings.TrimSpace(c.OIDCEnvironmentCode), "prod") {
 			return c, fmt.Errorf("SETTLEMENT_DEVELOPMENT_AUTH=true is forbidden when PLATFORM_ENVIRONMENT_CODE=prod: development auth bypasses every settlement authentication check")
 		}
-		if origin := strings.ToLower(strings.TrimSpace(c.PublicOrigin)); strings.HasPrefix(origin, "https://") && !isLoopbackHTTPOrigin(origin) {
-			return c, fmt.Errorf("SETTLEMENT_DEVELOPMENT_AUTH=true is forbidden when SETTLEMENT_PUBLIC_ORIGIN is a public https origin: development auth bypasses every settlement authentication check")
+		// 安全理由（SEC-D10 + AUD-2026-009）：DevelopmentAuth 与任何公网入口
+		// 组合都必须在启动期拒绝——除公网 https 外，明文 http 公网 origin 同样
+		// 意味着免鉴权写接口可达生产网络。失败关闭：命中即报错。
+		if origin := strings.ToLower(strings.TrimSpace(c.PublicOrigin)); (strings.HasPrefix(origin, "https://") || strings.HasPrefix(origin, "http://")) && !isLoopbackHTTPOrigin(origin) {
+			return c, fmt.Errorf("SETTLEMENT_DEVELOPMENT_AUTH=true is forbidden when SETTLEMENT_PUBLIC_ORIGIN is a public non-loopback origin: development auth bypasses every settlement authentication check")
 		}
 	}
 	if c.IntegrationEnabled, err = boolEnv("SETTLEMENT_INTEGRATION_ENABLED", false); err != nil {
@@ -219,10 +222,13 @@ func LoadDatabase() (string, error) {
 	return dsn, nil
 }
 
-// isLoopbackHTTPOrigin 判断 https origin 是否指向本机（localhost/127.0.0.1/::1），
-// 本地自签 https 调试不视为生产特征；非本机 https 一律按公网生产入口处理。
+// isLoopbackHTTPOrigin 判断 http/https origin 是否指向本机（localhost/127.0.0.1/::1），
+// 本机明文与自签调试不视为生产特征；非本机入口一律按公网生产入口处理。
 func isLoopbackHTTPOrigin(lowerOrigin string) bool {
-	host := strings.TrimPrefix(lowerOrigin, "https://")
+	host := lowerOrigin
+	if idx := strings.Index(host, "://"); idx >= 0 {
+		host = host[idx+3:]
+	}
 	if idx := strings.IndexAny(host, "/?#"); idx >= 0 {
 		host = host[:idx]
 	}
