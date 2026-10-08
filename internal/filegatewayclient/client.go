@@ -65,7 +65,11 @@ func (c *Client) Upload(ctx context.Context, requestID, applicationID, classific
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	part, err := writer.CreatePart(textproto.MIMEHeader{"Content-Disposition": {`form-data; name="file"; filename="` + strings.ReplaceAll(name, `"`, "") + `"`}, "Content-Type": {mime.FormatMediaType(contentType, nil)}})
+	baseType, parameters, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return "", errors.New("invalid upload media type")
+	}
+	part, err := writer.CreatePart(textproto.MIMEHeader{"Content-Disposition": {mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": name})}, "Content-Type": {mime.FormatMediaType(baseType, parameters)}})
 	if err != nil {
 		return "", err
 	}
