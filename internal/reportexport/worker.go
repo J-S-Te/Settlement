@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -103,7 +104,7 @@ func (w *Worker) generate(ctx context.Context, item job) {
 		content, err = w.csv(ctx, item.tenantID)
 	}
 	if err != nil {
-		w.fail(ctx, item.id, err)
+		w.fail(ctx, item.id, "query", err)
 		return
 	}
 	filename := filenamePrefix + "-" + time.Now().UTC().Format("20060102-150405") + ".csv"
@@ -112,18 +113,18 @@ func (w *Worker) generate(ctx context.Context, item job) {
 	if w.GatewayMode == "dual" || w.GatewayMode == "required" {
 		if w.Gateway == nil {
 			if w.GatewayMode == "required" {
-				w.fail(ctx, item.id, errors.New("file gateway unavailable"))
+				w.fail(ctx, item.id, "gateway_configuration", errors.New("file gateway unavailable"))
 				return
 			}
 		} else if id, uploadErr := w.Gateway.Upload(ctx, fmt.Sprintf("settlement-report-%s-%x", item.id, hash[:8]), w.GatewayApplicationID, "REPORT_EXPORT", filename, "text/csv; charset=utf-8", bytes.NewReader(content)); uploadErr != nil {
 			if w.GatewayMode == "required" {
-				w.fail(ctx, item.id, uploadErr)
+				w.fail(ctx, item.id, "gateway_upload", uploadErr)
 				return
 			}
 			fileStatus = "FAILED"
 		} else if bindErr := w.Gateway.Bind(ctx, w.GatewayApplicationID, id, "settlement_report_export", item.id, "REPORT", filename); bindErr != nil {
 			if w.GatewayMode == "required" {
-				w.fail(ctx, item.id, bindErr)
+				w.fail(ctx, item.id, "gateway_bind", bindErr)
 				return
 			}
 			fileStatus = "FAILED"
@@ -133,7 +134,7 @@ func (w *Worker) generate(ctx context.Context, item job) {
 	}
 	_, err = w.DB.ExecContext(ctx, `UPDATE settlement_report_export_job SET status='READY',file_name=?,file_content=?,platform_file_id=?,platform_file_version=CASE WHEN ?<>'' THEN 1 ELSE 0 END,platform_file_sha256=?,platform_file_size=?,platform_file_status=?,expires_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 7 DAY),completed_at=UTC_TIMESTAMP(3),locked_by='',locked_until=NULL,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND status='PROCESSING' AND locked_by=?`, filename, content, fileID, fileID, fmt.Sprintf("%x", hash[:]), len(content), fileStatus, item.id, w.WorkerID)
 	if err != nil {
-		w.fail(ctx, item.id, err)
+		w.fail(ctx, item.id, "publish", err)
 	}
 }
 
@@ -244,7 +245,11 @@ func safeCell(value string) string {
 	}
 }
 
-func (w *Worker) fail(ctx context.Context, id string, cause error) {
-	_, _ = w.DB.ExecContext(ctx, `UPDATE settlement_report_export_job SET status='FAILED',error_message=?,locked_by='',locked_until=NULL,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND locked_by=?`, "报表生成失败，请重新发起导出", id, w.WorkerID)
-	_ = cause
+func (w *Worker) fail(ctx context.Context, id, stage string, cause error) {
+	// Do not log raw dependency errors: OAuth errors can contain response bodies.
+	slog.ErrorContext(ctx, "report export job failed", "job_id", id, "stage", stage, "error_type", fmt.Sprintf("%T", cause))
+	_, err := w.DB.ExecContext(ctx, `UPDATE settlement_report_export_job SET status='FAILED',error_message=?,locked_by='',locked_until=NULL,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND locked_by=?`, "报表生成失败，请重新发起导出", id, w.WorkerID)
+	if err != nil {
+		slog.ErrorContext(ctx, "report export failure state persistence failed", "job_id", id, "stage", stage, "error_type", fmt.Sprintf("%T", err))
+	}
 }
