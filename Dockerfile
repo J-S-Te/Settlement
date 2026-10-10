@@ -1,6 +1,9 @@
 FROM golang:1.26.4-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
+COPY third_party/license-core ./third_party/license-core
+COPY scripts/license-core-sync.sh scripts/license-core.sha256 ./scripts/
+RUN sh scripts/license-core-sync.sh --check
 ARG GOPROXY=https://goproxy.cn|https://proxy.golang.org|direct
 ARG GOSUMDB=sum.golang.google.cn
 ENV GOPROXY=${GOPROXY} \
@@ -22,7 +25,9 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/settlement-api ./c
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/settlement-catalog-sync ./cmd/catalog-sync
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates tzdata && addgroup -S settlement && adduser -S -G settlement settlement
+ARG APP_VERSION
+LABEL org.opencontainers.image.version=${APP_VERSION} com.basic-platform.license.protocol="1"
+RUN apk add --no-cache ca-certificates tzdata && addgroup -S settlement && adduser -S -G settlement settlement && mkdir -p /var/lib/commercial-license && chown settlement:settlement /var/lib/commercial-license
 COPY --from=build /out/settlement-* /usr/local/bin/
 USER settlement
 EXPOSE 8085

@@ -34,6 +34,7 @@ type API struct {
 	taxMachine *platform.ServiceTokenVerifier
 	directory  platform.PersonnelDirectory
 	files      InvoiceFileGateway
+	commercial CommercialLicenseGate
 }
 
 type InvoiceFileGateway interface {
@@ -46,7 +47,11 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 	var directory platform.PersonnelDirectory
 	var publisher service.CreditEventPublisher
 	var files InvoiceFileGateway
+	var commercial CommercialLicenseGate
 	for _, dependency := range dependencies {
+		if value, ok := dependency.(CommercialLicenseGate); ok {
+			commercial = value
+		}
 		if value, ok := dependency.(platform.PersonnelDirectory); ok {
 			directory = value
 		}
@@ -58,7 +63,9 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 		}
 	}
 	api := &API{service: &service.Service{DB: db, CreditPublisher: publisher, InvoiceIssuanceMode: cfg.InvoiceIssuanceMode, TaxProviderCode: cfg.TaxProviderCode}, cfg: cfg, logger: logger, auth: auth, machine: machine, taxMachine: taxMachine, directory: directory, files: files}
+	api.commercial = commercial
 	if cfg.DevelopmentAuth && logger != nil {
+		// Licensing does not replace the existing identity and CSRF boundaries.
 		// 响亮警告（SEC-D10）：DevelopmentAuth 让所有结算写接口免鉴权（回退
 		// dev-finance 全权限主体）。它只允许出现在本机调试；与生产特征的组合
 		// 已在 config.Load 启动期拒绝，这里保证任何启用时刻都有醒目日志可告警。
@@ -110,6 +117,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-ID", requestID)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
+	if a.commercial != nil && a.commercial.Check(r.Context(), commercialOperation(r.Method, r.URL.Path)) != nil {
+		fail(w, http.StatusForbidden, "COMMERCIAL_LICENSE_DENIED", "商业授权不可用或已到期；历史查询与导出仍受原权限控制")
+		return
+	}
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return

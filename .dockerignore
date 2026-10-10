@@ -3,6 +3,12 @@
 !Dockerfile
 !go.mod
 !go.sum
+!third_party/
+!third_party/license-core/
+!third_party/license-core/**
+!scripts/
+!scripts/license-core-sync.sh
+!scripts/license-core.sha256
 !cmd/
 !cmd/**
 !internal/

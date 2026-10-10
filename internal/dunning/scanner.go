@@ -12,8 +12,9 @@ import (
 )
 
 type Scanner struct {
-	DB        *sql.DB
-	BatchSize int
+	CheckBusinessLicense func(context.Context) error
+	DB                   *sql.DB
+	BatchSize            int
 }
 type candidate struct {
 	TenantID, ReceivableID, Number, Customer, PolicyID, ActionType, RecipientRule, Channel, Priority string
@@ -21,6 +22,11 @@ type candidate struct {
 }
 
 func (s *Scanner) RunOnce(ctx context.Context) error {
+	if s.CheckBusinessLicense != nil {
+		if err := s.CheckBusinessLicense(ctx); err != nil {
+			return err
+		}
+	}
 	if s.BatchSize < 1 || s.BatchSize > 200 {
 		s.BatchSize = 50
 	}
@@ -49,6 +55,11 @@ func (s *Scanner) RunOnce(ctx context.Context) error {
 	return nil
 }
 func (s *Scanner) create(ctx context.Context, c candidate) error {
+	if s.CheckBusinessLicense != nil {
+		if err := s.CheckBusinessLicense(ctx); err != nil {
+			return err
+		}
+	}
 	recipient := strings.TrimPrefix(c.RecipientRule, "USER:")
 	if recipient == c.RecipientRule || strings.TrimSpace(recipient) == "" {
 		return fmt.Errorf("unsupported recipient rule")
@@ -85,6 +96,11 @@ func (s *Scanner) create(ctx context.Context, c candidate) error {
 		payload, _ := json.Marshal(map[string]any{"event_id": eventID, "event_type": "SETTLEMENT_RECEIVABLE_OVERDUE", "notification_scope": "CROSS_SYSTEM", "priority": c.Priority, "title": title, "content": content, "target_url": "/settlement/dunning", "reference_type": "RECEIVABLE", "reference_id": c.ReceivableID, "idempotency_key": eventID, "recipient_user_ids": []string{recipient}, "occurred_at": time.Now().UTC().Format(time.RFC3339Nano)})
 		_, err = tx.ExecContext(ctx, `INSERT INTO settlement_outbox_event(id,tenant_id,event_id,destination,event_type,aggregate_type,aggregate_id,payload_json,status,available_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,'PENDING',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id(), tenant, eventID, "PLATFORM_NOTIFICATION", "SETTLEMENT_RECEIVABLE_OVERDUE", "receivable", c.ReceivableID, payload)
 		if err != nil {
+			return err
+		}
+	}
+	if s.CheckBusinessLicense != nil {
+		if err := s.CheckBusinessLicense(ctx); err != nil {
 			return err
 		}
 	}

@@ -15,12 +15,13 @@ import (
 )
 
 type Worker struct {
-	DB          *sql.DB
-	Service     *service.Service
-	HTTP        *http.Client
-	StatusURL   string
-	AccessToken func(context.Context) (string, error)
-	BatchSize   int
+	CheckBusinessLicense func(context.Context) error
+	DB                   *sql.DB
+	Service              *service.Service
+	HTTP                 *http.Client
+	StatusURL            string
+	AccessToken          func(context.Context) (string, error)
+	BatchSize            int
 }
 
 type candidate struct {
@@ -31,6 +32,11 @@ type candidate struct {
 // RunOnce claims due operations before making network calls, then feeds every
 // result through the same transactional inbox/state machine as push callbacks.
 func (w *Worker) RunOnce(ctx context.Context) error {
+	if w.CheckBusinessLicense != nil {
+		if err := w.CheckBusinessLicense(ctx); err != nil {
+			return err
+		}
+	}
 	if w.DB == nil || w.Service == nil || w.HTTP == nil || strings.TrimSpace(w.StatusURL) == "" || w.AccessToken == nil {
 		return fmt.Errorf("tax reconciliation worker is not configured")
 	}
@@ -65,6 +71,11 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 }
 
 func (w *Worker) reconcile(ctx context.Context, item candidate) error {
+	if w.CheckBusinessLicense != nil {
+		if err := w.CheckBusinessLicense(ctx); err != nil {
+			return err
+		}
+	}
 	table := "settlement_invoice_issue_attempt"
 	if item.table == "red" {
 		table = "settlement_invoice_red_flush_attempt"
@@ -89,6 +100,11 @@ func (w *Worker) reconcile(ctx context.Context, item candidate) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
+	if w.CheckBusinessLicense != nil {
+		if err := w.CheckBusinessLicense(ctx); err != nil {
+			return err
+		}
+	}
 	resp, err := w.HTTP.Do(req)
 	if err != nil {
 		return nil // unknown remains eligible for a later reconciliation attempt
@@ -110,6 +126,11 @@ func (w *Worker) reconcile(ctx context.Context, item candidate) error {
 	}
 	if event.ExternalRequestID != item.externalRequestID || event.TenantID != item.tenant {
 		return fmt.Errorf("tax status result identity mismatch")
+	}
+	if w.CheckBusinessLicense != nil {
+		if err := w.CheckBusinessLicense(ctx); err != nil {
+			return err
+		}
 	}
 	_, err = w.Service.ApplyTaxCallback(ctx, item.tenant, event)
 	return err

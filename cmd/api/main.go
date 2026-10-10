@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/J-S-Te/license-core/consumer"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,6 +23,18 @@ import (
 )
 
 func main() {
+	licenseCtx, licenseStop := context.WithCancel(context.Background())
+	defer licenseStop()
+	commercialGate, licenseErr := consumer.FromEnvironment("settlement")
+	if licenseErr != nil {
+		slog.Error("commercial license configuration failed")
+		os.Exit(1)
+	}
+	go func() {
+		_ = commercialGate.Run(licenseCtx, func(error) {
+			slog.Warn("commercial license synchronization unavailable; local expiry remains authoritative")
+		})
+	}()
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("configuration failed", "error", err)
@@ -106,6 +119,7 @@ func main() {
 	if fileGateway != nil {
 		dependencies = append(dependencies, fileGateway)
 	}
+	dependencies = append(dependencies, commercialGate)
 	server := &http.Server{Addr: cfg.HTTPAddress, Handler: httpapi.New(db, cfg, slog.Default(), auth, machine, taxMachine, dependencies...), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	slog.Info("settlement API started", "address", cfg.HTTPAddress, "development_auth", cfg.DevelopmentAuth)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

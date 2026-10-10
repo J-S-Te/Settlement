@@ -16,6 +16,7 @@ import (
 )
 
 var ErrLeaseLost = errors.New("outbox lease lost")
+var ErrLicensePaused = errors.New("commercial license paused business delivery")
 
 type Event struct {
 	ID, TenantID, EventID, Destination, EventType, AggregateType, AggregateID string
@@ -154,13 +155,14 @@ type Destination struct {
 	ApplicationCode, EnvironmentCode              string
 }
 type Worker struct {
-	Store         *Store
-	HTTP          *http.Client
-	TokenEndpoint string
-	BatchSize     int
-	Destinations  []Destination
-	mu            sync.Mutex
-	tokens        map[string]cachedToken
+	CheckBusinessLicense func(context.Context) error
+	Store                *Store
+	HTTP                 *http.Client
+	TokenEndpoint        string
+	BatchSize            int
+	Destinations         []Destination
+	mu                   sync.Mutex
+	tokens               map[string]cachedToken
 }
 type cachedToken struct {
 	Value   string
@@ -190,6 +192,11 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 func (w *Worker) RunOnce(ctx context.Context) error {
 	for _, destination := range w.Destinations {
+		if destination.Name != "PLATFORM_AUDIT" && destination.Name != "PLATFORM_NOTIFICATION" && w.CheckBusinessLicense != nil {
+			if w.CheckBusinessLicense(ctx) != nil {
+				continue
+			}
+		}
 		events, err := w.Store.Acquire(ctx, destination.Name, w.BatchSize)
 		if err != nil {
 			return err
@@ -198,6 +205,9 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 			continue
 		}
 		if err = w.deliver(ctx, destination, events); err != nil {
+			if errors.Is(err, ErrLicensePaused) {
+				continue
+			}
 			permanent := false
 			var status *httpStatusError
 			if errors.As(err, &status) {
@@ -213,6 +223,11 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 	return nil
 }
 func (w *Worker) deliver(ctx context.Context, d Destination, events []Event) error {
+	if d.Name != "PLATFORM_AUDIT" && d.Name != "PLATFORM_NOTIFICATION" && w.CheckBusinessLicense != nil {
+		if w.CheckBusinessLicense(ctx) != nil {
+			return ErrLicensePaused
+		}
+	}
 	token, err := w.accessToken(ctx, d)
 	if err != nil {
 		return err
@@ -236,6 +251,11 @@ func (w *Worker) deliver(ctx context.Context, d Destination, events []Event) err
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Request-ID", events[0].EventID)
+	if d.Name != "PLATFORM_AUDIT" && d.Name != "PLATFORM_NOTIFICATION" && w.CheckBusinessLicense != nil {
+		if w.CheckBusinessLicense(ctx) != nil {
+			return ErrLicensePaused
+		}
+	}
 	resp, err := w.HTTP.Do(req)
 	if err != nil {
 		return err

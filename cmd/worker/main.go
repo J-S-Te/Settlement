@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"fmt"
+	"github.com/J-S-Te/license-core/consumer"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -83,7 +81,23 @@ func main() {
 	worker := &outbox.Worker{Store: &outbox.Store{DB: db, WorkerID: workerID, Lease: 30 * time.Second}, HTTP: httpClient, TokenEndpoint: platform + "/oauth2/token", BatchSize: 50, Destinations: destinations}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	commercialGate, licenseErr := consumer.FromEnvironment("settlement")
+	if licenseErr != nil {
+		slog.Error("commercial license configuration failed")
+		os.Exit(1)
+	}
+	go func() {
+		_ = commercialGate.Run(ctx, func(error) {
+			slog.Warn("commercial license synchronization unavailable; local expiry remains authoritative")
+		})
+	}()
+	checkBusiness := func(ctx context.Context) error { return commercialGate.Check(ctx, "MUTATE_BUSINESS") }
+	worker.CheckBusinessLicense = checkBusiness
+	if taxReconciler != nil {
+		taxReconciler.CheckBusinessLicense = checkBusiness
+	}
 	scanner := &dunning.Scanner{DB: db, BatchSize: 50}
+	scanner.CheckBusinessLicense = checkBusiness
 	exporter := &reportexport.Worker{DB: db, WorkerID: workerID, BatchSize: 5, GatewayMode: strings.ToLower(strings.TrimSpace(os.Getenv("SETTLEMENT_FILE_GATEWAY_MODE"))), GatewayApplicationID: strings.TrimSpace(os.Getenv("SETTLEMENT_FILE_GATEWAY_APPLICATION_ID"))}
 	exporter.GatewayMode = reportexport.NormalizeGatewayMode(exporter.GatewayMode)
 	if exporter.GatewayMode == "dual" || exporter.GatewayMode == "required" {
@@ -93,20 +107,7 @@ func main() {
 			tokenURL = platform + "/oauth2/token"
 		}
 		tokenSource := func(ctx context.Context) (string, error) {
-			request, _ := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader("grant_type=client_credentials&client_id="+url.QueryEscape(clientID)+"&client_secret="+url.QueryEscape(secret)+"&scope="+url.QueryEscape(scope)))
-			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			response, err := httpClient.Do(request)
-			if err != nil {
-				return "", err
-			}
-			defer response.Body.Close()
-			var payload struct {
-				AccessToken string `json:"access_token"`
-			}
-			if err = json.NewDecoder(response.Body).Decode(&payload); err != nil || response.StatusCode/100 != 2 || payload.AccessToken == "" {
-				return "", fmt.Errorf("file gateway token request failed: %s", response.Status)
-			}
-			return payload.AccessToken, nil
+			return requestFileGatewayToken(ctx, httpClient, tokenURL, clientID, secret, scope)
 		}
 		gateway, gatewayErr := filegatewayclient.New(endpoint, httpClient, tokenSource)
 		if gatewayErr != nil {
