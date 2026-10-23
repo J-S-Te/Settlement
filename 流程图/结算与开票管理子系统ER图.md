@@ -4,7 +4,7 @@
 >
 > 所有金额使用 `DECIMAL` 定点数；所有核心表均应包含 `tenant_id`、创建/更新时间、操作者与乐观锁版本等通用字段。图中为突出领域关系，省略了这些重复字段。
 
-> 维护说明：本图描述领域核心关系；`settlement_inbox_event`、`settlement_outbox_event`、`settlement_idempotency_record`、OIDC 会话、审计、通知和 `settlement_report_export_job` 是可靠性/认证/运营支撑表，必须以 `Settlement/migrations/` 的实际 DDL 为准。图中保留的 `TAX_INVOICE_ITEM` 代表设计预留，若迁移尚未创建该表，不得视为已上线能力。
+> 维护说明：本图为保留的领域逻辑设计，字段和约束不逐项等同现行物理表；2026-10-22 已对照迁移确认下述实现关系。`settlement_inbox_event`、`settlement_outbox_event`、`settlement_idempotency_record`、OIDC 会话、审计、通知和 `settlement_report_export_job` 是可靠性/认证/运营支撑表，必须以 `Settlement/migrations/` 的实际 DDL 为准。`TAX_INVOICE_ITEM` 已由 000010 创建为 `settlement_tax_invoice_item`，税控结果事务写入实际票面；详情另行读取申请依据并校验符号/合计，不能再标为未落地预留。报表租约/副作用表见 000014，信用结清撤销关系见 000012。图中的银行导入、全字段乐观锁和额外快照版本仍按设计目标理解，不据此宣称实现。
 
 ```mermaid
 erDiagram
@@ -267,12 +267,12 @@ erDiagram
 | 合同、客户、项目 | 通过来源 ID 回溯权威系统；结算单据保存名称、税务资料、付款条款等快照。上游变更不得覆盖已确认应收和已开票凭证。 |
 | 应收 | `receivable_plan` 是计划，`receivable` 是已确认的财务义务；开票状态、收款状态、账龄必须分别表达。 |
 | 开票 | 一张申请可有多行明细、占用多笔应收，并可产生多次开票尝试和一至多张税务发票。税控调用以 `invoice_issue_attempt` 的外部幂等键重试。 |
-| 红冲/作废 | 不修改原发票。红票是新的 `tax_invoice`，并通过 `invoice_red_flush_relation` 连接原蓝票。 |
+| 红冲 | 保留蓝票金额/票面事实，追加负数红票及 `invoice_red_flush_relation`；最终成功后原票状态改为 RED_FLUSHED。当前仅整票红冲，不将“作废”当作已实现入口。 |
 | 回款核销 | `receipt_allocation` 是最小不可变事实：一笔回款可分配多笔应收，反之亦然。错误以 `receipt_allocation_reversal` 冲销，不能更新或删除原分配记录。 |
 | 并发控制 | 确认开票占用或回款分配时，必须在同一数据库事务中锁定相关应收和回款投影，校验余额不为负，并使用 `version` 作乐观锁保护。 |
 | 催收 | 策略、案件、动作分离；`dunning_action.event_id` 是通知外发的幂等依据。普通提醒留在本系统；跨系统或高优先级提醒经 Outbox 异步投递基础平台。 |
 
-## 数据库约束与索引（第一期必备）
+## 设计约束与索引目标（以实际迁移复核）
 
 ```text
 UNIQUE (tenant_id, source_system, source_contract_id, source_contract_version)
@@ -280,7 +280,7 @@ UNIQUE (tenant_id, source_event_id)                         -- 上游事件幂�
 UNIQUE (tenant_id, request_no)
 UNIQUE (tenant_id, invoice_request.idempotency_key)
 UNIQUE (tenant_id, invoice_issue_attempt.external_request_id)
-UNIQUE (tenant_id, receipt.bank_transaction_reference)      -- 银行流水去重
+UNIQUE (tenant_id, receipt.bank_transaction_reference)      -- 人工回款流水参考去重；不是银行到账验证
 UNIQUE (tenant_id, receipt_allocation.idempotency_key)
 UNIQUE (dunning_action.event_id)
 
@@ -291,4 +291,4 @@ INDEX  invoice_request(tenant_id, status, created_at)
 INDEX  dunning_case(tenant_id, status, next_action_at)
 ```
 
-已确认的回款分配、冲销、发票及红冲记录只允许追加，禁止物理删除。涉及税号、银行账号、回单和发票文件的数据必须脱敏展示，并记录查看、下载、导出的审计事件。
+已确认的金额事实、冲销及票面凭证保留不物理删除；余额、处理状态和版本会由事务更新，不能把图中的“不可变”理解为整行所有列禁止变化。涉及税号、银行账号、回单和发票文件的数据必须脱敏展示，并记录查看、下载、导出的审计事件。

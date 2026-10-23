@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 )
@@ -16,6 +17,7 @@ type ServiceTokenVerifier struct {
 	verifier                                                    *oidc.IDTokenVerifier
 	clientID, audience, tenant, application, environment, scope string
 	strict                                                      bool
+	applicationVerifier                                         *platformApplicationVerifier
 }
 
 func NewStrictServiceTokenVerifier(ctx context.Context, issuer, clientID, audience, tenant, application, environment, scope string) (*ServiceTokenVerifier, error) {
@@ -34,6 +36,15 @@ func NewServiceTokenVerifier(ctx context.Context, issuer, clientID, audience, te
 	return &ServiceTokenVerifier{verifier: provider.Verifier(&oidc.Config{SkipClientIDCheck: true}), clientID: clientID, audience: audience, tenant: tenant, application: application, environment: environment, scope: scope}, nil
 }
 func (v *ServiceTokenVerifier) Verify(ctx context.Context, raw string) (ServiceIdentity, error) {
+	if v == nil {
+		return ServiceIdentity{}, ErrInvalidServiceToken
+	}
+	if v.applicationVerifier != nil {
+		return v.applicationVerifier.verify(strings.TrimSpace(raw), time.Now())
+	}
+	if v.verifier == nil {
+		return ServiceIdentity{}, ErrInvalidServiceToken
+	}
 	token, err := v.verifier.Verify(ctx, strings.TrimSpace(raw))
 	if err != nil {
 		return ServiceIdentity{}, ErrInvalidServiceToken

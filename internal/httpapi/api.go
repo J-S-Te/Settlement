@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,33 +12,39 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"mime"
+	"net"
 	"net/http"
+	"net/netip"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/j-s-te/settlement/internal/config"
+	"github.com/j-s-te/settlement/internal/handover"
 	"github.com/j-s-te/settlement/internal/platform"
 	"github.com/j-s-te/settlement/internal/service"
 )
 
 type API struct {
-	service    *service.Service
-	cfg        config.Config
-	logger     *slog.Logger
-	auth       *platform.Authenticator
-	machine    *platform.ServiceTokenVerifier
-	taxMachine *platform.ServiceTokenVerifier
-	directory  platform.PersonnelDirectory
-	files      InvoiceFileGateway
-	commercial CommercialLicenseGate
+	handover        *handover.Service
+	handoverMachine handoverVerifier
+	service         *service.Service
+	cfg             config.Config
+	logger          *slog.Logger
+	auth            *platform.Authenticator
+	machine         *platform.ServiceTokenVerifier
+	taxMachine      *platform.ServiceTokenVerifier
+	directory       platform.PersonnelDirectory
+	files           InvoiceFileGateway
+	commercial      CommercialLicenseGate
 }
 
 type InvoiceFileGateway interface {
-	Upload(context.Context, string, string, string, string, string, io.Reader) (string, error)
-	Bind(context.Context, string, string, string, string, string, string) error
+	service.InvoiceArchiveGateway
 	Download(context.Context, string) ([]byte, error)
 }
 
@@ -48,7 +53,15 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 	var publisher service.CreditEventPublisher
 	var files InvoiceFileGateway
 	var commercial CommercialLicenseGate
+	var handoverService *handover.Service
+	var handoverMachine handoverVerifier
 	for _, dependency := range dependencies {
+		if value, ok := dependency.(*handover.Service); ok {
+			handoverService = value
+		}
+		if value, ok := dependency.(handoverVerifier); ok {
+			handoverMachine = value
+		}
 		if value, ok := dependency.(CommercialLicenseGate); ok {
 			commercial = value
 		}
@@ -64,8 +77,12 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 	}
 	api := &API{service: &service.Service{DB: db, CreditPublisher: publisher, InvoiceIssuanceMode: cfg.InvoiceIssuanceMode, TaxProviderCode: cfg.TaxProviderCode}, cfg: cfg, logger: logger, auth: auth, machine: machine, taxMachine: taxMachine, directory: directory, files: files}
 	api.commercial = commercial
+	api.service.CheckInvoiceArchiveLicense = api.checkInvoiceArchiveLicense
+	if handoverService != nil && handoverMachine != nil {
+		api.handover, api.handoverMachine = handoverService, handoverMachine
+	}
 	if cfg.DevelopmentAuth && logger != nil {
-		// Licensing does not replace the existing identity and CSRF boundaries.
+		// 商业授权不替代既有身份及 CSRF 边界。
 		// 响亮警告（SEC-D10）：DevelopmentAuth 让所有结算写接口免鉴权（回退
 		// dev-finance 全权限主体）。它只允许出现在本机调试；与生产特征的组合
 		// 已在 config.Load 启动期拒绝，这里保证任何启用时刻都有醒目日志可告警。
@@ -185,6 +202,21 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/internal/v1/settlement/events/tax-results" && r.Method == http.MethodPost:
 		a.taxResult(w, r)
 		return
+	case a.handoverBound() && r.URL.Path == "/internal/v1/handover/freeze" && r.Method == http.MethodPost:
+		a.handoverFreeze(w, r)
+		return
+	case a.handoverBound() && r.URL.Path == "/internal/v1/handover/responsibilities" && r.Method == http.MethodGet:
+		a.handoverResponsibilities(w, r)
+		return
+	case a.handoverBound() && r.URL.Path == "/internal/v1/handover/transfers" && r.Method == http.MethodPost:
+		a.handoverTransfer(w, r)
+		return
+	case a.handoverBound() && strings.HasPrefix(r.URL.Path, "/internal/v1/handover/transfers/") && r.Method == http.MethodGet:
+		a.handoverReceipt(w, r)
+		return
+	case a.handoverBound() && r.URL.Path == "/internal/v1/handover/complete" && r.Method == http.MethodPost:
+		a.handoverComplete(w, r)
+		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/credit-sync-events/") && strings.HasSuffix(r.URL.Path, "/retry") && r.Method == http.MethodPost:
 		a.retryCreditSync(w, r)
 		return
@@ -196,6 +228,15 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case r.URL.Path == "/api/v1/reports/invoiced-receivables/export" && r.Method == http.MethodPost:
 		a.createInvoicedReceivablesExport(w, r)
+		return
+	case r.URL.Path == "/api/v1/outbox/events" && r.Method == http.MethodGet:
+		a.listOutboxEvents(w, r)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/outbox/events/") && strings.HasSuffix(r.URL.Path, "/retry") && r.Method == http.MethodPost:
+		a.retryOutboxEvent(w, r)
+		return
+	case r.URL.Path == "/api/v1/reports/aging" && r.Method == http.MethodGet:
+		a.agingSummary(w, r)
 		return
 	case r.URL.Path == "/api/v1/reports/aging/export" && r.Method == http.MethodPost:
 		a.createAgingReceivablesExport(w, r)
@@ -267,6 +308,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/approve") && r.Method == http.MethodPost:
 		a.approveInvoiceRequest(w, r)
 		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/recover-failure") && r.Method == http.MethodPost:
+		a.recoverInvoiceFailure(w, r)
+		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/reject") && r.Method == http.MethodPost:
 		a.rejectInvoiceRequest(w, r)
 		return
@@ -279,11 +323,20 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/v1/dunning/policies" && r.Method == http.MethodPost:
 		a.createDunningPolicy(w, r)
 		return
+	case r.URL.Path == "/api/v1/dunning/overview" && r.Method == http.MethodGet:
+		a.dunningOverview(w, r)
+		return
+	case r.URL.Path == "/api/v1/dunning/coverage" && r.Method == http.MethodGet:
+		a.dunningCoverage(w, r)
+		return
 	case r.URL.Path == "/api/v1/dunning/cases" && r.Method == http.MethodGet:
 		a.listDunningCases(w, r)
 		return
 	case r.URL.Path == "/api/v1/dunning/actions" && r.Method == http.MethodGet:
 		a.listDunningActions(w, r)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/dunning/actions/") && strings.HasSuffix(r.URL.Path, "/complete") && r.Method == http.MethodPost:
+		a.completeDunningAction(w, r)
 		return
 	case r.URL.Path == "/api/v1/dunning/recipients" && r.Method == http.MethodGet:
 		a.listDunningRecipients(w, r)
@@ -323,15 +376,80 @@ func (a *API) retryCreditSync(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]string{"event_id": eventID, "status": "DELIVERED"})
 }
 
-// Development auth is deliberately explicit and local only. Production must
-// install the same OIDC session adapter/client-credentials verifier used by the
-// other subsystems before it exposes any business route.
+// 开发认证必须显式且仅限本地。生产在暴露任何业务
+// 路由前，必须安装与其他子系统相同的 OIDC 会话
+// 适配器及客户端凭据校验器。
+// clientIP 解析本次业务操作的客户端地址与来源标记。
+//
+// 只有直接对端命中配置的可信代理时才采信 X-Real-IP / X-Forwarded-For；XFF 从右往左
+// 跳过可信代理本身，取第一个非代理地址。私网、VPN、回环都是合法客户端地址。
+func (a *API) clientIP(r *http.Request) (string, string) {
+	peer := normalizePeerAddress(r.RemoteAddr)
+	if peer != "" && a.trustsProxy(peer) {
+		if ip := normalizeIPAddress(r.Header.Get("X-Real-IP")); ip != "" {
+			return ip, "TRUSTED_PROXY"
+		}
+		values := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+		for i := len(values) - 1; i >= 0; i-- {
+			ip := normalizeIPAddress(values[i])
+			if ip == "" || a.trustsProxy(ip) {
+				continue
+			}
+			return ip, "TRUSTED_PROXY"
+		}
+	}
+	if peer != "" {
+		return peer, "DIRECT"
+	}
+	return "", "UNKNOWN"
+}
+
+func (a *API) trustsProxy(value string) bool {
+	address, err := netip.ParseAddr(value)
+	if err != nil {
+		return false
+	}
+	for _, prefix := range a.cfg.TrustedProxies {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizePeerAddress(remoteAddr string) string {
+	value := strings.TrimSpace(remoteAddr)
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	return normalizeIPAddress(strings.Trim(value, "[]"))
+}
+
+func normalizeIPAddress(value string) string {
+	parsed, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil || parsed.IsUnspecified() || parsed.IsMulticast() {
+		return ""
+	}
+	return parsed.String()
+}
+
 func (a *API) principal(r *http.Request) (service.Principal, error) {
 	if !a.cfg.DevelopmentAuth {
 		if a.auth == nil {
 			return service.Principal{}, errors.New("OIDC adapter is not configured")
 		}
-		return a.auth.Authenticate(r.Context(), r)
+		principal, err := a.auth.Authenticate(r.Context(), r)
+		if err != nil {
+			return principal, err
+		}
+		// AUD-IP-2026：登录地址来自平台授权上下文（随会话固定），操作地址按请求解析，
+		// 由业务事务写入审计 Outbox。handler 与 principal 共享同一 *http.Request，
+		// 就地替换上下文后，后续 service.X(r.Context(), …) 能读到来源元数据。
+		clientIP, ipSource := a.clientIP(r)
+		*r = *r.WithContext(service.WithRequestMeta(r.Context(), service.RequestMeta{
+			LoginIP: principal.LoginIP, ClientIP: clientIP, IPSource: ipSource,
+		}))
+		return principal, nil
 	}
 	return service.Principal{TenantID: "dev", UserID: "dev-finance", IdentityID: "dev-finance", DisplayName: "本地结算管理员", Username: "dev-finance", CatalogVersion: "development", AuthorizationRevision: 1, Permissions: map[string]bool{"settlement.admin": true}}, nil
 }
@@ -411,6 +529,9 @@ func (a *API) contractEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := a.service.IngestContract(r.Context(), "contract_management", trustedTenant, event)
 	if err != nil {
+		if a.logger != nil {
+			a.logger.Error("contract financial event ingest failed", "event_id", event.EventID, "contract_id", event.Contract.ID, "error", err)
+		}
 		respondError(w, err)
 		return
 	}
@@ -471,18 +592,121 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
-	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM settlement_invoice_request WHERE tenant_id=? AND status IN ('SUBMITTED','UNDER_REVIEW')`, p.TenantID).Scan(&invoices); err != nil {
+	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM settlement_invoice_request WHERE tenant_id=? AND status IN ('SUBMITTED','UNDER_REVIEW','ISSUE_PENDING')`, p.TenantID).Scan(&invoices); err != nil {
 		respondError(w, err)
 		return
 	}
-	write(w, http.StatusOK, map[string]int{"receivable_count": receivables, "overdue_count": overdue, "pending_plan_count": plans, "pending_invoice_count": invoices})
+	// 币种合计在 SQL 中覆盖整个租户计算。看板
+	// 绝不能累加不同币种金额，也不能依赖列表请求的
+	// 第一页。
+	type totals struct{ open, receipts, pendingInvoice, overdue string }
+	byCurrency := map[string]*totals{}
+	get := func(currency string) *totals {
+		currency = strings.ToUpper(strings.TrimSpace(currency))
+		if currency == "" {
+			currency = "CNY"
+		}
+		if byCurrency[currency] == nil {
+			byCurrency[currency] = &totals{open: "0.00", receipts: "0.00", pendingInvoice: "0.00", overdue: "0.00"}
+		}
+		return byCurrency[currency]
+	}
+	addRows := func(query, field string) error {
+		rows, err := a.service.DB.QueryContext(r.Context(), query, p.TenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var currency, value string
+			if err := rows.Scan(&currency, &value); err != nil {
+				return err
+			}
+			t := get(currency)
+			switch field {
+			case "open":
+				t.open = value
+			case "receipts":
+				t.receipts = value
+			case "pending":
+				t.pendingInvoice = value
+			case "overdue":
+				t.overdue = value
+			}
+		}
+		return rows.Err()
+	}
+	if err := addRows(`SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND open_amount>0 GROUP BY currency ORDER BY currency`, "open"); err != nil {
+		respondError(w, err)
+		return
+	}
+	if err := addRows(`SELECT currency,COALESCE(SUM(amount),0) FROM settlement_receipt WHERE tenant_id=? AND receipt_date>=DATE_FORMAT(CURDATE(),'%Y-%m-01') AND receipt_date<DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'),INTERVAL 1 MONTH) GROUP BY currency ORDER BY currency`, "receipts"); err != nil {
+		respondError(w, err)
+		return
+	}
+	if err := addRows(`SELECT cs.currency,COALESCE(SUM(ir.amount_incl_tax),0) FROM settlement_invoice_request ir JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? AND ir.status IN ('SUBMITTED','UNDER_REVIEW','ISSUE_PENDING') GROUP BY cs.currency ORDER BY cs.currency`, "pending"); err != nil {
+		respondError(w, err)
+		return
+	}
+	if err := addRows(`SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND open_amount>0 AND due_date<CURDATE() GROUP BY currency ORDER BY currency`, "overdue"); err != nil {
+		respondError(w, err)
+		return
+	}
+	currencyTotals := make([]map[string]string, 0, len(byCurrency))
+	for currency, t := range byCurrency {
+		currencyTotals = append(currencyTotals, map[string]string{
+			"currency": currency, "open_receivable": t.open, "current_month_receipts": t.receipts,
+			"pending_invoice": t.pendingInvoice, "overdue": t.overdue,
+		})
+	}
+	sort.Slice(currencyTotals, func(i, j int) bool { return currencyTotals[i]["currency"] < currencyTotals[j]["currency"] })
+	write(w, http.StatusOK, map[string]any{"receivable_count": receivables, "overdue_count": overdue, "pending_plan_count": plans, "pending_invoice_count": invoices, "currency_totals": currencyTotals})
 }
+func (a *API) listOutboxEvents(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.admin")
+	if !ok {
+		return
+	}
+	items, err := a.service.ListOutboxEvents(r.Context(), p)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (a *API) retryOutboxEvent(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.admin")
+	if !ok {
+		return
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/outbox/events/"), "/retry")
+	if err := a.service.RetryOutboxEvent(r.Context(), p, id); err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]string{"id": id, "status": "PENDING"})
+}
+
+func (a *API) agingSummary(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.report.read")
+	if !ok {
+		return
+	}
+	items, err := a.service.AgingSummary(r.Context(), p)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"items": items})
+}
+
 func (a *API) invoicedReceivablesTop10(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.report.read")
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.open_amount DESC,r.due_date ASC,r.id ASC LIMIT 10`, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.currency ASC,r.open_amount DESC,r.due_date ASC,r.id ASC LIMIT 10`, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -609,7 +833,12 @@ func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.tenant_id=? ORDER BY rp.due_date ASC LIMIT 100`, p.TenantID)
+	limit, offset, err := page(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
+		return
+	}
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.tenant_id=? ORDER BY rp.due_date ASC,rp.id ASC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -726,7 +955,12 @@ func (a *API) listReceipts(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,receipt_no,customer_name_snapshot,amount,unallocated_amount,currency,DATE_FORMAT(receipt_date,'%Y-%m-%d'),payment_method,bank_transaction_reference,status FROM settlement_receipt WHERE tenant_id=? ORDER BY receipt_date DESC LIMIT 100`, p.TenantID)
+	limit, offset, err := page(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
+		return
+	}
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,receipt_no,customer_name_snapshot,amount,unallocated_amount,currency,DATE_FORMAT(receipt_date,'%Y-%m-%d'),payment_method,bank_transaction_reference,status FROM settlement_receipt WHERE tenant_id=? ORDER BY receipt_date DESC,id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -748,8 +982,8 @@ func (a *API) listReceipts(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, items)
 }
 
-// page parses bounded list pagination so a client cannot request an unbounded
-// financial result set. The default remains compatible with the first-phase UI.
+// page 解析有界列表分页，防止客户端请求无限
+// 财务结果集。默认值保持与第一阶段 UI 兼容。
 func page(r *http.Request) (int, int, error) {
 	limit := 100
 	offset := 0
@@ -807,7 +1041,12 @@ func (a *API) listAllocations(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT a.id,a.allocation_no,rc.receipt_no,rv.receivable_no,a.allocated_amount,a.currency,a.status,a.match_mode,a.match_confidence,a.confirmed_by,a.confirmed_at FROM settlement_receipt_allocation a JOIN settlement_receipt rc ON rc.id=a.receipt_id AND rc.tenant_id=a.tenant_id JOIN settlement_receivable rv ON rv.id=a.receivable_id AND rv.tenant_id=a.tenant_id WHERE a.tenant_id=? ORDER BY a.confirmed_at DESC LIMIT 100`, p.TenantID)
+	limit, offset, err := page(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
+		return
+	}
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT a.id,a.allocation_no,rc.receipt_no,rv.receivable_no,a.allocated_amount,a.currency,a.status,a.match_mode,a.match_confidence,a.confirmed_by,a.confirmed_at FROM settlement_receipt_allocation a JOIN settlement_receipt rc ON rc.id=a.receipt_id AND rc.tenant_id=a.tenant_id JOIN settlement_receivable rv ON rv.id=a.receivable_id AND rv.tenant_id=a.tenant_id WHERE a.tenant_id=? ORDER BY a.confirmed_at DESC,a.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -923,7 +1162,12 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.rejection_reason,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),COALESCE((SELECT ia.channel FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),'') FROM settlement_invoice_request ir JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? ORDER BY ir.created_at DESC LIMIT 100`, p.TenantID)
+	limit, offset, err := page(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
+		return
+	}
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.rejection_reason,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),COALESCE((SELECT ia.channel FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_code FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_message FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),'') FROM settlement_invoice_request ir JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? ORDER BY ir.created_at DESC,ir.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -931,18 +1175,18 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, no, contract, kind, excl, tax, incl, status, submitted, approved, rejectionReason, issueChannel string
+		var id, no, contract, kind, excl, tax, incl, status, submitted, approved, rejectionReason, issueChannel, failureCode, failureMessage string
 		var buyer []byte
 		var taxRate sql.NullString
 		var taxRateCount int
 		var version int
 		var created any
-		if err := rows.Scan(&id, &no, &contract, &buyer, &kind, &excl, &tax, &incl, &status, &submitted, &approved, &rejectionReason, &version, &created, &taxRateCount, &taxRate, &issueChannel); err != nil {
+		if err := rows.Scan(&id, &no, &contract, &buyer, &kind, &excl, &tax, &incl, &status, &submitted, &approved, &rejectionReason, &version, &created, &taxRateCount, &taxRate, &issueChannel, &failureCode, &failureMessage); err != nil {
 			respondError(w, err)
 			return
 		}
 		buyerName, buyerTaxNo := buyerSummary(buyer)
-		items = append(items, map[string]any{"id": id, "request_no": no, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "tax_rate_display": taxRateDisplay(taxRate.String, taxRateCount), "status": status, "submitted_by": submitted, "approved_by": approved, "rejection_reason": rejectionReason, "version": version, "created_at": created, "issue_channel": issueChannel})
+		items = append(items, map[string]any{"id": id, "request_no": no, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "tax_rate_display": taxRateDisplay(taxRate.String, taxRateCount), "status": status, "submitted_by": submitted, "approved_by": approved, "rejection_reason": rejectionReason, "version": version, "created_at": created, "issue_channel": issueChannel, "failure_code": failureCode, "failure_message": failureMessage})
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -956,7 +1200,12 @@ func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,COALESCE((SELECT rf.status FROM settlement_invoice_red_flush_request rf WHERE rf.tenant_id=ti.tenant_id AND rf.original_invoice_id=ti.id ORDER BY rf.created_at DESC LIMIT 1),'') FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.tenant_id=? ORDER BY ti.issue_date DESC,ti.created_at DESC LIMIT 100`, p.TenantID)
+	limit, offset, err := page(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
+		return
+	}
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,COALESCE((SELECT rf.status FROM settlement_invoice_red_flush_request rf WHERE rf.tenant_id=ti.tenant_id AND rf.original_invoice_id=ti.id ORDER BY rf.created_at DESC LIMIT 1),'') FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.tenant_id=? ORDER BY ti.issue_date DESC,ti.created_at DESC,ti.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -978,6 +1227,96 @@ func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusOK, items)
+}
+
+type taxInvoiceDetailLine struct {
+	LineNo                int
+	ItemName              string
+	TaxClassificationCode string
+	AmountExclTax         string
+	TaxRate               string
+	TaxAmount             string
+	AmountInclTax         string
+}
+
+// taxInvoiceDetailLines 读取一个已存储明细集合。调用方负责
+// 选择表：已开税票明细与申请明细属于不同
+// 事实，不能相互替代。
+func (a *API) taxInvoiceDetailLines(ctx context.Context, query, tenant, sourceID string) ([]taxInvoiceDetailLine, error) {
+	rows, err := a.service.DB.QueryContext(ctx, query, tenant, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	lines := []taxInvoiceDetailLine{}
+	for rows.Next() {
+		var line taxInvoiceDetailLine
+		if err := rows.Scan(&line.LineNo, &line.ItemName, &line.TaxClassificationCode, &line.AmountExclTax, &line.TaxRate, &line.TaxAmount, &line.AmountInclTax); err != nil {
+			return nil, err
+		}
+		lines = append(lines, line)
+	}
+	return lines, rows.Err()
+}
+
+func invoiceDetailLinePayloads(lines []taxInvoiceDetailLine) []map[string]any {
+	items := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		items = append(items, map[string]any{
+			"line_no": line.LineNo, "item_name": line.ItemName,
+			"tax_classification_code": line.TaxClassificationCode,
+			"amount_excl_tax":         line.AmountExclTax, "tax_rate_display": taxRateDisplay(line.TaxRate, 1),
+			"tax_amount": line.TaxAmount, "amount_incl_tax": line.AmountInclTax,
+		})
+	}
+	return items
+}
+
+func invoiceDecimal(value string) (*big.Rat, bool) {
+	number, ok := new(big.Rat).SetString(strings.TrimSpace(value))
+	return number, ok
+}
+
+// verifyTaxInvoiceDetailLines 将展示的已开明细与发票头
+// 关联校验。红票头合计为负，因此每条已开明细
+// 必须带相同符号（零税率税额分量可保持零）；
+// 明细合计还必须与票头合计精确相等。
+func verifyTaxInvoiceDetailLines(headerExcl, headerTax, headerIncl string, lines []taxInvoiceDetailLine) error {
+	if len(lines) == 0 {
+		return errors.New("tax invoice has no issued items")
+	}
+	headerInclAmount, ok := invoiceDecimal(headerIncl)
+	if !ok {
+		return errors.New("invalid invoice header amount")
+	}
+	headerSign := headerInclAmount.Sign()
+	totalExcl, totalTax, totalIncl := new(big.Rat), new(big.Rat), new(big.Rat)
+	for index, line := range lines {
+		excl, okExcl := invoiceDecimal(line.AmountExclTax)
+		tax, okTax := invoiceDecimal(line.TaxAmount)
+		incl, okIncl := invoiceDecimal(line.AmountInclTax)
+		if !okExcl || !okTax || !okIncl {
+			return fmt.Errorf("line %d has an invalid amount", index+1)
+		}
+		if headerSign < 0 && (excl.Sign() > 0 || tax.Sign() > 0 || incl.Sign() > 0) {
+			return fmt.Errorf("line %d has a positive amount under a negative invoice header", index+1)
+		}
+		if headerSign > 0 && (excl.Sign() < 0 || tax.Sign() < 0 || incl.Sign() < 0) {
+			return fmt.Errorf("line %d has a negative amount under a positive invoice header", index+1)
+		}
+		totalExcl.Add(totalExcl, excl)
+		totalTax.Add(totalTax, tax)
+		totalIncl.Add(totalIncl, incl)
+	}
+	wantExcl, okExcl := invoiceDecimal(headerExcl)
+	wantTax, okTax := invoiceDecimal(headerTax)
+	if !okExcl || !okTax {
+		return errors.New("invalid invoice header amount")
+	}
+	if totalExcl.Cmp(wantExcl) != 0 || totalTax.Cmp(wantTax) != 0 || totalIncl.Cmp(headerInclAmount) != 0 {
+		return errors.New("issued item totals differ from the invoice header")
+	}
+	return nil
 }
 
 func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
@@ -1003,24 +1342,31 @@ func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	buyerName, buyerTaxNo := buyerSummary(buyer)
 	sellerName, _ := buyerSummary(seller)
-	itemRows, err := a.service.DB.QueryContext(r.Context(), `SELECT line_no,item_name,tax_classification_code,amount_excl_tax,tax_rate,tax_amount,amount_incl_tax FROM settlement_invoice_request_item WHERE tenant_id=? AND invoice_request_id=? ORDER BY line_no`, p.TenantID, requestID)
+	issuedLines, err := a.taxInvoiceDetailLines(r.Context(), `SELECT line_no,item_name,tax_classification_code,amount_excl_tax,tax_rate,tax_amount,amount_incl_tax FROM settlement_tax_invoice_item WHERE tenant_id=? AND tax_invoice_id=? ORDER BY line_no`, p.TenantID, invoiceID)
 	if err != nil {
 		respondError(w, err)
 		return
 	}
-	defer itemRows.Close()
-	items := []map[string]any{}
-	for itemRows.Next() {
-		var line int
-		var name, classification, itemExcl, rate, itemTax, itemIncl string
-		if err := itemRows.Scan(&line, &name, &classification, &itemExcl, &rate, &itemTax, &itemIncl); err != nil {
-			respondError(w, err)
+	requestLines, err := a.taxInvoiceDetailLines(r.Context(), `SELECT line_no,item_name,tax_classification_code,amount_excl_tax,tax_rate,tax_amount,amount_incl_tax FROM settlement_invoice_request_item WHERE tenant_id=? AND invoice_request_id=? ORDER BY line_no`, p.TenantID, requestID)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	items := issuedLines
+	itemsSource := "TAX_INVOICE"
+	if len(issuedLines) == 0 {
+		// 旧版人工发票没有存储税票明细。对这些记录保留
+		// 原蓝票展示行为，但负数红票的已开符号具有业务意义，
+		// 绝不能使用此回退。
+		headerInclAmount, ok := invoiceDecimal(incl)
+		if !ok || headerInclAmount.Sign() < 0 {
+			fail(w, http.StatusConflict, "SETTLEMENT_TAX_INVOICE_ITEM_MISMATCH", "红票缺少票面明细，无法与票头核对")
 			return
 		}
-		items = append(items, map[string]any{"line_no": line, "item_name": name, "tax_classification_code": classification, "amount_excl_tax": itemExcl, "tax_rate_display": taxRateDisplay(rate, 1), "tax_amount": itemTax, "amount_incl_tax": itemIncl})
-	}
-	if err := itemRows.Err(); err != nil {
-		respondError(w, err)
+		items = requestLines
+		itemsSource = "REQUEST"
+	} else if err := verifyTaxInvoiceDetailLines(excl, tax, incl, issuedLines); err != nil {
+		fail(w, http.StatusConflict, "SETTLEMENT_TAX_INVOICE_ITEM_MISMATCH", "发票票面明细与票头金额或符号不一致，暂不展示")
 		return
 	}
 	documentRows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,document_type,original_name,media_type,archived_at FROM settlement_invoice_document WHERE tenant_id=? AND tax_invoice_id=? ORDER BY archived_at DESC`, p.TenantID, invoiceID)
@@ -1054,7 +1400,7 @@ func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 	if redErr == nil {
 		redFlush = map[string]any{"id": redFlushID, "status": redFlushStatus, "reason_detail": redFlushReason, "review_reason": redFlushReviewReason, "version": redFlushVersion, "can_review": redFlushStatus == "SUBMITTED" && redFlushRequestedBy != p.UserID && p.Allows("settlement.invoice.approve")}
 	}
-	write(w, http.StatusOK, map[string]any{"id": invoiceID, "invoice_request_id": requestID, "request_no": requestNo, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "seller_name": sellerName, "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "document_count": len(documents), "documents": documents, "red_flush_request": redFlush, "items": items})
+	write(w, http.StatusOK, map[string]any{"id": invoiceID, "invoice_request_id": requestID, "request_no": requestNo, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "seller_name": sellerName, "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "document_count": len(documents), "documents": documents, "red_flush_request": redFlush, "items": invoiceDetailLinePayloads(items), "items_source": itemsSource, "request_items": invoiceDetailLinePayloads(requestLines)})
 }
 
 func (a *API) uploadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
@@ -1086,6 +1432,7 @@ func (a *API) uploadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_DOCUMENT", "电子发票文件不得超过 10 MiB")
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_DOCUMENT", "请选择电子发票文件")
@@ -1128,36 +1475,35 @@ func (a *API) uploadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	checksum := fmt.Sprintf("%x", sha256.Sum256(content))
-	var existingID string
-	err = a.service.DB.QueryRowContext(r.Context(), `SELECT id FROM settlement_invoice_document WHERE tenant_id=? AND tax_invoice_id=? AND document_type=? AND checksum=?`, p.TenantID, invoiceID, documentType, checksum).Scan(&existingID)
-	if err == nil {
-		write(w, http.StatusOK, map[string]string{"id": existingID, "status": "ARCHIVED"})
-		return
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		respondError(w, err)
-		return
-	}
 	requestID := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if requestID == "" {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_IDEMPOTENCY_KEY_REQUIRED", "上传电子发票需要幂等键")
 		return
 	}
-	objectID, err := a.files.Upload(r.Context(), requestID, a.cfg.FileGatewayApplicationID, "INTERNAL", originalName, mediaType, bytes.NewReader(content))
+	documentID, created, err := a.service.UploadInvoiceDocument(r.Context(), p,
+		service.InvoiceArchiveIdentity{TenantID: a.cfg.OIDCTenantID, ApplicationID: a.cfg.FileGatewayApplicationID, GatewayURL: a.cfg.FileGatewayURL}, a.files,
+		service.InvoiceArchiveInput{Key: requestID, InvoiceID: invoiceID, DocumentType: documentType, OriginalName: originalName, MediaType: mediaType, Checksum: checksum, Content: content})
 	if err != nil {
-		fail(w, http.StatusBadGateway, "SETTLEMENT_FILE_UPLOAD_FAILED", "电子发票上传失败，请稍后重试")
-		return
-	}
-	if err = a.files.Bind(r.Context(), a.cfg.FileGatewayApplicationID, objectID, "tax_invoice", invoiceID, "electronic_invoice", originalName); err != nil {
-		fail(w, http.StatusBadGateway, "SETTLEMENT_FILE_BIND_FAILED", "电子发票归档失败，请稍后重试")
-		return
-	}
-	documentID, err := a.service.ArchiveInvoiceDocument(r.Context(), p, invoiceID, documentType, originalName, mediaType, objectID, checksum)
-	if err != nil {
+		if errors.Is(err, service.ErrInvoiceArchiveLicense) {
+			fail(w, http.StatusForbidden, "COMMERCIAL_LICENSE_DENIED", "商业授权不可用或已到期；历史查询与导出仍受原权限控制")
+			return
+		}
+		if errors.Is(err, service.ErrInvoiceArchiveProvenance) {
+			fail(w, http.StatusConflict, "SETTLEMENT_INVOICE_ARCHIVE_IDENTITY_UNVERIFIED", "已存在归档文件，但无法确认其原文件服务归属或当前配置不匹配；请管理员受控核对归档来源，勿反复重试")
+			return
+		}
+		if errors.Is(err, service.ErrInvoiceArchiveGateway) {
+			fail(w, http.StatusBadGateway, "SETTLEMENT_FILE_ARCHIVE_FAILED", "电子发票归档失败，请稍后重试")
+			return
+		}
 		respondError(w, err)
 		return
 	}
-	write(w, http.StatusCreated, map[string]string{"id": documentID, "status": "ARCHIVED"})
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	write(w, status, map[string]string{"id": documentID, "status": "ARCHIVED"})
 }
 
 func (a *API) downloadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
@@ -1327,6 +1673,10 @@ func (a *API) listDunningRecipients(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.directory == nil {
+		if a.cfg.DevelopmentAuth {
+			write(w, http.StatusOK, map[string]any{"items": []map[string]any{{"user_id": "dev-finance", "display_name": "本地结算管理员", "roles": []string{"settlement_collector"}}}, "page": 1, "page_size": 50, "total": 1})
+			return
+		}
 		fail(w, http.StatusServiceUnavailable, "SETTLEMENT_PERSONNEL_DIRECTORY_UNAVAILABLE", "催收人员目录尚未配置")
 		return
 	}
@@ -1359,7 +1709,12 @@ func (a *API) listDunningPolicies(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,name,version,aging_from_days,aging_to_days,action_type,recipient_rule,channel,repeat_interval_days,priority,enabled FROM settlement_dunning_policy WHERE tenant_id=? ORDER BY aging_from_days`, p.TenantID)
+	limit, offset, err := page(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
+		return
+	}
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,name,version,aging_from_days,aging_to_days,action_type,recipient_rule,channel,repeat_interval_days,priority,enabled FROM settlement_dunning_policy WHERE tenant_id=? ORDER BY aging_from_days,id LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1382,12 +1737,67 @@ func (a *API) listDunningPolicies(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusOK, items)
 }
+func (a *API) dunningOverview(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.dunning.manage")
+	if !ok {
+		return
+	}
+	overview, err := a.service.DunningOverview(r.Context(), p)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, overview)
+}
+
+func (a *API) dunningCoverage(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.dunning.manage")
+	if !ok {
+		return
+	}
+	coverage, err := a.service.DunningCoverage(r.Context(), p)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, coverage)
+}
+
+func (a *API) completeDunningAction(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.dunning.manage")
+	if !ok {
+		return
+	}
+	actionID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/dunning/actions/"), "/complete")
+	if actionID == "" || strings.Contains(actionID, "/") {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", "催收动作标识不合法")
+		return
+	}
+	var in struct {
+		Version uint64 `json:"version"`
+		Note    string `json:"note"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if err := a.service.CompleteDunningAction(r.Context(), p, actionID, in.Version, in.Note); err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]string{"id": actionID, "status": "COMPLETED"})
+}
+
 func (a *API) listDunningCases(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.dunning.manage")
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT dc.id,r.receivable_no,cs.customer_name_snapshot,DATEDIFF(CURDATE(),r.due_date),r.open_amount,dc.current_escalation_level,dc.status,dc.next_action_at FROM settlement_dunning_case dc JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE dc.tenant_id=? ORDER BY dc.next_action_at LIMIT 100`, p.TenantID)
+	limit, offset, err := page(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
+		return
+	}
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT dc.id,r.receivable_no,cs.customer_name_snapshot,DATEDIFF(CURDATE(),r.due_date),r.open_amount,dc.current_escalation_level,dc.status,dc.next_action_at,dc.last_action_at,COALESCE((SELECT da.recipient_user_id FROM settlement_dunning_action da WHERE da.tenant_id=dc.tenant_id AND da.dunning_case_id=dc.id ORDER BY da.created_at DESC,da.id DESC LIMIT 1),'') FROM settlement_dunning_case dc JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE dc.tenant_id=? ORDER BY dc.next_action_at,dc.id LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1395,14 +1805,14 @@ func (a *API) listDunningCases(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, no, customer, open, status string
+		var id, no, customer, open, status, recipient string
 		var days, level int
-		var next any
-		if err := rows.Scan(&id, &no, &customer, &days, &open, &level, &status, &next); err != nil {
+		var next, last any
+		if err := rows.Scan(&id, &no, &customer, &days, &open, &level, &status, &next, &last, &recipient); err != nil {
 			respondError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"id": id, "receivable_no": no, "customer_name": customer, "aging_days": days, "open_amount": open, "level": level, "status": status, "next_action_at": next})
+		items = append(items, map[string]any{"id": id, "receivable_no": no, "customer_name": customer, "aging_days": days, "open_amount": open, "level": level, "status": status, "next_action_at": next, "last_action_at": last, "recipient_user_id": recipient})
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -1415,7 +1825,12 @@ func (a *API) listDunningActions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT da.id,r.receivable_no,da.channel,da.sent_at,da.created_at,da.recipient_user_id,da.priority,da.status,dc.current_escalation_level FROM settlement_dunning_action da JOIN settlement_dunning_case dc ON dc.id=da.dunning_case_id AND dc.tenant_id=da.tenant_id JOIN settlement_receivable r ON r.id=dc.receivable_id WHERE da.tenant_id=? ORDER BY COALESCE(da.sent_at,da.created_at) DESC LIMIT 100`, p.TenantID)
+	limit, offset, err := page(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
+		return
+	}
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT da.id,r.receivable_no,da.channel,da.sent_at,da.created_at,da.recipient_user_id,da.priority,da.status,dc.current_escalation_level,da.version,da.completed_at,da.completed_by,da.result_detail FROM settlement_dunning_action da JOIN settlement_dunning_case dc ON dc.id=da.dunning_case_id AND dc.tenant_id=da.tenant_id JOIN settlement_receivable r ON r.id=dc.receivable_id WHERE da.tenant_id=? ORDER BY COALESCE(da.sent_at,da.created_at) DESC,da.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1423,14 +1838,15 @@ func (a *API) listDunningActions(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, receivableNo, channel, recipient, priority, status string
-		var sentAt, createdAt any
+		var id, receivableNo, channel, recipient, priority, status, completedBy, resultDetail string
+		var sentAt, createdAt, completedAt any
 		var level int
-		if err := rows.Scan(&id, &receivableNo, &channel, &sentAt, &createdAt, &recipient, &priority, &status, &level); err != nil {
+		var version uint64
+		if err := rows.Scan(&id, &receivableNo, &channel, &sentAt, &createdAt, &recipient, &priority, &status, &level, &version, &completedAt, &completedBy, &resultDetail); err != nil {
 			respondError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"id": id, "receivable_no": receivableNo, "channel": channel, "sent_at": sentAt, "created_at": createdAt, "recipient_user_id": recipient, "priority": priority, "status": status, "escalation_level": level})
+		items = append(items, map[string]any{"id": id, "receivable_no": receivableNo, "channel": channel, "sent_at": sentAt, "created_at": createdAt, "recipient_user_id": recipient, "priority": priority, "status": status, "escalation_level": level, "version": version, "completed_at": completedAt, "completed_by": completedBy, "result_detail": resultDetail})
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -1443,7 +1859,15 @@ func (a *API) listNotifications(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,notification_scope,priority,title,content,target_url,reference_type,reference_id,created_at,read_at FROM settlement_local_notification WHERE tenant_id=? AND recipient_user_id=? ORDER BY created_at DESC LIMIT 50`, p.TenantID, p.UserID)
+	limit, offset, err := page(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
+		return
+	}
+	if r.URL.Query().Get("limit") == "" {
+		limit = 50
+	}
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,notification_scope,priority,title,content,target_url,reference_type,reference_id,created_at,read_at FROM settlement_local_notification WHERE tenant_id=? AND recipient_user_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, p.TenantID, p.UserID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1535,6 +1959,8 @@ func respondError(w http.ResponseWriter, err error) {
 		fail(w, http.StatusNotFound, "SETTLEMENT_NOT_FOUND", "未找到记录")
 	case errors.Is(err, service.ErrConflict):
 		fail(w, http.StatusConflict, "SETTLEMENT_CONFLICT", "记录已变化、重复或余额不足")
+	case errors.Is(err, service.ErrForbidden):
+		fail(w, http.StatusForbidden, "SETTLEMENT_FORBIDDEN", "无权处理该催收动作")
 	default:
 		fail(w, http.StatusInternalServerError, "SETTLEMENT_INTERNAL_ERROR", "服务处理失败")
 	}

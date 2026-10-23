@@ -24,8 +24,8 @@ jobs:
           cache-dependency-path: go.sum
       - run: go test ./...
       - run: go vet ./...
-      # Keep the CI boundary aligned with the three binaries that the immutable
-      # runtime image and the remote deployment contract actually execute.
+      # CI 构建范围须与不可变运行时镜像及远程部署契约
+      # 实际执行的二进制程序保持一致。
       - run: go build ./cmd/api ./cmd/worker ./cmd/migrate ./cmd/catalog-sync
 
   image:
@@ -41,11 +41,11 @@ jobs:
       - id: vars
         shell: bash
         env:
-          # Registry endpoints vary by runner/network, but the Settlement
-          # repository itself is intentionally not configurable. Reusing a
-          # repository-level ACR_NAMESPACE/ACR_REPOSITORY pair caused the
-          # image path to become .../settlement/settlement/settlement and ACR
-          # rejected the push with insufficient_scope.
+          # 镜像仓库端点可随执行器和网络变化，但 Settlement 仓库名称固定。
+          # 复用仓库级的 ACR_NAMESPACE/ACR_REPOSITORY 配置曾导致
+          # 镜像路径重复拼接为 .../settlement/settlement/settlement，
+          # 并使 ACR 以 insufficient_scope 拒绝推送。
+          # 因此命名空间和仓库名在此统一指定。
           ACR_PUSH_REGISTRY: ${{ vars.ACR_PUSH_REGISTRY || 'jszn666test-registry.cn-hangzhou.cr.aliyuncs.com' }}
           ACR_PULL_REGISTRY: ${{ vars.ACR_PULL_REGISTRY || 'jszn666test-registry-vpc.cn-hangzhou.cr.aliyuncs.com' }}
           ACR_NAMESPACE: full_lifecycle_management
@@ -56,9 +56,9 @@ jobs:
           : "${ACR_PULL_REGISTRY:?missing ACR_PULL_REGISTRY}"
           : "${ACR_NAMESPACE:?missing ACR_NAMESPACE}"
           : "${ACR_REPOSITORY:?missing ACR_REPOSITORY}"
-          # docker/login-action accepts a registry host only. Strip an
-          # accidentally configured namespace/repository suffix before both
-          # login and image-reference construction.
+          # docker/login-action 只接受镜像仓库主机名。
+          # 登录和构造镜像引用前，均须移除
+          # 误配置的命名空间或仓库路径后缀。
           push_registry="${ACR_PUSH_REGISTRY#https://}"
           push_registry="${push_registry#http://}"
           push_registry="${push_registry%%/*}"

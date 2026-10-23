@@ -300,6 +300,11 @@ func payloadFor(d Destination, event Event) (json.RawMessage, error) {
 		risk = "MEDIUM"
 	}
 	reason, _ := detail["reason_code"].(string)
+	// AUD-IP-2026：把业务事务内记录的三类来源地址提升为平台协议字段。
+	// 缺少这些字段时平台会退回投递连接地址，正是要修掉的口径。
+	loginIP, _ := detail["login_ip"].(string)
+	clientIP, _ := detail["client_ip"].(string)
+	ipSource, _ := detail["ip_source"].(string)
 	payload := map[string]any{
 		"event_id": event.EventID, "application_code": d.ApplicationCode,
 		"environment_code": d.EnvironmentCode, "actor_type": "USER", "actor_id": actor,
@@ -309,6 +314,15 @@ func payloadFor(d Destination, event Event) (json.RawMessage, error) {
 		"correlation_id": strings.ToLower(event.EventID), "result": result,
 		"reason_code": reason, "risk_level": risk, "classification": "INTERNAL",
 		"summary": event.EventType, "metadata": detail,
+	}
+	if loginIP != "" {
+		payload["login_ip"] = loginIP
+	}
+	if clientIP != "" {
+		payload["client_ip"] = clientIP
+	}
+	if ipSource != "" {
+		payload["ip_source"] = ipSource
 	}
 	return json.Marshal(payload)
 }

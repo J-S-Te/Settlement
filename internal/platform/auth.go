@@ -203,22 +203,146 @@ func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (serv
 	return current, nil
 }
 func (a *Authenticator) Logout(w http.ResponseWriter, r *http.Request) {
-	if cookie, err := r.Cookie(a.cfg.OIDCSessionCookieName); err == nil {
-		_, _ = a.db.ExecContext(r.Context(), `UPDATE settlement_oidc_session SET revoked_at=UTC_TIMESTAMP(3) WHERE session_id_hash=? AND revoked_at IS NULL`, digest(cookie.Value))
+	w.Header().Set("Cache-Control", "no-store")
+	idToken, err := a.clearLocalSession(w, r, true)
+	if err != nil {
+		http.Error(w, "logout service unavailable", http.StatusServiceUnavailable)
+		return
 	}
-	expired := a.cookie("", time.Unix(1, 0))
-	expired.MaxAge = -1
-	http.SetCookie(w, expired)
-	http.Redirect(w, r, "/settlement/logged-out", http.StatusFound)
+	http.Redirect(w, r, a.logoutRedirect(idToken), http.StatusFound)
 }
 func (a *Authenticator) LogoutLocal(w http.ResponseWriter, r *http.Request) {
-	if cookie, err := r.Cookie(a.cfg.OIDCSessionCookieName); err == nil {
-		_, _ = a.db.ExecContext(r.Context(), `UPDATE settlement_oidc_session SET revoked_at=UTC_TIMESTAMP(3) WHERE session_id_hash=? AND revoked_at IS NULL`, digest(cookie.Value))
+	w.Header().Set("Cache-Control", "no-store")
+	if _, err := a.clearLocalSession(w, r, false); err != nil {
+		http.Error(w, "logout service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *Authenticator) clearLocalSession(w http.ResponseWriter, r *http.Request, includeHint bool) (string, error) {
+	var idToken string
+	if cookie, err := r.Cookie(a.cfg.OIDCSessionCookieName); err == nil && cookie.Value != "" {
+		hash := digest(cookie.Value)
+		if includeHint {
+			var identity string
+			var ciphertext []byte
+			// 读取失败只能降级为本地退出；不从请求参数或另一个租户补取 hint。
+			if err := a.db.QueryRowContext(r.Context(), `SELECT identity_id,id_token_ciphertext FROM settlement_oidc_session WHERE session_id_hash=? AND tenant_id=? AND revoked_at IS NULL`, hash, a.cfg.OIDCTenantID).Scan(&identity, &ciphertext); err == nil {
+				idToken = a.storedLogoutHint(ciphertext, identity)
+			}
+		}
+		result, err := a.db.ExecContext(r.Context(), `UPDATE settlement_oidc_session SET revoked_at=UTC_TIMESTAMP(3) WHERE session_id_hash=? AND tenant_id=? AND revoked_at IS NULL`, hash, a.cfg.OIDCTenantID)
+		if err != nil {
+			return "", err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return "", err
+		}
+		if affected != 1 {
+			// 已撤销/不存在的本地会话不再代表浏览器当前的 OP 会话。
+			idToken = ""
+		}
 	}
 	expired := a.cookie("", time.Unix(1, 0))
 	expired.MaxAge = -1
 	http.SetCookie(w, expired)
-	w.WriteHeader(http.StatusNoContent)
+	return idToken, nil
+}
+
+func (a *Authenticator) storedLogoutHint(ciphertext []byte, identity string) string {
+	raw, err := a.decrypt(ciphertext)
+	if err != nil || identity == "" || len(raw) == 0 || len(raw) > 64*1024 {
+		return ""
+	}
+	parts := strings.Split(string(raw), ".")
+	if len(parts) != 3 || parts[0] == "" || parts[2] == "" {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Issuer     string          `json:"iss"`
+		Audience   json.RawMessage `json:"aud"`
+		TenantID   string          `json:"tenant_id"`
+		IdentityID string          `json:"identity_id"`
+		Subject    string          `json:"sub"`
+	}
+	// Callback 已验签并经 AEAD 保存；此处复核配置/会话绑定即可，不依赖在线验签或 exp。
+	// RP logout 允许旧 ID Token 作 hint；是否接受该旧会话仍由当前 OP 决定。
+	if json.Unmarshal(payload, &claims) != nil || claims.Issuer != strings.TrimRight(a.cfg.OIDCIssuer, "/") ||
+		a.cfg.OIDCTenantID == "" || claims.TenantID != a.cfg.OIDCTenantID || claims.IdentityID != identity || claims.Subject == "" || a.cfg.OIDCClientID == "" {
+		return ""
+	}
+	var audience string
+	if json.Unmarshal(claims.Audience, &audience) == nil && audience == a.cfg.OIDCClientID {
+		return string(raw)
+	}
+	var audiences []string
+	if json.Unmarshal(claims.Audience, &audiences) == nil {
+		for _, candidate := range audiences {
+			if candidate == a.cfg.OIDCClientID {
+				return string(raw)
+			}
+		}
+	}
+	return ""
+}
+
+func (a *Authenticator) logoutRedirect(idToken string) string {
+	const local = "/settlement/logged-out"
+	allowHTTP := a.cfg.AllowInsecureHTTPOrigin || a.cfg.DevelopmentAuth
+	endpoint := logoutHTTPURL(a.endSession, allowHTTP)
+	issuer := logoutHTTPURL(a.cfg.OIDCIssuer, allowHTTP)
+	if idToken == "" || !sameLogoutOrigin(endpoint, issuer) {
+		return local
+	}
+	query := endpoint.Query()
+	query.Set("client_id", a.cfg.OIDCClientID)
+	query.Set("id_token_hint", idToken)
+	query.Del("logout_hint")
+	query.Del("post_logout_redirect_uri")
+	// 当前落地页没有安全相关回调副作用，不创建或透传未经关联校验的 state。
+	query.Del("state")
+	redirect := logoutHTTPURL(a.cfg.OIDCPostLogoutURI, allowHTTP)
+	origin := logoutHTTPURL(a.cfg.PublicOrigin, allowHTTP)
+	if sameLogoutOrigin(redirect, origin) {
+		// 只使用运维配置的精确值；OP 仍须复核该值已登记，不能由请求 Host/return_to 推导。
+		query.Set("post_logout_redirect_uri", a.cfg.OIDCPostLogoutURI)
+	}
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String()
+}
+
+func logoutHTTPURL(value string, allowHTTP bool) *url.URL {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Host == "" || parsed.User != nil || strings.Contains(value, "#") || parsed.Opaque != "" || strings.Contains(parsed.Path, "\\") ||
+		(parsed.Scheme != "https" && (parsed.Scheme != "http" || !allowHTTP)) {
+		return nil
+	}
+	if _, err := url.ParseQuery(parsed.RawQuery); err != nil {
+		return nil
+	}
+	return parsed
+}
+
+func sameLogoutOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil || left.Scheme != right.Scheme || !strings.EqualFold(left.Hostname(), right.Hostname()) {
+		return false
+	}
+	effectivePort := func(value *url.URL) string {
+		if port := value.Port(); port != "" {
+			return port
+		}
+		if value.Scheme == "https" {
+			return "443"
+		}
+		return "80"
+	}
+	return effectivePort(left) == effectivePort(right)
 }
 func (a *Authenticator) cookie(value string, expires time.Time) *http.Cookie {
 	return &http.Cookie{Name: a.cfg.OIDCSessionCookieName, Value: value, Path: "/settlement", Expires: expires, HttpOnly: true, Secure: a.cfg.OIDCSessionSecure, SameSite: http.SameSiteLaxMode}

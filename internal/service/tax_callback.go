@@ -402,7 +402,7 @@ func finalizeInvoiceAllocations(ctx context.Context, tx *sql.Tx, tenant, request
 		if _, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_request_allocation SET invoiced_amount=reserved_amount,status='INVOICED' WHERE tenant_id=? AND invoice_request_id=? AND receivable_id=? AND status='RESERVED'`, tenant, requestID, item.receivableID); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE settlement_receivable SET invoiced_amount=invoiced_amount+?,invoice_status=CASE WHEN invoiced_amount+? >= original_amount THEN 'FULLY_INVOICED' ELSE 'PARTIALLY_INVOICED' END,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=?`, item.amount, item.amount, item.receivableID, tenant); err != nil {
+		if err = incrementInvoiced(ctx, tx, tenant, item.receivableID, item.amount); err != nil {
 			return err
 		}
 	}
@@ -433,7 +433,7 @@ func reverseInvoiceAllocations(ctx context.Context, tx *sql.Tx, tenant, redFlush
 		if _, err = tx.ExecContext(ctx, `INSERT INTO settlement_invoice_allocation_reversal(id,tenant_id,red_flush_request_id,original_allocation_id,reversed_amount,created_at) VALUES(?,?,?,?,?,UTC_TIMESTAMP(3))`, newID(), tenant, redFlushRequestID, item.allocationID, item.amount); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE settlement_receivable SET invoiced_amount=GREATEST(0,invoiced_amount-?),invoice_status=CASE WHEN GREATEST(0,invoiced_amount-?)=0 THEN 'NOT_INVOICED' WHEN GREATEST(0,invoiced_amount-?)<original_amount THEN 'PARTIALLY_INVOICED' ELSE 'FULLY_INVOICED' END,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=?`, item.amount, item.amount, item.amount, item.receivableID, tenant); err != nil {
+		if err = decrementInvoiced(ctx, tx, tenant, item.receivableID, item.amount); err != nil {
 			return err
 		}
 	}

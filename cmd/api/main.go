@@ -17,6 +17,7 @@ import (
 	"github.com/j-s-te/settlement/internal/config"
 	"github.com/j-s-te/settlement/internal/creditclient"
 	"github.com/j-s-te/settlement/internal/filegatewayclient"
+	"github.com/j-s-te/settlement/internal/handover"
 	"github.com/j-s-te/settlement/internal/httpapi"
 	"github.com/j-s-te/settlement/internal/platform"
 	"golang.org/x/oauth2/clientcredentials"
@@ -66,7 +67,7 @@ func main() {
 			os.Exit(1)
 		}
 		if cfg.IntegrationEnabled {
-			machine, err = platform.NewServiceTokenVerifier(context.Background(), cfg.OIDCIssuer, cfg.ContractClientID, cfg.ContractAudience, cfg.OIDCTenantID, "contract_management", cfg.OIDCEnvironmentCode, "settlement.contract.ingest")
+			machine, err = platform.NewContractServiceTokenVerifier(context.Background(), cfg)
 			if err != nil {
 				slog.Error("initialize machine token verifier", "error", err)
 				os.Exit(1)
@@ -87,6 +88,7 @@ func main() {
 			slog.Error("initialize CRM credit client", "error", err)
 			os.Exit(1)
 		}
+		creditPublisher.SetBusinessLicenseCheck(func(ctx context.Context) error { return commercialGate.Check(ctx, "MUTATE_BUSINESS") })
 	}
 	var fileGateway *filegatewayclient.Client
 	if (cfg.FileGatewayMode == "dual" || cfg.FileGatewayMode == "required") && cfg.FileGatewayURL != "" {
@@ -120,6 +122,25 @@ func main() {
 		dependencies = append(dependencies, fileGateway)
 	}
 	dependencies = append(dependencies, commercialGate)
+	if cfg.HandoverMachineEnabled {
+		handoverMachine, verifyErr := platform.NewStrictServiceTokenVerifier(context.Background(), cfg.OIDCIssuer,
+			cfg.HandoverMachineClientID, cfg.HandoverMachineAudience, cfg.OIDCTenantID, cfg.HandoverMachineApplicationCode, cfg.OIDCEnvironmentCode, cfg.HandoverMachineScope)
+		if verifyErr != nil {
+			slog.Error("initialize handover machine token verifier", "error", verifyErr)
+			os.Exit(1)
+		}
+		handoverRepository, repositoryErr := handover.NewRepository(db)
+		if repositoryErr != nil {
+			slog.Error("initialize handover repository", "error", repositoryErr)
+			os.Exit(1)
+		}
+		handoverService, serviceErr := handover.NewService(handoverRepository, handover.NewID, time.Now)
+		if serviceErr != nil {
+			slog.Error("initialize handover service", "error", serviceErr)
+			os.Exit(1)
+		}
+		dependencies = append(dependencies, handoverService, handoverMachine)
+	}
 	server := &http.Server{Addr: cfg.HTTPAddress, Handler: httpapi.New(db, cfg, slog.Default(), auth, machine, taxMachine, dependencies...), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	slog.Info("settlement API started", "address", cfg.HTTPAddress, "development_auth", cfg.DevelopmentAuth)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

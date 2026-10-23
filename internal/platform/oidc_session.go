@@ -2,12 +2,13 @@ package platform
 
 import (
 	"errors"
+	"net"
 	"strings"
 
 	"github.com/j-s-te/settlement/internal/service"
 )
 
-// oidcClaims 是浏览器 OIDC ID Token 的最小身份投影。
+// oidcClaims 是浏览器 OIDC ID 令牌 的最小身份投影。
 // 权限不从这些 Claims 推导，必须由 authorizationContext 提供。
 type oidcClaims struct {
 	Subject           string `json:"sub"`
@@ -32,6 +33,7 @@ func principal(a authorizationContext, claims oidcClaims) service.Principal {
 		IdentityID: a.IdentityID, PersonID: claims.PersonID,
 		DisplayName: strings.TrimSpace(claims.Name), Username: strings.TrimSpace(claims.PreferredUsername),
 		CatalogVersion: a.CatalogVersion, AuthorizationRevision: a.AuthorizationRevision,
+		LoginIP: normalizeIP(a.UserLoginIP),
 	}
 }
 
@@ -45,4 +47,16 @@ func canonicalSubjectID(subjectID, identityID string) (string, error) {
 		return "", errors.New("subject_id and identity_id must identify the same platform subject")
 	}
 	return subjectID, nil
+}
+
+// normalizeIP 规范化登录地址；非法值返回空，避免把脏数据写进审计。
+func normalizeIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if parsed := net.ParseIP(value); parsed != nil {
+		return parsed.String()
+	}
+	return ""
 }

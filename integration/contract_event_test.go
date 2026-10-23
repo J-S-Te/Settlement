@@ -15,14 +15,15 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/j-s-te/settlement/internal/config"
 	"github.com/j-s-te/settlement/internal/httpapi"
+	"github.com/j-s-te/settlement/internal/service"
 )
 
-// TestContractEventIngestTenantBoundary proves the machine-boundary tenant
-// consistency guard for contract event ingestion (AUD-2026-001): a same-tenant
-// event is accepted (202), a cross-tenant declaration is rejected, and an
-// unauthenticated request never passes the machine boundary.
+// TestContractEventIngestTenantBoundary 验证合同事件摄取的机器边界租户
+// 一致性守卫（AUD-2026-001）：同租户
+// 事件被接受（202），跨租户声明被拒绝，且
+// 未认证请求绝不能通过机器边界。
 //
-// Like TestInvoiceFlow this test is opt-in because it writes to the database:
+// 与 TestInvoiceFlow 一样，此测试写数据库，需显式启用：
 //
 //	SETTLEMENT_E2E_TEST=1 SETTLEMENT_E2E_TEST_DSN='...' go test ./integration -v
 func TestContractEventIngestTenantBoundary(t *testing.T) {
@@ -52,8 +53,10 @@ func TestContractEventIngestTenantBoundary(t *testing.T) {
 	suffix := strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000000000"), ".", "")
 	acceptedEventID := "E2E-CE-" + suffix
 	rejectedEventID := "E2E-CE-R-" + suffix
+	revisionEventID := "E2E-C2-" + suffix
 	contractID := "E2E-CE-CONTRACT-" + suffix
 	defer cleanupContractEvent(t, db, tenant, source, acceptedEventID, contractID)
+	defer cleanupContractEvent(t, db, tenant, source, revisionEventID, contractID)
 	defer cleanupContractEvent(t, db, "other-tenant", source, rejectedEventID, contractID)
 
 	handler := httpapi.New(db, config.Config{
@@ -113,6 +116,69 @@ func TestContractEventIngestTenantBoundary(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM settlement_contract_snapshot WHERE tenant_id=? AND source_event_id=?`, tenant, acceptedEventID).Scan(&snapshotCount); err != nil || snapshotCount != 1 {
 		t.Fatalf("same-tenant snapshot count=%d err=%v, want exactly one financial snapshot", snapshotCount, err)
 	}
+	// 先确认第一份计划，使修订反例覆盖真实
+	// 应收，而非仅覆盖空计划。
+	var planID string
+	var planVersion int
+	if err := db.QueryRow(`SELECT p.id,p.version FROM settlement_receivable_plan p JOIN settlement_contract_snapshot s ON s.id=p.contract_snapshot_id AND s.tenant_id=p.tenant_id WHERE p.tenant_id=? AND s.source_event_id=?`, tenant, acceptedEventID).Scan(&planID, &planVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&service.Service{DB: db}).ConfirmPlan(ctx, service.Principal{TenantID: tenant, UserID: "e2e-finance", Permissions: map[string]bool{"settlement.admin": true}}, planID, service.PlanConfirmationInput{Version: planVersion}); err != nil {
+		t.Fatalf("confirm first plan: %v", err)
+	}
+	var receivableCount int
+	var receivableOpen string
+	if err := db.QueryRow(`SELECT COUNT(*),COALESCE(MAX(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND contract_snapshot_id=(SELECT id FROM settlement_contract_snapshot WHERE tenant_id=? AND source_event_id=?)`, tenant, tenant, acceptedEventID).Scan(&receivableCount, &receivableOpen); err != nil {
+		t.Fatal(err)
+	}
+	if receivableCount != 1 || receivableOpen != "1000.00" {
+		t.Fatalf("first receivable count=%d open=%s, want one 1000.00", receivableCount, receivableOpen)
+	}
+
+	// 精确事件重放为空操作：返回已接受结果，
+	// 不得创建第二份快照或应收计划。
+	replay := httptest.NewRequest(http.MethodPost, "/internal/v1/settlement/events/contracts", jsonBody(t, event(acceptedEventID, tenant)))
+	replay.Header.Set("Authorization", "Bearer e2e-machine-secret")
+	replayResponse := httptest.NewRecorder()
+	handler.ServeHTTP(replayResponse, replay)
+	if replayResponse.Code != http.StatusAccepted || !strings.Contains(replayResponse.Body.String(), `"accepted":true`) || !strings.Contains(replayResponse.Body.String(), `"duplicate":true`) {
+		t.Fatalf("exact replay status=%d body=%s, want 202 accepted=true duplicate=true", replayResponse.Code, replayResponse.Body.String())
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM settlement_contract_snapshot WHERE tenant_id=? AND source_event_id=?`, tenant, acceptedEventID).Scan(&snapshotCount); err != nil || snapshotCount != 1 {
+		t.Fatalf("replay snapshot count=%d err=%v, want unchanged one snapshot", snapshotCount, err)
+	}
+
+	// 后续财务修订不得创建第二份全额应收。
+	// 合同流守卫必须在写入任何财务事实前返回冲突。
+	revision := event(revisionEventID, tenant)
+	revisionContract := revision["contract"].(map[string]any)
+	revisionContract["version"] = 2
+	revisionContract["amount"] = "1200.00"
+	revisionContract["payment_terms"] = []map[string]any{{"installment_no": 1, "due_date": "2099-12-31", "amount": "1200.00"}}
+	revision["aggregate"].(map[string]any)["version"] = 2
+	revisionRequest := httptest.NewRequest(http.MethodPost, "/internal/v1/settlement/events/contracts", jsonBody(t, revision))
+	revisionRequest.Header.Set("Authorization", "Bearer e2e-machine-secret")
+	revisionResponse := httptest.NewRecorder()
+	handler.ServeHTTP(revisionResponse, revisionRequest)
+	if revisionResponse.Code != http.StatusConflict || !strings.Contains(revisionResponse.Body.String(), "SETTLEMENT_CONFLICT") {
+		t.Fatalf("revision status=%d body=%s, want 409 SETTLEMENT_CONFLICT", revisionResponse.Code, revisionResponse.Body.String())
+	}
+	var revisionSnapshots, revisionPlans int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM settlement_contract_snapshot WHERE tenant_id=? AND source_event_id=?`, tenant, revisionEventID).Scan(&revisionSnapshots); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM settlement_receivable_plan p JOIN settlement_contract_snapshot s ON s.id=p.contract_snapshot_id AND s.tenant_id=p.tenant_id WHERE p.tenant_id=? AND s.source_event_id=?`, tenant, revisionEventID).Scan(&revisionPlans); err != nil {
+		t.Fatal(err)
+	}
+	if revisionSnapshots != 0 || revisionPlans != 0 {
+		t.Fatalf("revision wrote snapshots=%d plans=%d, want none", revisionSnapshots, revisionPlans)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*),COALESCE(MAX(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND contract_snapshot_id=(SELECT id FROM settlement_contract_snapshot WHERE tenant_id=? AND source_event_id=?)`, tenant, tenant, acceptedEventID).Scan(&receivableCount, &receivableOpen); err != nil {
+		t.Fatal(err)
+	}
+	if receivableCount != 1 || receivableOpen != "1000.00" {
+		t.Fatalf("revision changed receivables count=%d open=%s, want unchanged one 1000.00", receivableCount, receivableOpen)
+	}
 }
 
 func cleanupContractEvent(t *testing.T, db *sql.DB, tenant, source, eventID, contractID string) {
@@ -120,6 +186,9 @@ func cleanupContractEvent(t *testing.T, db *sql.DB, tenant, source, eventID, con
 	var snapshotID string
 	_ = db.QueryRow(`SELECT id FROM settlement_contract_snapshot WHERE tenant_id=? AND source_event_id=?`, tenant, eventID).Scan(&snapshotID)
 	if snapshotID != "" {
+		if _, err := db.Exec(`DELETE FROM settlement_receivable WHERE tenant_id=? AND contract_snapshot_id=?`, tenant, snapshotID); err != nil {
+			t.Errorf("cleanup receivables: %v", err)
+		}
 		if _, err := db.Exec(`DELETE FROM settlement_receivable_plan WHERE tenant_id=? AND contract_snapshot_id=?`, tenant, snapshotID); err != nil {
 			t.Errorf("cleanup receivable plans: %v", err)
 		}

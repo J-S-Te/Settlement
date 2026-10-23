@@ -1,5 +1,5 @@
-// Package runtime provides local, durable commercial-license gates. Callers
-// must authenticate and authorize the original operation before invoking it.
+// Package runtime 提供本地持久化的商业授权门禁。
+// 调用方须先完成原始操作的身份认证与权限校验。
 package runtime
 
 import (
@@ -106,8 +106,8 @@ func validateSnapshot(s PlatformSnapshot) error {
 	return nil
 }
 
-// strict rejects duplicate keys at every depth, aliases, absent/null fields and
-// trailing content. Field names are exact, unlike encoding/json's aliases.
+// strict 拒绝任意嵌套层级的重复键、别名、缺失或为 null 的字段以及尾随内容。
+// 字段名须精确匹配，不接受 encoding/json 支持的字段别名。
 func strict(raw []byte, target any, fields string) error {
 	if len(raw) == 0 || len(raw) > maxBytes {
 		return ErrInvalid
@@ -195,7 +195,7 @@ func decode(s string) ([]byte, error) {
 	return b, nil
 }
 
-// SignSnapshot is a platform-side primitive, never a vendor license issuer.
+// SignSnapshot 是平台侧的快照签名原语，不用于厂商授权签发。
 func SignSnapshot(s PlatformSnapshot, kid string, private ed25519.PrivateKey) (string, error) {
 	if err := validateSnapshot(s); err != nil {
 		return "", err
@@ -219,8 +219,8 @@ func SignSnapshot(s PlatformSnapshot, kid string, private ed25519.PrivateKey) (s
 	return raw, nil
 }
 
-// VerifySnapshot trusts only configured platform keys and independently verifies
-// both embedded licenses against the configured vendor keys.
+// VerifySnapshot 仅信任已配置的平台密钥，并使用已配置的厂商密钥
+// 分别验证快照中嵌入的两份授权。
 func VerifySnapshot(raw string, binding Binding, platformKeys, vendorKeys map[string]ed25519.PublicKey) (PlatformSnapshot, error) {
 	var s PlatformSnapshot
 	if !validBinding(binding) || len(raw) == 0 || len(raw) > maxBytes || len(platformKeys) == 0 || len(vendorKeys) == 0 {

@@ -1,6 +1,6 @@
-// Package consumer is the standard-library runtime bootstrap shared by business
-// services. Deployment configuration supplies only platform trust; vendor trust
-// is compiled into the reviewed release, never imported from customer settings.
+// Package consumer 基于标准库提供业务服务共用的运行时初始化能力。
+// 部署配置仅提供平台信任；厂商信任编译进已审核的发布版本，
+// 不得从客户配置导入。
 package consumer
 
 import (
@@ -21,6 +21,7 @@ import (
 	"time"
 
 	core "github.com/J-S-Te/license-core"
+	"github.com/J-S-Te/license-core/catalog"
 	runtime "github.com/J-S-Te/license-core/runtime"
 	"github.com/J-S-Te/license-core/syncclient"
 )
@@ -71,14 +72,14 @@ func publicKey(raw []byte) (ed25519.PublicKey, error) {
 	return key, nil
 }
 
-// FromEnvironment is called once at startup. No fallback is permitted when
-// controlled licensing is enabled but trust, binding or credentials are absent.
+// FromEnvironment 在启动时调用一次。启用受控授权后，
+// 若缺少信任、绑定或凭据，禁止回退到其他模式。
 func FromEnvironment(application string) (*Gate, error) { return FromLookup(application, os.Getenv) }
 
-// Compatibility is only for never-enrolled components. The fixed durable mount
-// prevents a missing env file after restart from silently disabling enforcement.
+// 兼容模式仅适用于从未登记的组件。
+// 固定的持久化挂载可防止重启后因环境文件缺失而静默关闭授权执行。
 func compatibilityAllowed(get func(string) string, stateDirectory string) error {
-	for _, field := range []string{"INSTANCE_ID", "ENVIRONMENT", "SERVICE_ID", "STATE_PATH", "PLATFORM_PUBLIC_KEY_PATH", "PLATFORM_BASE_URL", "CLIENT_ID", "CLIENT_SECRET", "COVERAGE_DIGEST", "IMAGE_DIGEST"} {
+	for _, field := range []string{"INSTANCE_ID", "ENVIRONMENT", "SERVICE_ID", "STATE_PATH", "PLATFORM_PUBLIC_KEY_PATH", "PLATFORM_BASE_URL", "CLIENT_ID", "CLIENT_SECRET", "COVERAGE_DIGEST", "IMAGE_DIGEST", "REGISTRATION_PROTOCOL", "CATALOG_VERSION"} {
 		if get("COMMERCIAL_LICENSE_"+field) != "" {
 			return ErrConfiguration
 		}
@@ -91,6 +92,21 @@ func compatibilityAllowed(get func(string) string, stateDirectory string) error 
 		return ErrConfiguration
 	}
 	return nil
+}
+
+func registrationConfiguration(get func(string) string) (int, int, error) {
+	protocol := strings.TrimSpace(get("COMMERCIAL_LICENSE_REGISTRATION_PROTOCOL"))
+	catalogVersion := strings.TrimSpace(get("COMMERCIAL_LICENSE_CATALOG_VERSION"))
+	if protocol == "" && catalogVersion == "" {
+		return catalog.RegistrationProtocolV1, 0, nil
+	}
+	if protocol == "1" && catalogVersion == "" {
+		return catalog.RegistrationProtocolV1, 0, nil
+	}
+	if protocol == "2" && catalogVersion == "1" {
+		return catalog.RegistrationProtocolV2, catalog.Version, nil
+	}
+	return 0, 0, ErrConfiguration
 }
 
 func FromLookup(application string, get func(string) string) (*Gate, error) {
@@ -108,6 +124,10 @@ func FromLookup(application string, get func(string) string) (*Gate, error) {
 		return nil, ErrConfiguration
 	}
 	read := func(name string) string { return get("COMMERCIAL_LICENSE_" + name) }
+	registrationProtocol, catalogVersion, err := registrationConfiguration(get)
+	if err != nil {
+		return nil, err
+	}
 	binding := runtime.Binding{InstanceID: read("INSTANCE_ID"), Environment: read("ENVIRONMENT"), Application: application, ServiceID: read("SERVICE_ID")}
 	f, err := os.Open(read("PLATFORM_PUBLIC_KEY_PATH"))
 	if err != nil {
@@ -173,7 +193,7 @@ func FromLookup(application string, get func(string) string) (*Gate, error) {
 		}
 		return out.AccessToken, nil
 	}
-	sc, err := syncclient.New(syncclient.Options{BaseURL: u.String(), ServiceID: binding.ServiceID, CoverageDigest: read("COVERAGE_DIGEST"), ImageDigest: read("IMAGE_DIGEST"), AllowHTTP: allowHTTP, Client: client, Token: token, Runtime: rt})
+	sc, err := syncclient.New(syncclient.Options{BaseURL: u.String(), ServiceID: binding.ServiceID, CoverageDigest: read("COVERAGE_DIGEST"), ImageDigest: read("IMAGE_DIGEST"), RegistrationProtocol: registrationProtocol, CatalogVersion: catalogVersion, AllowHTTP: allowHTTP, Client: client, Token: token, Runtime: rt})
 	if err != nil {
 		return nil, ErrConfiguration
 	}

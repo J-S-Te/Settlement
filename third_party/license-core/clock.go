@@ -7,16 +7,16 @@ import (
 	"time"
 )
 
-// TimeStore must preserve a monotonic high-water mark atomically across callers.
-// Implementations must not overwrite a larger timestamp with a smaller one.
+// TimeStore 须在并发调用间原子地维护单调递增的时间高水位。
+// 实现不得用较小时间戳覆盖较大时间戳。
 type TimeStore interface {
 	Load(context.Context) (int64, error)
 	SaveMax(context.Context, int64) error
 }
 
-// TimeObserver is an optional rollback detector. Deployments must supply durable
-// storage and call Observe before evaluating operations; this package does not
-// claim to prevent OS clock tampering or independently integrate any service.
+// TimeObserver 提供可选的时钟回拨检测。部署时须提供持久化存储，
+// 并在评估操作前调用 Observe；本包不负责防止操作系统时钟被篡改，
+// 也不会自行接入任何服务。
 type TimeObserver struct {
 	Store     TimeStore
 	Tolerance time.Duration

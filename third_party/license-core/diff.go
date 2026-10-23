@@ -7,7 +7,7 @@ import (
 	"sort"
 )
 
-// Digest authenticates the token before returning its exact compact JWS digest.
+// Digest 先验证令牌，再返回原始紧凑格式 JWS 的摘要。
 func Digest(raw string, trusted map[string]ed25519.PublicKey) (string, error) {
 	if _, err := Verify(raw, trusted); err != nil {
 		return "", err
@@ -29,9 +29,9 @@ const (
 	UPDATED = "UPDATED"
 )
 
-// Diff compares validated, same-binding, strictly increasing license versions.
-// Returned snapshots are independent copies, sorted by application code.
-// The caller must verify both licenses before comparing them.
+// Diff 比较已验证、绑定相同且版本严格递增的两份授权。
+// 返回按应用编码排序的独立快照副本。
+// 调用方须先验证两份授权，再进行比较。
 func Diff(next, current License) ([]ApplicationChange, error) {
 	if err := CompareVersions(next, current); err != nil {
 		return nil, err

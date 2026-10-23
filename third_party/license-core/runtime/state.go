@@ -16,8 +16,8 @@ import (
 	core "github.com/J-S-Te/license-core"
 )
 
-// State is returned for diagnostics only; changes can only enter through signed
-// snapshots or independently signed, single-use vendor clock recovery tokens.
+// State 仅用于诊断；状态只能通过签名快照，
+// 或厂商独立签名的一次性时钟恢复令牌更新。
 type State struct {
 	Protocol              int      `json:"protocol"`
 	SnapshotJWS           string   `json:"snapshotJWS"`
@@ -39,9 +39,9 @@ type FileRuntime struct {
 	vendorKeys   map[string]ed25519.PublicKey
 }
 
-// NewFileRuntime does not create or bootstrap an authorized state. The parent
-// directory must be owned/protected by the service deployment, and all service
-// processes using it must share the same binding and trust configuration.
+// NewFileRuntime 不会创建或初始化已授权状态。父目录须由服务部署负责持有和保护，
+// 所有使用该目录的服务进程
+// 必须采用相同的绑定与信任配置。
 func NewFileRuntime(path string, binding Binding, platformKeys, vendorKeys map[string]ed25519.PublicKey) (*FileRuntime, error) {
 	if path == "" || !validBinding(binding) || len(platformKeys) == 0 || len(vendorKeys) == 0 {
 		return nil, ErrInvalid
@@ -181,8 +181,8 @@ func (r *FileRuntime) save(state State) (result error) {
 	return nil
 }
 
-// observe persists a blocked latch before returning a rollback error. Moving
-// the clock forward again does not clear the latch.
+// observe 在返回时钟回拨错误前持久化阻断标记。
+// 再次调快时钟不会清除该标记。
 func (r *FileRuntime) observe(state *State, now int64) error {
 	if !validTime(now) {
 		return ErrInvalid
@@ -204,9 +204,9 @@ func (r *FileRuntime) observe(state *State, now int64) error {
 	return nil
 }
 
-// ApplySnapshot is an atomic control update, not a network synchronization
-// implementation. Old revisions and equal-revision equivocation are rejected.
-// The exact already-persisted signed bytes may be replayed to retry an ACK.
+// ApplySnapshot 原子地更新控制状态，不负责网络同步。
+// 拒绝旧修订版以及同一修订号对应不同内容的快照。
+// 允许重放已持久化的完全相同签名字节，以重试 ACK。
 func (r *FileRuntime) ApplySnapshot(ctx context.Context, raw string, now time.Time) error {
 	next, err := VerifySnapshot(raw, r.binding, r.platformKeys, r.vendorKeys)
 	if err != nil {
@@ -225,8 +225,8 @@ func (r *FileRuntime) ApplySnapshot(ctx context.Context, raw string, now time.Ti
 				return err
 			}
 			if next.Revision == state.ControlRevision && raw == state.SnapshotJWS {
-				// observe has durably advanced clock high-water (or rejected a
-				// latched rollback). No authorization dates or revisions change.
+				// observe 已持久化推进时钟高水位，或因已锁存的回拨状态拒绝操作。
+				// 授权日期与修订号均保持不变。
 				return nil
 			}
 			if next.Revision <= state.ControlRevision || next.HighestLicenseVersion < state.HighestLicenseVersion || rank(next.EnforcementState) < rank(old.EnforcementState) || next.SnapshotIssuedAt < old.SnapshotIssuedAt {
@@ -286,17 +286,17 @@ func (r *FileRuntime) validateAdvance(old, next PlatformSnapshot, highest uint64
 	if oc != nil && (nc == nil || nc.Version < oc.Version) {
 		return ErrRollback
 	}
-	// An observed pending whole-license replacement cannot disappear or be
-	// replaced by an older version. Promotion preserves the exact signed token.
+	// 已观察到的待生效整证替换不得消失，
+	// 也不得被较低版本替代；转为生效时保留原始签名令牌。
 	if op != nil && !(nc != nil && nc.Version >= op.Version || np != nil && np.Version >= op.Version) {
 		return ErrRollback
 	}
 	return nil
 }
 
-// Evaluate uses absolute signed validity times. Failed/missing synchronization
-// never extends them. Only a signed PENDING_ENFORCEMENT + migrationEligible
-// snapshot permits transitional business writes without a valid license.
+// Evaluate 按签名中的绝对有效期判定，同步失败或缺失不会延长有效期。
+// 具有迁移资格的签名 PENDING_ENFORCEMENT 快照，
+// 仅在从未导入商业授权时保留旧版行为。
 func (r *FileRuntime) Evaluate(ctx context.Context, operation core.Operation, now time.Time) error {
 	switch operation {
 	case core.ESSENTIAL_SERVICE:
@@ -313,13 +313,16 @@ func (r *FileRuntime) Evaluate(ctx context.Context, operation core.Operation, no
 		if err := r.observe(&state, now.Unix()); err != nil {
 			return err
 		}
-		// Even tolerated clock jitter must not reactivate an expired license or
-		// switch back from an already-effective whole pending replacement.
+		// 即使时钟抖动在容忍范围内，也不得重新激活已到期授权，
+		// 或撤销已生效的待替换整证。
 		effectiveNow := now
 		if state.ClockHighWater > now.Unix() {
 			effectiveNow = time.Unix(state.ClockHighWater, 0)
 		}
-		if snapshot.EnforcementState == Pending && snapshot.MigrationEligible && !state.EnforcementStarted {
+		// 迁移资格仅用于识别旧安装，不豁免签名授权的范围或绝对有效期检查。
+		// 一旦已观察到授权版本，
+		// 回退检查就必须阻止重新进入无授权兼容模式。
+		if snapshot.EnforcementState == Pending && snapshot.MigrationEligible && !state.EnforcementStarted && state.HighestLicenseVersion == 0 && snapshot.CurrentLicenseJWS == "" && snapshot.PendingLicenseJWS == "" {
 			return nil
 		}
 		current, pending, err := licenses(snapshot, r.vendorKeys)
@@ -350,9 +353,9 @@ func (r *FileRuntime) ReadState(ctx context.Context) (State, error) {
 	return state, err
 }
 
-// RecoverClock accepts only an independently vendor-signed recovery credential
-// for the highest observed license and consumes its ID in the same durable
-// transaction. No boolean reset or unsigned recovery path is available.
+// RecoverClock 仅接受厂商独立签名、绑定最高已观察授权版本的恢复凭证，
+// 并在同一持久化事务内核销凭证 ID。
+// 不提供布尔开关重置或未签名的恢复路径。
 func (r *FileRuntime) RecoverClock(ctx context.Context, raw string, now time.Time) error {
 	recovery, err := core.VerifyRecovery(raw, r.vendorKeys)
 	if err != nil {

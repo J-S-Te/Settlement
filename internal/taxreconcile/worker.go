@@ -29,8 +29,8 @@ type candidate struct {
 	attempts                             int
 }
 
-// RunOnce claims due operations before making network calls, then feeds every
-// result through the same transactional inbox/state machine as push callbacks.
+// RunOnce 在网络调用前认领到期操作，随后将每个
+// 结果交给与推送回调相同的事务收件箱及状态机处理。
 func (w *Worker) RunOnce(ctx context.Context) error {
 	if w.CheckBusinessLicense != nil {
 		if err := w.CheckBusinessLicense(ctx); err != nil {
@@ -107,7 +107,7 @@ func (w *Worker) reconcile(ctx context.Context, item candidate) error {
 	}
 	resp, err := w.HTTP.Do(req)
 	if err != nil {
-		return nil // unknown remains eligible for a later reconciliation attempt
+		return nil // unknown 仍可在之后再次对账。
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound || resp.StatusCode >= 500 {

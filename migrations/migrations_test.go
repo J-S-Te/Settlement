@@ -50,6 +50,7 @@ func TestAllMigrationsKeepIDAndControlPlaneContracts(t *testing.T) {
 		"locked_by", "locked_until", "dead_lettered_at", "settlement_contract_stream",
 		"settlement_tax_result_inbox", "payload_hash", "processing_status",
 		"settlement_invoice_red_flush_attempt", "settlement_invoice_allocation_reversal",
+		"lease_generation", "settlement_report_export_effect", "uq_settlement_export_request",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("migrations missing %s", required)

@@ -12,7 +12,7 @@ import (
 	"github.com/j-s-te/settlement/authz"
 )
 
-// authorizationContext 是基础平台依据 Access Token 返回的、结算系统专属授权上下文。
+// authorizationContext 是基础平台依据 访问令牌 返回的、结算系统专属授权上下文。
 // 该结构只在平台适配边界内使用，结算业务不直接解析基础平台响应。
 type authorizationContext struct {
 	Subject                    string                   `json:"sub"`

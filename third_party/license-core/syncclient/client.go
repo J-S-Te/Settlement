@@ -1,5 +1,5 @@
-// Package syncclient synchronizes signed control snapshots without extending
-// commercial expiration or weakening the local gate on network failure.
+// Package syncclient 同步已签名的控制快照，不延长商业授权有效期，
+// 也不在网络故障时放宽本地门禁。
 package syncclient
 
 import (
@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/J-S-Te/license-core/catalog"
 	runtime "github.com/J-S-Te/license-core/runtime"
 )
 
@@ -30,14 +31,16 @@ type LocalRuntime interface {
 	ReadState(context.Context) (runtime.State, error)
 }
 type Options struct {
-	BaseURL        string
-	ServiceID      string
-	CoverageDigest string
-	ImageDigest    string
-	AllowHTTP      bool
-	Client         *http.Client
-	Token          TokenSource
-	Runtime        LocalRuntime
+	BaseURL              string
+	ServiceID            string
+	CoverageDigest       string
+	ImageDigest          string
+	RegistrationProtocol int
+	CatalogVersion       int
+	AllowHTTP            bool
+	Client               *http.Client
+	Token                TokenSource
+	Runtime              LocalRuntime
 }
 type Client struct {
 	options Options
@@ -61,14 +64,40 @@ func validDigest(s string) bool {
 	b, err := hex.DecodeString(s)
 	return err == nil && len(b) == 32 && strings.ToLower(s) == s
 }
+func registration(options Options) (int, int, error) {
+	protocol, catalogVersion := options.RegistrationProtocol, options.CatalogVersion
+	if protocol == 0 && catalogVersion == 0 {
+		return catalog.RegistrationProtocolV1, 0, nil
+	}
+	if protocol == catalog.RegistrationProtocolV1 && catalogVersion == 0 {
+		return catalog.RegistrationProtocolV1, 0, nil
+	}
+	if protocol == catalog.RegistrationProtocolV2 && catalogVersion == catalog.Version {
+		return catalog.RegistrationProtocolV2, catalogVersion, nil
+	}
+	return 0, 0, ErrSync
+}
+
+func validOptionalDigest(value string) bool {
+	return value == "" || (strings.HasPrefix(value, "sha256:") && validDigest(strings.TrimPrefix(value, "sha256:")))
+}
+
 func New(options Options) (*Client, error) {
 	u, err := url.Parse(options.BaseURL)
 	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") || (u.Scheme != "https" && !(u.Scheme == "http" && options.AllowHTTP)) {
 		return nil, ErrSync
 	}
-	if options.Token == nil || options.Runtime == nil || !strings.HasPrefix(options.CoverageDigest, "sha256:") || !validDigest(strings.TrimPrefix(options.CoverageDigest, "sha256:")) || !strings.HasPrefix(options.ImageDigest, "sha256:") || !validDigest(strings.TrimPrefix(options.ImageDigest, "sha256:")) || options.ServiceID == "" || len(options.ServiceID) > 128 {
+	protocol, catalogVersion, err := registration(options)
+	if err != nil {
 		return nil, ErrSync
 	}
+	if options.Token == nil || options.Runtime == nil || options.ServiceID == "" || len(options.ServiceID) > 128 || !validOptionalDigest(options.CoverageDigest) || !validOptionalDigest(options.ImageDigest) {
+		return nil, ErrSync
+	}
+	if protocol == catalog.RegistrationProtocolV1 && (options.CoverageDigest == "" || options.ImageDigest == "") {
+		return nil, ErrSync
+	}
+	options.RegistrationProtocol, options.CatalogVersion = protocol, catalogVersion
 	for _, r := range options.ServiceID {
 		if !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-", r) {
 			return nil, ErrSync
@@ -78,7 +107,7 @@ func New(options Options) (*Client, error) {
 	if options.Client != nil {
 		client = *options.Client
 	}
-	// Credentials must never follow a redirect, even to another path on the same host.
+	// 凭据不得随重定向发送，即使目标只是同一主机的另一个路径。
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	client.Timeout = 10 * time.Second
 	return &Client{options: options, http: &client, prefix: strings.TrimRight(options.BaseURL, "/") + "/api/v1/internal/licenses/runtime/" + url.PathEscape(options.ServiceID)}, nil
@@ -138,17 +167,21 @@ func (c *Client) request(ctx context.Context, method, action string, input any, 
 	return nil
 }
 
-// SyncOnce acknowledges only the exact signed revision durably applied by the
-// local runtime. A failed acknowledgement never rolls the local gate back.
+// SyncOnce 仅确认本地运行时已持久化应用的确切签名修订版。
+// 确认失败不会回退本地门禁状态。
 func (c *Client) SyncOnce(ctx context.Context) error {
 	if c == nil {
 		return ErrSync
 	}
 	ready := struct {
-		Protocol int    `json:"protocol"`
-		Coverage string `json:"coverage_digest"`
-		Image    string `json:"image_digest"`
-	}{runtime.Protocol, c.options.CoverageDigest, c.options.ImageDigest}
+		Protocol       int    `json:"protocol"`
+		CatalogVersion int    `json:"catalog_version,omitempty"`
+		Coverage       string `json:"coverage_digest,omitempty"`
+		Image          string `json:"image_digest,omitempty"`
+	}{Protocol: c.options.RegistrationProtocol, CatalogVersion: c.options.CatalogVersion, Coverage: c.options.CoverageDigest, Image: c.options.ImageDigest}
+	if c.options.RegistrationProtocol == catalog.RegistrationProtocolV1 {
+		ready.Protocol = runtime.Protocol
+	}
 	if err := c.request(ctx, http.MethodPost, "ready", ready, nil); err != nil {
 		return err
 	}
@@ -170,9 +203,9 @@ func (c *Client) SyncOnce(ctx context.Context) error {
 	return c.request(ctx, http.MethodPost, "ack", acknowledgement{snapshot.Revision, snapshot.Digest}, nil)
 }
 
-// Run retries on the fixed 30-second cadence. The callback receives only the
-// error, never response contents, credentials or signed license material.
-// Local Evaluate must still be called before every business operation.
+// Run 按固定的 30 秒间隔重试。回调只接收错误，
+// 不接收响应内容、凭据或签名授权材料。
+// 每次业务操作前仍须调用本地 Evaluate。
 func (c *Client) Run(ctx context.Context, onError func(error)) error {
 	if c == nil || ctx == nil {
 		return ErrSync

@@ -11,8 +11,8 @@ import (
 
 const RecoveryTokenType = "commercial-clock-recovery+jws"
 
-// Recovery is a separately signed, narrowly bound clock recovery credential.
-// Successful verification does not consume it or update persisted clock state.
+// Recovery 是独立签名且绑定范围受限的时钟恢复凭证。
+// 验证成功不会核销凭证，也不会更新持久化时钟状态。
 type Recovery struct {
 	ProtocolVersion int    `json:"protocol_version"`
 	Issuer          string `json:"issuer"`
@@ -34,8 +34,8 @@ func validateRecoveryFields(r Recovery) error {
 	return nil
 }
 
-// ValidateRecovery checks binding and validity. The caller must provide a trusted
-// current time and atomically consume the ID while applying the recovery anchor.
+// ValidateRecovery 检查绑定与有效期。调用方须提供可信的当前时间，
+// 并在应用恢复锚点时原子地核销凭证 ID。
 func ValidateRecovery(r Recovery, l License, now time.Time) error {
 	if err := validateRecoveryFields(r); err != nil {
 		return err

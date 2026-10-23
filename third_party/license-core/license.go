@@ -1,4 +1,4 @@
-// Package licensecore validates vendor-signed offline commercial licenses.
+// Package licensecore 验证厂商签名的离线商业授权。
 package licensecore
 
 import (
@@ -106,7 +106,7 @@ type header struct {
 	KeyID     string `json:"kid"`
 }
 
-// strictJSON rejects duplicate keys at every nesting level before decoding.
+// strictJSON 在解码前拒绝任意嵌套层级的重复键。
 func strictJSON(data []byte, target any) error {
 	if len(data) == 0 || len(data) > MaxTokenBytes {
 		return ErrInvalid
@@ -158,8 +158,8 @@ func strictJSON(data []byte, target any) error {
 	if _, err := d.Token(); err != io.EOF {
 		return fmt.Errorf("%w: trailing JSON", ErrInvalid)
 	}
-	// encoding/json normally accepts case-insensitive field aliases. Protocol
-	// fields are exact, so reject aliases as well as unknown fields.
+	// encoding/json 默认接受大小写不同的字段别名。
+	// 协议字段须精确匹配，因此同时拒绝别名与未知字段。
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(data, &object); err != nil || object == nil {
 		return ErrInvalid
@@ -203,7 +203,7 @@ func strictJSON(data []byte, target any) error {
 	return nil
 }
 
-// ParseRequest applies the same strict JSON policy as license verification.
+// ParseRequest 使用与授权验证相同的严格 JSON 校验规则。
 func ParseRequest(raw []byte) (Request, error) {
 	var r Request
 	if err := strictJSON(raw, &r); err != nil {
@@ -226,7 +226,7 @@ func Sign(l License, kid string, key ed25519.PrivateKey) (string, error) {
 	if !identifier(kid) || len(key) != ed25519.PrivateKeySize {
 		return "", fmt.Errorf("%w: signing key", ErrInvalid)
 	}
-	// Reject malformed private keys rather than signing unverifiable output.
+	// 拒绝格式不正确的私钥，避免生成无法验证的签名。
 	if !bytes.Equal(ed25519.NewKeyFromSeed(key.Seed()), key) {
 		return "", fmt.Errorf("%w: signing key", ErrInvalid)
 	}

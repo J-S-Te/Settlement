@@ -20,7 +20,7 @@ func requestFileGatewayToken(ctx context.Context, client *http.Client, endpoint,
 	if err != nil {
 		return "", errors.New("file gateway OAuth endpoint invalid")
 	}
-	// Business machine clients require Basic; form secrets are broker-only.
+	// 业务机器客户端要求 Basic；表单密钥仅供 Broker 使用。
 	request.SetBasicAuth(clientID, secret)
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response, err := client.Do(request)

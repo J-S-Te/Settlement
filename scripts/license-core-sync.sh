@@ -3,7 +3,7 @@ set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 mirror="$repo/third_party/license-core"
 manifest="$repo/scripts/license-core.sha256"
-files='clock.go diff.go go.mod license.go recovery.go runtime/lock_unix.go runtime/snapshot.go runtime/state.go syncclient/client.go consumer/consumer.go'
+files='catalog/catalog.go clock.go diff.go go.mod license.go recovery.go runtime/lock_unix.go runtime/snapshot.go runtime/state.go syncclient/client.go consumer/consumer.go'
 digest() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f 1; else shasum -a 256 "$1" | cut -d ' ' -f 1; fi; }
 verify() {
  [ -z "$(find "$mirror" -type l -print)" ] || exit 1

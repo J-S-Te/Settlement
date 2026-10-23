@@ -105,9 +105,98 @@ func (c *Client) Bind(ctx context.Context, applicationID, fileID, resourceType, 
 	return c.do(ctx, http.MethodPost, "/api/v1/files/"+url.PathEscape(fileID)+"/bindings", "", bytes.NewReader(payload), "application/json", nil)
 }
 
-// Download reads a READY file after the settlement API has already verified
-// the caller's business-resource access. The bounded buffer prevents a file
-// gateway response from exhausting API memory.
+// Release 补偿精确应用及资源绑定，即使 Bind
+// 响应丢失。网关保留停用墓碑，使延迟
+// 请求无法重新激活已放弃的文件代次。
+func (c *Client) Release(ctx context.Context, applicationID, fileID, resourceType, resourceID, bindingType string) error {
+	for _, value := range []string{applicationID, fileID, resourceType, resourceID, bindingType} {
+		if strings.TrimSpace(value) == "" {
+			return errors.New("application, file, resource and binding type are required")
+		}
+	}
+	payload, err := json.Marshal(map[string]string{"application_id": applicationID, "resource_type": resourceType, "resource_id": resourceID, "binding_type": bindingType})
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, "/api/v1/files/"+url.PathEscape(fileID)+"/bindings/release", "", bytes.NewReader(payload), "application/json", nil)
+}
+
+// ResolveUpload 仅观察不可变请求。租户和应用
+// 来自网关验证后的机器身份，绝非查询参数。
+func (c *Client) ResolveUpload(ctx context.Context, requestID string) (fileID, status string, found bool, err error) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return "", "", false, errors.New("upload request ID is required")
+	}
+	var result struct {
+		Data struct {
+			RequestID string `json:"request_id"`
+			FileID    string `json:"file_id"`
+			Status    string `json:"status"`
+		} `json:"data"`
+	}
+	err = c.do(ctx, http.MethodGet, "/api/v1/file-upload-requests/"+url.PathEscape(requestID), "", nil, "", &result)
+	if err != nil {
+		var httpErr *gatewayHTTPError
+		if errors.As(err, &httpErr) && httpErr.status == http.StatusNotFound {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	if result.Data.RequestID != requestID {
+		return "", "", false, errors.New("file gateway upload lookup identity is invalid")
+	}
+	if validUploadRequestState(result.Data.FileID, result.Data.Status) {
+		return result.Data.FileID, result.Data.Status, true, nil
+	}
+	return "", "", false, errors.New("file gateway upload lookup state is invalid")
+}
+
+// RetireUpload 在放弃业务绑定前隔离不可变上传键。
+// 请求缺失时会创建持久化取消墓碑。
+func (c *Client) RetireUpload(ctx context.Context, requestID string) (fileID, status string, err error) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return "", "", errors.New("upload request ID is required")
+	}
+	var result struct {
+		Data struct {
+			RequestID string `json:"request_id"`
+			FileID    string `json:"file_id"`
+			Status    string `json:"status"`
+			Retired   bool   `json:"retired"`
+		} `json:"data"`
+	}
+	err = c.do(ctx, http.MethodPost, "/api/v1/file-upload-requests/"+url.PathEscape(requestID)+"/retire", "", nil, "", &result)
+	if err != nil {
+		return "", "", err
+	}
+	if !result.Data.Retired || result.Data.RequestID != requestID || !validUploadRequestState(result.Data.FileID, result.Data.Status) {
+		return "", "", errors.New("file gateway upload retirement was not confirmed")
+	}
+	return result.Data.FileID, result.Data.Status, nil
+}
+
+func validUploadRequestState(fileID, status string) bool {
+	switch status {
+	case "CANCELLED":
+		return fileID == ""
+	case "WRITING", "READY", "FAILED", "REJECTED":
+		return fileID != ""
+	default:
+		return false
+	}
+}
+
+type gatewayHTTPError struct{ status int }
+
+func (e *gatewayHTTPError) Error() string {
+	return fmt.Sprintf("file gateway returned HTTP %d", e.status)
+}
+
+// Download 在结算 API 已确认调用方业务资源访问权限后，
+// 读取 READY 文件。有界缓冲区防止文件
+// 网关响应耗尽 API 内存。
 func (c *Client) Download(ctx context.Context, fileID string) ([]byte, error) {
 	fileID = strings.TrimSpace(fileID)
 	if fileID == "" {
@@ -167,7 +256,7 @@ func (c *Client) do(ctx context.Context, method, path, requestID string, body io
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		return fmt.Errorf("file gateway returned HTTP %d", resp.StatusCode)
+		return &gatewayHTTPError{status: resp.StatusCode}
 	}
 	if target != nil {
 		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(target); err != nil {
