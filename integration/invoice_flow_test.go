@@ -21,13 +21,13 @@ import (
 	"github.com/j-s-te/settlement/internal/service"
 )
 
-// TestInvoiceFlow proves the business path behind the invoice receivable
-// selector. It deliberately does not insert business records directly:
-// contract data enters through IngestContract, the receivable is created by
-// ConfirmPlan, and the invoice reservation enters through the HTTP API.
+// TestInvoiceFlow 验证发票应收选择器背后的业务
+// 路径，有意不直接插入业务记录：
+// 合同数据经 IngestContract 进入，应收由
+// ConfirmPlan 创建，发票预留经 HTTP API 进入。
 //
-// The test is opt-in because it writes to the database. Run it only against a
-// disposable or dedicated Settlement database:
+// 测试写数据库，需显式启用。仅可针对一次性
+// 或专用 Settlement 数据库运行：
 //
 // SETTLEMENT_E2E_TEST=1 SETTLEMENT_E2E_TEST_DSN='...' go test ./integration -v
 func TestInvoiceFlow(t *testing.T) {
@@ -119,8 +119,8 @@ func TestInvoiceFlow(t *testing.T) {
 	if firstRequest == "" {
 		t.Fatal("first invoice request did not return an id")
 	}
-	// Reusing the key is safe and returns the existing request instead of
-	// reserving another 50,000 yuan.
+	// 复用该键是安全的，会返回已有请求，
+	// 而不是再次预留 50,000 元。
 	if got := createInvoiceRequest(t, handler, snapshotID, receivableID, "50000.00", "e2e-invoice-1"); got != firstRequest {
 		t.Fatalf("idempotent retry returned %q, want %q", got, firstRequest)
 	}
@@ -131,8 +131,8 @@ func TestInvoiceFlow(t *testing.T) {
 		t.Fatalf("second invoice request id=%q is invalid", secondRequest)
 	}
 	assertNoEligibleReceivable(t, handler)
-	// A lost success response after the final reservation must still be safely
-	// replayable even though no invoiceable balance remains.
+	// 最终预留后的成功响应丢失时，即使已无
+	// 可开票余额，仍必须可安全重放。
 	if got := createInvoiceRequest(t, handler, snapshotID, receivableID, "70000.00", "e2e-invoice-2"); got != secondRequest {
 		t.Fatalf("full-balance idempotent retry returned %q, want %q", got, secondRequest)
 	}
@@ -163,6 +163,46 @@ func TestInvoiceFlow(t *testing.T) {
 	unknown := service.TaxCallbackEvent{EventID: "tax-unknown-" + adapterAttemptID, EventType: service.TaxInvoiceIssueUnknownEvent, TenantID: tenant, ProviderCode: "e2e-provider", OccurredAt: time.Now().UTC(), ResultSequence: 1, AttemptID: adapterAttemptID, ExternalRequestID: adapterAttemptID, FailureCode: "TIMEOUT", FailureMessage: "result temporarily unknown"}
 	if result, callbackErr := adapterService.ApplyTaxCallback(ctx, tenant, unknown); callbackErr != nil || result != "APPLIED" {
 		t.Fatalf("apply unknown tax result: result=%q err=%v", result, callbackErr)
+	}
+	var recoveryVersion int
+	if err = db.QueryRowContext(ctx, `SELECT version FROM settlement_invoice_request WHERE tenant_id=? AND id=?`, tenant, secondRequest).Scan(&recoveryVersion); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryErr := adapterService.RecoverFailedInvoice(ctx, service.Principal{TenantID: tenant, UserID: "reviewer-2"}, "unknown-review-"+secondRequest, secondRequest, recoveryVersion, "未知结果不能再次开具"); !errors.Is(recoveryErr, service.ErrConflict) {
+		t.Fatalf("UNKNOWN recovery = %v", recoveryErr)
+	}
+	failed := unknown
+	failed.EventID = "tax-failed-" + adapterAttemptID
+	failed.EventType = service.TaxInvoiceIssueFailedEvent
+	failed.ResultSequence = 2
+	failed.FailureCode = "DEFINITIVE_REJECTION"
+	if result, callbackErr := adapterService.ApplyTaxCallback(ctx, tenant, failed); callbackErr != nil || result != "APPLIED" {
+		t.Fatalf("failed callback=%s %v", result, callbackErr)
+	}
+	if err = db.QueryRowContext(ctx, `SELECT version FROM settlement_invoice_request WHERE tenant_id=? AND id=?`, tenant, secondRequest).Scan(&recoveryVersion); err != nil {
+		t.Fatal(err)
+	}
+	for retry := 0; retry < 2; retry++ {
+		if recoveryErr := adapterService.RecoverFailedInvoice(ctx, service.Principal{TenantID: tenant, UserID: "reviewer-2"}, "failed-review-"+secondRequest, secondRequest, recoveryVersion, "确认税控已明确拒绝，恢复审批"); recoveryErr != nil {
+			t.Fatal(recoveryErr)
+		}
+	}
+	assertIssueChannelAndTaxCommands(t, db, tenant, secondRequest, "TAX_ADAPTER", 1)
+	oldAttemptID := adapterAttemptID
+	adapterAttemptID, err = adapterService.ApproveInvoiceRequest(ctx, service.Principal{TenantID: tenant, UserID: "reviewer-3"}, secondRequest, recoveryVersion+1)
+	if err != nil || adapterAttemptID == oldAttemptID {
+		t.Fatalf("fresh reviewed attempt=%s %v", adapterAttemptID, err)
+	}
+	assertIssueChannelAndTaxCommands(t, db, tenant, secondRequest, "TAX_ADAPTER", 2)
+	var attemptNo int
+	if err = db.QueryRowContext(ctx, `SELECT attempt_no FROM settlement_invoice_issue_attempt WHERE id=? AND tenant_id=?`, adapterAttemptID, tenant).Scan(&attemptNo); err != nil || attemptNo != 2 {
+		t.Fatalf("attempt number=%d %v", attemptNo, err)
+	}
+	unknown.AttemptID = adapterAttemptID
+	unknown.ExternalRequestID = adapterAttemptID
+	unknown.EventID = "tax-unknown-" + adapterAttemptID
+	if result, callbackErr := adapterService.ApplyTaxCallback(ctx, tenant, unknown); callbackErr != nil || result != "APPLIED" {
+		t.Fatalf("new unknown callback=%s %v", result, callbackErr)
 	}
 	invoiceResult := &service.TaxInvoiceResult{ExternalInvoiceID: "EXT-" + adapterAttemptID, InvoiceCode: "E2E-TAX", InvoiceNo: "NO-" + adapterAttemptID[:12], InvoiceType: "VAT_SPECIAL", Currency: "CNY", AmountExclTax: "70000.00", TaxAmount: "0.00", AmountInclTax: "70000.00", IssueDate: time.Now().UTC().Format("2006-01-02"), SellerProfile: map[string]any{"name": "E2E seller"}, Items: []service.InvoiceItemInput{{ItemName: "集成测试服务", Quantity: "1", UnitPriceExclTax: "70000.00", AmountExclTax: "70000.00", TaxRate: "0", TaxAmount: "0", AmountInclTax: "70000.00"}}}
 	issued := service.TaxCallbackEvent{EventID: "tax-issued-" + adapterAttemptID, EventType: service.TaxInvoiceIssuedEvent, TenantID: tenant, ProviderCode: "e2e-provider", OccurredAt: time.Now().UTC(), ResultSequence: 2, AttemptID: adapterAttemptID, ExternalRequestID: adapterAttemptID, ExternalOperationID: "OP-" + adapterAttemptID, Invoice: invoiceResult}
@@ -225,8 +265,8 @@ func TestInvoiceFlow(t *testing.T) {
 		t.Fatalf("red flush relation count=%d err=%v", count, err)
 	}
 
-	// The red invoice appends a reversal fact and restores only the red-flushed
-	// 70,000 allocation; the manually issued 50,000 remains invoiced.
+	// 红票追加冲销事实，仅恢复被红冲的
+	// 70,000 分配额；人工开票的 50,000 仍保持已开票。
 	assertEligibleAmount(t, handler, "70000.00", receivableID)
 }
 

@@ -2,12 +2,175 @@ package filegatewayclient
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+type resourceReleaser interface {
+	Release(context.Context, string, string, string, string, string) error
+}
+
+type uploadResolver interface {
+	ResolveUpload(context.Context, string) (string, string, bool, error)
+}
+
+type uploadRetirer interface {
+	RetireUpload(context.Context, string) (string, string, error)
+}
+
+func TestRetireUploadConfirmsPersistentRequestTombstone(t *testing.T) {
+	for _, status := range []string{"CANCELLED", "WRITING", "READY", "FAILED", "REJECTED"} {
+		t.Run(status, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/api/v1/file-upload-requests/request-1/retire" || r.URL.RawQuery != "" {
+					t.Errorf("invalid retirement route: %s %s", r.Method, r.URL)
+				}
+				if r.Header.Get("Authorization") != "Bearer token-1" {
+					t.Error("retirement bearer missing")
+				}
+				body, _ := io.ReadAll(r.Body)
+				if len(body) != 0 {
+					t.Error("retirement retransmitted content or supplied client scope")
+				}
+				fileID := "file-1"
+				if status == "CANCELLED" {
+					fileID = ""
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"request_id": "request-1", "file_id": fileID, "status": status, "retired": true}})
+			}))
+			defer server.Close()
+			client, _ := New(server.URL, server.Client(), func(context.Context) (string, error) { return "token-1", nil })
+			retirer, ok := any(client).(uploadRetirer)
+			if !ok {
+				t.Fatal("gateway client cannot persistently retire an upload request")
+			}
+			fileID, gotStatus, err := retirer.RetireUpload(context.Background(), "request-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotStatus != status || (status == "CANCELLED") != (fileID == "") {
+				t.Fatalf("retire=%q,%q", fileID, gotStatus)
+			}
+		})
+	}
+}
+
+func TestRetireUploadRejectsUnconfirmedRetirement(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"request_id":"request-1","file_id":"file-1","status":"READY","retired":false}}`)
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, server.Client(), func(context.Context) (string, error) { return "token-1", nil })
+	retirer, ok := any(client).(uploadRetirer)
+	if !ok {
+		t.Fatal("retirer missing")
+	}
+	if _, _, err := retirer.RetireUpload(context.Background(), "request-1"); err == nil {
+		t.Fatal("unconfirmed retirement allowed cleanup completion")
+	}
+}
+
+func TestResolveUploadUsesReadOnlyTenantAndApplicationBoundRequestLookup(t *testing.T) {
+	for _, status := range []string{"WRITING", "READY", "FAILED", "REJECTED", "MISSING"} {
+		t.Run(status, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/api/v1/file-upload-requests/request-1" || r.URL.RawQuery != "" {
+					t.Errorf("invalid resolve request: %s %s", r.Method, r.URL)
+				}
+				if r.Header.Get("Authorization") != "Bearer token-1" {
+					t.Error("resolve bearer missing")
+				}
+				body, _ := io.ReadAll(r.Body)
+				if len(body) != 0 {
+					t.Error("resolve retransmitted file content")
+				}
+				if status == "MISSING" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]string{"request_id": "request-1", "file_id": "file-1", "status": status}})
+			}))
+			defer server.Close()
+			client, err := New(server.URL, server.Client(), func(context.Context) (string, error) { return "token-1", nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolver, ok := any(client).(uploadResolver)
+			if !ok {
+				t.Fatal("gateway client cannot resolve an upload request without retransmitting bytes")
+			}
+			fileID, gotStatus, found, err := resolver.ResolveUpload(context.Background(), "request-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status == "MISSING" {
+				if found || fileID != "" {
+					t.Fatal("404 was interpreted as an existing upload")
+				}
+				return
+			}
+			if !found || fileID != "file-1" || gotStatus != status {
+				t.Fatalf("resolve=%q,%q,%v", fileID, gotStatus, found)
+			}
+		})
+	}
+}
+
+func TestResolveUploadRejectsWrongIdentityAndUnknownState(t *testing.T) {
+	for _, payload := range []string{`{"data":{"request_id":"other","file_id":"file-1","status":"READY"}}`, `{"data":{"request_id":"request-1","file_id":"file-1","status":"DELETING"}}`, `{"data":{"request_id":"request-1","file_id":"","status":"FAILED"}}`} {
+		t.Run(payload, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, payload) }))
+			defer server.Close()
+			client, _ := New(server.URL, server.Client(), func(context.Context) (string, error) { return "token-1", nil })
+			resolver, ok := any(client).(uploadResolver)
+			if !ok {
+				t.Fatal("resolver missing")
+			}
+			if _, _, _, err := resolver.ResolveUpload(context.Background(), "request-1"); err == nil {
+				t.Fatal("malformed request lookup accepted")
+			}
+		})
+	}
+}
+
+func TestReleaseUsesScopedIdempotentGatewayResourceContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/files/file-1/bindings/release" {
+			t.Errorf("unexpected release route: %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer token-1" {
+			t.Error("missing release bearer")
+		}
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		for key, want := range map[string]string{"application_id": "settlement", "resource_type": "settlement_report_export", "resource_id": "job-1", "binding_type": "REPORT"} {
+			if payload[key] != want {
+				t.Errorf("release %s=%q, want %q", key, payload[key], want)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client, err := New(server.URL, server.Client(), func(context.Context) (string, error) { return "token-1", nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaser, ok := any(client).(resourceReleaser)
+	if !ok {
+		t.Fatal("gateway client cannot compensate a resource binding after an unknown Bind response")
+	}
+	for range 2 {
+		if err = releaser.Release(context.Background(), "settlement", "file-1", "settlement_report_export", "job-1", "REPORT"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func TestUploadPreservesCSVMediaTypeAndExportMetadata(t *testing.T) {
 	const filename = "结算报表 \"十月\".csv"

@@ -4,42 +4,56 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Config intentionally keeps deployment secrets outside source control. The
-// API is an independent subsystem and must not reuse another application's DB,
-// browser cookie or machine-client credentials.
+// Config 有意将部署密钥置于源码控制之外。
+// API 为独立子系统，不得复用其他应用的数据库、
+// 浏览器 Cookie 或机器客户端凭据。
 type Config struct {
-	HTTPAddress                    string
-	MySQLDSN                       string
-	DevelopmentAuth                bool
-	IntegrationEnabled             bool
-	IntegrationBearerToken         string
-	OutboxWorkerEnabled            bool
-	OutboxWorkerBatchSize          int
-	PlatformBaseURL                string
-	OIDCIssuer                     string
-	OIDCBackchannelBaseURL         string
-	OIDCClientID                   string
-	OIDCClientSecret               string
-	OIDCRedirectURI                string
-	OIDCPostLogoutURI              string
-	OIDCTenantID                   string
-	OIDCEnvironmentCode            string
-	OIDCSessionCookieName          string
-	OIDCSessionKey                 []byte
-	OIDCSessionSecure              bool
-	ContractClientID               string
-	ContractAudience               string
-	TaxResultIngestEnabled         bool
-	TaxResultBearerToken           string
-	TaxResultClientID              string
-	TaxResultAudience              string
-	TaxResultApplicationCode       string
+	HTTPAddress            string
+	MySQLDSN               string
+	DevelopmentAuth        bool
+	IntegrationEnabled     bool
+	IntegrationBearerToken string
+	OutboxWorkerEnabled    bool
+	OutboxWorkerBatchSize  int
+	PlatformBaseURL        string
+	OIDCIssuer             string
+	OIDCBackchannelBaseURL string
+	OIDCClientID           string
+	OIDCClientSecret       string
+	OIDCRedirectURI        string
+	OIDCPostLogoutURI      string
+	OIDCTenantID           string
+	OIDCEnvironmentCode    string
+	// TrustedProxies 是唯一允许采信转发头的直接对端（AUD-IP-2026，默认仅回环）。
+	TrustedProxies                    []netip.Prefix
+	OIDCSessionCookieName             string
+	OIDCSessionKey                    []byte
+	OIDCSessionSecure                 bool
+	ContractClientID                  string
+	ContractAudience                  string
+	PlatformMachineTokenPublicKeyPath string
+	PlatformMachineTokenIssuer        string
+	ContractOAuthClientID             string
+	ContractApplicationID             string
+	ContractEnvironmentID             string
+	TaxResultIngestEnabled            bool
+	TaxResultBearerToken              string
+	TaxResultClientID                 string
+	TaxResultAudience                 string
+	TaxResultApplicationCode          string
+	// HandoverMachine 是基础平台人员交接机器协议的入站配置。
+	HandoverMachineEnabled         bool
+	HandoverMachineClientID        string
+	HandoverMachineAudience        string
+	HandoverMachineApplicationCode string
+	HandoverMachineScope           string
 	TaxProviderCode                string
 	PersonnelDirectoryURL          string
 	PersonnelDirectoryClientID     string
@@ -65,21 +79,35 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	trustedProxies, trustedErr := parseTrustedProxies(env("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128"))
+	if trustedErr != nil {
+		return Config{}, fmt.Errorf("APP_TRUSTED_PROXIES: %w", trustedErr)
+	}
 	c := Config{
 		HTTPAddress:            env("SETTLEMENT_HTTP_ADDR", ":8085"),
 		MySQLDSN:               strings.TrimSpace(os.Getenv("SETTLEMENT_MYSQL_DSN")),
 		IntegrationBearerToken: strings.TrimSpace(os.Getenv("SETTLEMENT_INTEGRATION_BEARER_TOKEN")),
 		PlatformBaseURL:        strings.TrimSpace(os.Getenv("PLATFORM_BASE_URL")), OIDCIssuer: strings.TrimSpace(os.Getenv("OIDC_ISSUER")), OIDCBackchannelBaseURL: strings.TrimSpace(os.Getenv("OIDC_BACKCHANNEL_BASE_URL")),
 		OIDCClientID: strings.TrimSpace(os.Getenv("OIDC_CLIENT_ID")), OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"), OIDCRedirectURI: strings.TrimSpace(os.Getenv("OIDC_REDIRECT_URI")), OIDCPostLogoutURI: strings.TrimSpace(os.Getenv("OIDC_POST_LOGOUT_REDIRECT_URI")),
-		OIDCTenantID: strings.TrimSpace(os.Getenv("OIDC_TENANT_ID")), OIDCEnvironmentCode: env("PLATFORM_ENVIRONMENT_CODE", "dev"), OIDCSessionCookieName: env("OIDC_SESSION_COOKIE_NAME", "settlement_session"),
+		OIDCTenantID: strings.TrimSpace(os.Getenv("OIDC_TENANT_ID")), OIDCEnvironmentCode: env("PLATFORM_ENVIRONMENT_CODE", "dev"),
+		TrustedProxies: trustedProxies, OIDCSessionCookieName: env("OIDC_SESSION_COOKIE_NAME", "settlement_session"),
 		ContractClientID: strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_CLIENT_ID")), ContractAudience: strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_AUDIENCE")),
-		TaxResultBearerToken:       strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_BEARER_TOKEN")),
-		TaxResultClientID:          strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_CLIENT_ID")),
-		TaxResultAudience:          strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_AUDIENCE")),
-		TaxResultApplicationCode:   env("SETTLEMENT_TAX_RESULT_APPLICATION_CODE", "tax_adapter"),
-		TaxProviderCode:            env("SETTLEMENT_TAX_PROVIDER_CODE", "default"),
-		PersonnelDirectoryURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_URL")), "/"),
-		PersonnelDirectoryClientID: strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_ID")), PersonnelDirectoryClientSecret: os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_SECRET"),
+		PlatformMachineTokenPublicKeyPath: strings.TrimSpace(os.Getenv("PLATFORM_MACHINE_TOKEN_PUBLIC_KEY_PATH")),
+		PlatformMachineTokenIssuer:        strings.TrimSpace(os.Getenv("PLATFORM_MACHINE_TOKEN_ISSUER")),
+		ContractOAuthClientID:             strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_OAUTH_CLIENT_ID")),
+		ContractApplicationID:             strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_APPLICATION_ID")),
+		ContractEnvironmentID:             strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_ENVIRONMENT_ID")),
+		TaxResultBearerToken:              strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_BEARER_TOKEN")),
+		TaxResultClientID:                 strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_CLIENT_ID")),
+		TaxResultAudience:                 strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_AUDIENCE")),
+		TaxResultApplicationCode:          env("SETTLEMENT_TAX_RESULT_APPLICATION_CODE", "tax_adapter"),
+		HandoverMachineClientID:           strings.TrimSpace(os.Getenv("SETTLEMENT_HANDOVER_CLIENT_ID")),
+		HandoverMachineAudience:           strings.TrimSpace(os.Getenv("SETTLEMENT_HANDOVER_AUDIENCE")),
+		HandoverMachineApplicationCode:    env("SETTLEMENT_HANDOVER_APPLICATION_CODE", "basic-platform"),
+		HandoverMachineScope:              env("SETTLEMENT_HANDOVER_SCOPE", "handover.machine"),
+		TaxProviderCode:                   env("SETTLEMENT_TAX_PROVIDER_CODE", "default"),
+		PersonnelDirectoryURL:             strings.TrimRight(strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_URL")), "/"),
+		PersonnelDirectoryClientID:        strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_ID")), PersonnelDirectoryClientSecret: os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_SECRET"),
 		CRMCreditEndpoint:        strings.TrimSpace(os.Getenv("CRM_CREDIT_SYNC_ENDPOINT")),
 		CRMCreditTokenEndpoint:   strings.TrimSpace(os.Getenv("CRM_CREDIT_TOKEN_URL")),
 		CRMCreditClientID:        strings.TrimSpace(os.Getenv("CRM_CREDIT_CLIENT_ID")),
@@ -119,6 +147,9 @@ func Load() (Config, error) {
 	if c.TaxResultIngestEnabled, err = boolEnv("SETTLEMENT_TAX_RESULT_INGEST_ENABLED", false); err != nil {
 		return c, err
 	}
+	if c.HandoverMachineEnabled, err = boolEnv("SETTLEMENT_HANDOVER_ENABLED", false); err != nil {
+		return c, err
+	}
 	if c.OutboxWorkerEnabled, err = boolEnv("SETTLEMENT_OUTBOX_WORKER_ENABLED", true); err != nil {
 		return c, err
 	}
@@ -149,6 +180,16 @@ func Load() (Config, error) {
 	if c.HTTPAddress == "" || c.MySQLDSN == "" {
 		return c, fmt.Errorf("SETTLEMENT_HTTP_ADDR and SETTLEMENT_MYSQL_DSN are required")
 	}
+	if c.PlatformMachineTokenPublicKeyPath != "" || c.PlatformMachineTokenIssuer != "" || c.ContractOAuthClientID != "" || c.ContractApplicationID != "" || c.ContractEnvironmentID != "" {
+		if c.DevelopmentAuth {
+			return c, fmt.Errorf("platform machine tokens require production authentication")
+		}
+		for name, value := range map[string]string{"PLATFORM_MACHINE_TOKEN_PUBLIC_KEY_PATH": c.PlatformMachineTokenPublicKeyPath, "PLATFORM_MACHINE_TOKEN_ISSUER": c.PlatformMachineTokenIssuer, "CONTRACT_INTEGRATION_CLIENT_ID": c.ContractClientID, "CONTRACT_INTEGRATION_AUDIENCE": c.ContractAudience, "CONTRACT_INTEGRATION_OAUTH_CLIENT_ID": c.ContractOAuthClientID, "CONTRACT_INTEGRATION_APPLICATION_ID": c.ContractApplicationID, "CONTRACT_INTEGRATION_ENVIRONMENT_ID": c.ContractEnvironmentID, "OIDC_TENANT_ID": c.OIDCTenantID, "PLATFORM_ENVIRONMENT_CODE": c.OIDCEnvironmentCode} {
+			if value == "" {
+				return c, fmt.Errorf("%s is required for platform machine token verification", name)
+			}
+		}
+	}
 	if c.IntegrationEnabled && !c.DevelopmentAuth && (c.ContractClientID == "" || c.ContractAudience == "") {
 		return c, fmt.Errorf("contract client ID and audience are required when production integration is enabled")
 	}
@@ -157,6 +198,9 @@ func Load() (Config, error) {
 	}
 	if c.TaxResultIngestEnabled && !c.DevelopmentAuth && (c.TaxResultClientID == "" || c.TaxResultAudience == "" || c.TaxResultApplicationCode == "" || c.TaxProviderCode == "") {
 		return c, fmt.Errorf("tax result client, audience, application and provider are required when tax result ingest is enabled")
+	}
+	if c.HandoverMachineEnabled && (c.HandoverMachineClientID == "" || c.HandoverMachineAudience == "" || c.HandoverMachineApplicationCode == "") {
+		return c, fmt.Errorf("SETTLEMENT_HANDOVER_CLIENT_ID/AUDIENCE/APPLICATION_CODE are required when SETTLEMENT_HANDOVER_ENABLED=true")
 	}
 	if c.TaxResultIngestEnabled && c.DevelopmentAuth && c.TaxResultBearerToken == "" {
 		return c, fmt.Errorf("development tax result token is required when tax result ingest is enabled")
@@ -212,8 +256,8 @@ func Load() (Config, error) {
 	return c, nil
 }
 
-// LoadDatabase is deliberately narrow so the migration job does not require
-// browser/OIDC secrets that it never uses.
+// LoadDatabase 有意保持窄范围，使迁移任务无需
+// 提供其从不使用的浏览器或 OIDC 密钥。
 func LoadDatabase() (string, error) {
 	dsn := strings.TrimSpace(os.Getenv("SETTLEMENT_MYSQL_DSN"))
 	if dsn == "" {
@@ -268,4 +312,26 @@ func durationEnv(key string, fallback time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}
 	return parsed, nil
+}
+
+// parseTrustedProxies 解析逗号分隔的可信代理地址或 CIDR；非法项直接报错，
+// 避免拼写错误被静默忽略后仍以"谁都不信任/全信任"运行。
+func parseTrustedProxies(value string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0)
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(item); err == nil {
+			prefixes = append(prefixes, prefix.Masked())
+			continue
+		}
+		address, err := netip.ParseAddr(item)
+		if err != nil {
+			return nil, err
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(address, address.BitLen()))
+	}
+	return prefixes, nil
 }

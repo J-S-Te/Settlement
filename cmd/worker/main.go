@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"fmt"
+	"github.com/J-S-Te/license-core/consumer"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,10 +13,11 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/j-s-te/settlement/internal/creditclient"
 	"github.com/j-s-te/settlement/internal/dunning"
 	"github.com/j-s-te/settlement/internal/filegatewayclient"
 	"github.com/j-s-te/settlement/internal/outbox"
-	"github.com/j-s-te/settlement/internal/reportexport"
+	platformdir "github.com/j-s-te/settlement/internal/platform"
 	"github.com/j-s-te/settlement/internal/service"
 	"github.com/j-s-te/settlement/internal/taxreconcile"
 	"golang.org/x/oauth2/clientcredentials"
@@ -79,13 +78,64 @@ func main() {
 			return token.AccessToken, nil
 		}, BatchSize: 50}
 	}
+	var creditWorker *service.CreditSyncWorker
+	var creditPublisher *creditclient.Client
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("SETTLEMENT_CRM_CREDIT_SYNC_ENABLED")), "true") {
+		endpoint := strings.TrimSpace(os.Getenv("CRM_CREDIT_SYNC_ENDPOINT"))
+		tokenURL := strings.TrimSpace(os.Getenv("CRM_CREDIT_TOKEN_URL"))
+		if tokenURL == "" {
+			tokenURL = platform + "/oauth2/token"
+		}
+		clientID := strings.TrimSpace(os.Getenv("CRM_CREDIT_CLIENT_ID"))
+		clientSecret := os.Getenv("CRM_CREDIT_CLIENT_SECRET")
+		scope := strings.TrimSpace(os.Getenv("CRM_CREDIT_SCOPE"))
+		if scope == "" {
+			scope = "crm.credit.payment.ingest"
+		}
+		var creditErr error
+		creditPublisher, creditErr = creditclient.New(endpoint, tokenURL, clientID, clientSecret, scope, &http.Client{Timeout: 8 * time.Second})
+		if creditErr != nil {
+			slog.Error("initialize CRM credit retry publisher", "error", creditErr)
+			os.Exit(1)
+		}
+		creditWorker = &service.CreditSyncWorker{DB: db, Publisher: creditPublisher, BatchSize: 50, Lease: 2 * time.Minute}
+	}
 	httpClient := &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	worker := &outbox.Worker{Store: &outbox.Store{DB: db, WorkerID: workerID, Lease: 30 * time.Second}, HTTP: httpClient, TokenEndpoint: platform + "/oauth2/token", BatchSize: 50, Destinations: destinations}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	commercialGate, licenseErr := consumer.FromEnvironment("settlement")
+	if licenseErr != nil {
+		slog.Error("commercial license configuration failed")
+		os.Exit(1)
+	}
+	go func() {
+		_ = commercialGate.Run(ctx, func(error) {
+			slog.Warn("commercial license synchronization unavailable; local expiry remains authoritative")
+		})
+	}()
+	checkBusiness := func(ctx context.Context) error { return commercialGate.Check(ctx, "MUTATE_BUSINESS") }
+	worker.CheckBusinessLicense = checkBusiness
+	if creditWorker != nil {
+		creditWorker.CheckBusinessLicense = checkBusiness
+		creditPublisher.SetBusinessLicenseCheck(checkBusiness)
+	}
+	if taxReconciler != nil {
+		taxReconciler.CheckBusinessLicense = checkBusiness
+	}
 	scanner := &dunning.Scanner{DB: db, BatchSize: 50}
-	exporter := &reportexport.Worker{DB: db, WorkerID: workerID, BatchSize: 5, GatewayMode: strings.ToLower(strings.TrimSpace(os.Getenv("SETTLEMENT_FILE_GATEWAY_MODE"))), GatewayApplicationID: strings.TrimSpace(os.Getenv("SETTLEMENT_FILE_GATEWAY_APPLICATION_ID"))}
-	exporter.GatewayMode = reportexport.NormalizeGatewayMode(exporter.GatewayMode)
+	scanner.CheckBusinessLicense = checkBusiness
+	scanner.Directory = platformdir.NewPersonnelDirectory(
+		os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_URL"),
+		os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_ID"),
+		os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_SECRET"),
+		5*time.Second,
+	)
+	exporter, exportErr := newReportExporter(db, workerID)
+	if exportErr != nil {
+		slog.Error("report export configuration failed", "error", exportErr)
+		os.Exit(1)
+	}
 	if exporter.GatewayMode == "dual" || exporter.GatewayMode == "required" {
 		endpoint, clientID, secret := strings.TrimRight(strings.TrimSpace(os.Getenv("FILE_GATEWAY_URL")), "/"), os.Getenv("FILE_GATEWAY_CLIENT_ID"), os.Getenv("FILE_GATEWAY_CLIENT_SECRET")
 		tokenURL, scope := os.Getenv("FILE_GATEWAY_TOKEN_URL"), os.Getenv("FILE_GATEWAY_SCOPE")
@@ -93,20 +143,7 @@ func main() {
 			tokenURL = platform + "/oauth2/token"
 		}
 		tokenSource := func(ctx context.Context) (string, error) {
-			request, _ := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader("grant_type=client_credentials&client_id="+url.QueryEscape(clientID)+"&client_secret="+url.QueryEscape(secret)+"&scope="+url.QueryEscape(scope)))
-			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			response, err := httpClient.Do(request)
-			if err != nil {
-				return "", err
-			}
-			defer response.Body.Close()
-			var payload struct {
-				AccessToken string `json:"access_token"`
-			}
-			if err = json.NewDecoder(response.Body).Decode(&payload); err != nil || response.StatusCode/100 != 2 || payload.AccessToken == "" {
-				return "", fmt.Errorf("file gateway token request failed: %s", response.Status)
-			}
-			return payload.AccessToken, nil
+			return requestFileGatewayToken(ctx, httpClient, tokenURL, clientID, secret, scope)
 		}
 		gateway, gatewayErr := filegatewayclient.New(endpoint, httpClient, tokenSource)
 		if gatewayErr != nil {
@@ -117,6 +154,31 @@ func main() {
 		} else {
 			exporter.Gateway = gateway
 		}
+	}
+	// Recovery uses the same tenant-bound machine identity as report exports.
+	// A missing gateway leaves durable work pending and is reported each run.
+	archiveRecovery := &service.InvoiceArchiveWorker{DB: db, Identity: service.InvoiceArchiveIdentity{
+		TenantID: exporter.TenantID, ApplicationID: exporter.GatewayApplicationID,
+		GatewayURL: strings.TrimRight(strings.TrimSpace(os.Getenv("FILE_GATEWAY_URL")), "/"),
+	}, CheckBusinessLicense: checkBusiness}
+	if exporter.Gateway != nil {
+		archiveRecovery.Gateway = exporter.Gateway
+	}
+	if exporter.GatewayMode == "dual" || exporter.GatewayMode == "required" {
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				if err := archiveRecovery.RunOnce(ctx); err != nil && ctx.Err() == nil {
+					slog.Error("invoice archive recovery failed", "error", err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
 	}
 	go func() {
 		ticker := time.NewTicker(time.Minute)
@@ -162,6 +224,22 @@ func main() {
 			}
 		}
 	}()
+	if creditWorker != nil {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				if err := creditWorker.RunOnce(ctx); err != nil && ctx.Err() == nil {
+					slog.Error("CRM credit retry failed", "error", err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	if err = worker.Run(ctx); err != nil && err != context.Canceled {
 		slog.Error("settlement worker stopped", "error", err)
 		os.Exit(1)

@@ -5,16 +5,25 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/j-s-te/settlement/internal/creditclient"
 )
 
+const creditEventCompleted = "customer.credit.payment.completed.v1"
+const creditEventReversed = "customer.credit.payment.reversed.v1"
+
 func insertCreditSync(ctx context.Context, tx *sql.Tx, tenant, eventID, allocationID, receivableID string, payload []byte) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO settlement_credit_sync(id,tenant_id,event_id,allocation_id,receivable_id,status,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,'PENDING',?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, newID(), tenant, eventID, allocationID, receivableID, payload)
+	return insertCreditSyncEvent(ctx, tx, tenant, eventID, allocationID, receivableID, creditEventCompleted, "", payload)
+}
+
+func insertCreditSyncEvent(ctx context.Context, tx *sql.Tx, tenant, eventID, allocationID, receivableID, eventType, originalEventID string, payload []byte) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO settlement_credit_sync(id,tenant_id,event_id,event_type,original_event_id,allocation_id,receivable_id,status,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?, 'PENDING',?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, newID(), tenant, eventID, eventType, originalEventID, allocationID, receivableID, payload)
 	return err
 }
 
-// RetryCreditSync claims one event, sends it once, and records the result.
-// It is intentionally invoked by the original request or a finance retry;
-// no background scanner is involved.
+// RetryCreditSync 认领一个事件，发送一次并记录结果。
+// 有意由原请求或财务重试触发，
+// 不涉及后台扫描器。
 func (s *Service) RetryCreditSync(ctx context.Context, tenant, eventID string) error {
 	if s.CreditPublisher == nil {
 		return errors.New("CRM credit publisher is not configured")
@@ -41,6 +50,11 @@ func (s *Service) RetryCreditSync(ctx context.Context, tenant, eventID string) e
 	}
 
 	if err = s.CreditPublisher.Publish(ctx, tenant, eventID, payload); err != nil {
+		if errors.Is(err, creditclient.ErrLicensePaused) {
+			// 尚未发送任何内容。保留认领租约以便正常恢复，
+			// 不能将许可证暂停计为 CRM 投递失败。
+			return err
+		}
 		_, updateErr := s.DB.ExecContext(context.WithoutCancel(ctx), `UPDATE settlement_credit_sync SET status='RETRY_WAIT',attempt_count=attempt_count+1,last_error_summary=?,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND status='PROCESSING'`, safeCreditError(err), id)
 		if updateErr != nil {
 			return fmt.Errorf("publish CRM credit event: %w; record failure: %v", err, updateErr)

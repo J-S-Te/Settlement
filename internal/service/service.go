@@ -9,14 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrConflict = errors.New("conflict")
-	ErrInvalid  = errors.New("invalid input")
+	ErrNotFound  = errors.New("not found")
+	ErrConflict  = errors.New("conflict")
+	ErrInvalid   = errors.New("invalid input")
+	ErrForbidden = errors.New("forbidden")
 )
 
 type CreditEventPublisher interface {
@@ -28,6 +31,9 @@ type Service struct {
 	CreditPublisher     CreditEventPublisher
 	InvoiceIssuanceMode string
 	TaxProviderCode     string
+	// Optional only for directly constructed component tests. The HTTP API
+	// installs its live commercial gate for every invoice archive operation.
+	CheckInvoiceArchiveLicense func(context.Context) error
 }
 
 func (s *Service) taxProviderCode() string {
@@ -80,6 +86,9 @@ type Principal struct {
 	Username              string
 	CatalogVersion        string
 	AuthorizationRevision uint64
+	// LoginIP 是会话创建时平台记录的登录地址（AUD-IP-2026）。它随会话固定，
+	// 与每次操作观察到的客户端地址分开存储。
+	LoginIP string
 }
 
 func (p Principal) Allows(permission string) bool {
@@ -93,13 +102,39 @@ func newID() string {
 	}
 	return strings.ToUpper(hex.EncodeToString(b))
 }
+
+var (
+	moneyPattern      = regexp.MustCompile(`^[0-9]+(?:\.[0-9]{1,2})?$`)
+	sixDecimalPattern = regexp.MustCompile(`^[0-9]+(?:\.[0-9]{1,6})?$`)
+)
+
 func amount(value string) (string, error) {
-	r, ok := new(big.Rat).SetString(strings.TrimSpace(value))
-	if !ok || r.Sign() <= 0 || r.Denom().Cmp(big.NewInt(100)) > 0 {
+	value = strings.TrimSpace(value)
+	if !moneyPattern.MatchString(value) {
+		return "", fmt.Errorf("%w: amount must be a positive decimal with at most two fractional digits", ErrInvalid)
+	}
+	r, ok := new(big.Rat).SetString(value)
+	if !ok || r.Sign() <= 0 {
 		return "", fmt.Errorf("%w: amount must be a positive decimal with at most two fractional digits", ErrInvalid)
 	}
 	return r.FloatString(2), nil
 }
+
+// nonNegativeAmount 用于允许零金额的发票税额分量，
+// 如零税率或免税行。其他金额入口仍
+// 要求正金额。
+func nonNegativeAmount(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !moneyPattern.MatchString(value) {
+		return "", fmt.Errorf("%w: amount must be a non-negative decimal with at most two fractional digits", ErrInvalid)
+	}
+	r, ok := new(big.Rat).SetString(value)
+	if !ok || r.Sign() < 0 {
+		return "", fmt.Errorf("%w: amount must be a non-negative decimal with at most two fractional digits", ErrInvalid)
+	}
+	return r.FloatString(2), nil
+}
+
 func required(value, name string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -108,9 +143,13 @@ func required(value, name string) (string, error) {
 	return value, nil
 }
 
-// IngestContract stores the original event before creating financial snapshots.
-// Replayed event IDs are successful no-ops; a version that already exists with
-// another event ID is rejected so an old contract update cannot overwrite facts.
+func textTooLong(value string, max int) bool {
+	return len([]rune(strings.TrimSpace(value))) > max
+}
+
+// IngestContract 在创建财务快照前存储原始事件。
+// 重放事件 ID 为成功空操作；若同一版本已存在但属于
+// 其他事件 ID，则拒绝，防止旧合同更新覆盖事实。
 // trustedTenant 是机器令牌验签得到的可信租户（AUD-2026-001）：报文声明的租户
 // 必须与之一致，否则持合法令牌的调用方可声明任意租户写入财务快照与应收计划
 // （对齐 ApplyTaxCallback 的租户一致性校验）。
@@ -166,7 +205,11 @@ func (s *Service) IngestContract(ctx context.Context, source, trustedTenant stri
 	if err = tx.QueryRowContext(ctx, `SELECT current_version FROM settlement_contract_stream WHERE tenant_id=? AND source_application=? AND source_contract_id=? FOR UPDATE`, event.TenantID, source, event.Contract.ID).Scan(&currentVersion); err != nil {
 		return false, err
 	}
-	if event.Contract.Version <= currentVersion {
+	// 首个财务生效事件固定合同财务
+	// 基线。任何后续事件 ID，即使合同版本更新，均为
+	// 修订，不得创建第二份全额应收。精确事件 ID
+	// 重放在上方作为成功重复处理。
+	if currentVersion != 0 {
 		return false, ErrConflict
 	}
 	inboxID := newID()
@@ -226,8 +269,8 @@ type PlanConfirmationInput struct {
 	Reason        string `json:"reason"`
 }
 
-// ConfirmPlan applies the last permitted edits to a pending plan and records
-// both old and new values in the audit outbox before creating the receivable.
+// ConfirmPlan 对待确认计划执行最后允许的编辑，并在创建应收前，
+// 将新旧值一并记录到审计 Outbox。
 func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, in PlanConfirmationInput) error {
 	if in.Version < 1 {
 		return fmt.Errorf("%w: version must be positive", ErrInvalid)
@@ -309,6 +352,9 @@ func (s *Service) CreateReceipt(ctx context.Context, p Principal, key string, in
 	}
 	if in.BankReference, err = required(in.BankReference, "bank_transaction_reference"); err != nil {
 		return "", err
+	}
+	if textTooLong(in.CustomerID, 128) || textTooLong(in.CustomerName, 255) || textTooLong(in.BankReference, 128) {
+		return "", fmt.Errorf("%w: receipt text exceeds the length limit", ErrInvalid)
 	}
 	in.Currency = strings.ToUpper(strings.TrimSpace(in.Currency))
 	if len(in.Currency) != 3 {
@@ -408,29 +454,44 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 		}
 		return "", err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE settlement_receipt SET unallocated_amount=unallocated_amount-?,status=CASE WHEN unallocated_amount-?=0 THEN 'FULLY_ALLOCATED' ELSE 'PARTIALLY_ALLOCATED' END,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=?`, a, a, in.ReceiptID, p.TenantID)
+	receiptRemaining := new(big.Rat).Sub(add(receiptAvailable), add(a))
+	receivableOpenAfter := new(big.Rat).Sub(add(receivableOpen), add(a))
+	receiptStatus := "PARTIALLY_ALLOCATED"
+	if receiptRemaining.Sign() == 0 {
+		receiptStatus = "FULLY_ALLOCATED"
+	}
+	receivableStatus := "PARTIALLY_SETTLED"
+	if receivableOpenAfter.Sign() == 0 {
+		receivableStatus = "SETTLED"
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE settlement_receipt SET unallocated_amount=?,status=?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=?`, receiptRemaining.FloatString(2), receiptStatus, in.ReceiptID, p.TenantID)
 	if err != nil {
 		return "", err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE settlement_receivable SET received_allocated_amount=received_allocated_amount+?,open_amount=open_amount-?,collection_status=CASE WHEN open_amount-?=0 THEN 'SETTLED' ELSE 'PARTIALLY_SETTLED' END,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=?`, a, a, a, in.ReceivableID, p.TenantID)
+	_, err = tx.ExecContext(ctx, `UPDATE settlement_receivable SET open_amount=?,collection_status=?,received_allocated_amount=received_allocated_amount+?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=?`, receivableOpenAfter.FloatString(2), receivableStatus, a, in.ReceivableID, p.TenantID)
 	if err != nil {
 		return "", err
 	}
 	var creditEventID string
 	if receivableOpen == a {
-		creditEventID = newID()
-		payload, marshalErr := json.Marshal(map[string]any{
-			"event_id": creditEventID, "event_type": "customer.credit.payment.completed.v1",
-			"tenant_id": p.TenantID, "payment_id": id, "receipt_id": in.ReceiptID,
-			"allocation_id": id, "customer_id": receivableCustomer, "contract_no": contractNo,
-			"period_no": installment, "due_date": dueDate, "paid_date": receiptDate,
-			"due_amount": receivableOriginal, "paid_amount": a, "source_system": "settlement",
-		})
-		if marshalErr != nil {
-			return "", marshalErr
-		}
-		if err = insertCreditSync(ctx, tx, p.TenantID, creditEventID, id, in.ReceivableID, payload); err != nil {
-			return "", err
+		// CRM 信用使用数字客户 ID、字符串 period_no 及
+		// RFC3339 日期。非 CRM 客户 ID 不创建信用同步
+		// 事件，避免无效载荷污染重试队列。
+		if customerID, parseErr := strconv.ParseUint(strings.TrimSpace(receivableCustomer), 10, 64); parseErr == nil {
+			creditEventID = newID()
+			payload, marshalErr := json.Marshal(map[string]any{
+				"event_id": creditEventID, "event_type": creditEventCompleted,
+				"tenant_id": p.TenantID, "payment_id": id, "receipt_id": in.ReceiptID,
+				"allocation_id": id, "customer_id": customerID, "contract_no": contractNo,
+				"period_no": strconv.Itoa(installment), "due_date": creditDate(dueDate), "paid_date": creditDate(receiptDate),
+				"due_amount": receivableOriginal, "paid_amount": receivableOriginal, "source_system": "settlement",
+			})
+			if marshalErr != nil {
+				return "", marshalErr
+			}
+			if err = insertCreditSync(ctx, tx, p.TenantID, creditEventID, id, in.ReceivableID, payload); err != nil {
+				return "", err
+			}
 		}
 	}
 	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_ALLOCATION_CONFIRMED", "receipt_allocation", id, map[string]any{"actor_id": p.UserID, "receipt_id": in.ReceiptID, "receivable_id": in.ReceivableID, "match_mode": in.MatchMode, "match_confidence": in.MatchConfidence, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
@@ -443,6 +504,14 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 		_ = s.RetryCreditSync(ctx, p.TenantID, creditEventID)
 	}
 	return id, nil
+}
+
+func creditDate(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) == 10 {
+		return value + "T00:00:00Z"
+	}
+	return value
 }
 
 func decimalGreater(left, right string) bool {
