@@ -494,7 +494,7 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 			}
 		}
 	}
-	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_ALLOCATION_CONFIRMED", "receipt_allocation", id, map[string]any{"actor_id": p.UserID, "receipt_id": in.ReceiptID, "receivable_id": in.ReceivableID, "match_mode": in.MatchMode, "match_confidence": in.MatchConfidence, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
+	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_ALLOCATION_CONFIRMED", "receipt_allocation", id, map[string]any{"actor_id": p.UserID, "receipt_id": in.ReceiptID, "receivable_id": in.ReceivableID, "match_mode": in.MatchMode, "match_confidence": in.MatchConfidence, "receivable_status": receivableStatus, "receipt_status": receiptStatus, "receivable_settled": receivableStatus == "SETTLED", "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
 		return "", err
 	}
 	if err = tx.Commit(); err != nil {
