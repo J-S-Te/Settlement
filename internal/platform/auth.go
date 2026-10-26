@@ -139,6 +139,24 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "identity claims invalid", 401)
 		return
 	}
+
+	if strings.TrimSpace(claims.PreferredUsername) == "" {
+		info, profileErr := a.provider.UserInfo(ctx, oauth2.StaticTokenSource(token))
+		if profileErr != nil {
+			http.Error(w, "user profile unavailable", 401)
+			return
+		}
+		var profile struct {
+			Subject  string `json:"sub"`
+			Username string `json:"preferred_username"`
+		}
+		if profileErr = info.Claims(&profile); profileErr != nil || profile.Subject != claims.Subject {
+			http.Error(w, "user profile identity invalid", 401)
+			return
+		}
+		claims.PreferredUsername = strings.TrimSpace(profile.Username)
+	}
+
 	authz, err := a.resolveAuthorization(ctx, token.AccessToken)
 	platformSubjectID, subjectErr := canonicalSubjectID(authz.SubjectID, authz.IdentityID)
 	compatibilityErr := validateSettlementCatalogCompatibility(authz)
@@ -188,6 +206,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (serv
 	if json.Unmarshal(tokenJSON, &token) != nil || !token.Expiry.After(time.Now()) {
 		return service.Principal{}, ErrUnauthenticated
 	}
+
 	authz, err := a.resolveAuthorization(ctx, token.AccessToken)
 	platformSubjectID, subjectErr := canonicalSubjectID(authz.SubjectID, authz.IdentityID)
 	compatibilityErr := validateSettlementCatalogCompatibility(authz)
