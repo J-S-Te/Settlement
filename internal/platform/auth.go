@@ -68,18 +68,34 @@ func NewAuthenticator(ctx context.Context, db *sql.DB, cfg config.Config) (*Auth
 	_ = provider.Claims(&discovery)
 	return &Authenticator{db: db, cfg: cfg, provider: provider, verifier: provider.Verifier(&oidc.Config{ClientID: cfg.OIDCClientID}), client: client, codec: codec, endSession: discovery.EndSession, oauth: oauth2.Config{ClientID: cfg.OIDCClientID, ClientSecret: cfg.OIDCClientSecret, RedirectURL: cfg.OIDCRedirectURI, Endpoint: provider.Endpoint(), Scopes: []string{"openid", "profile"}}}, nil
 }
+
+// Login 用途：创建UTC登录事务并跳转统一身份提供方，避免连接时区改变有效期。
+// 参数：w 为响应，r 为浏览器登录请求。
+// 返回值：无；数据库失败返回503，成功返回登录跳转。
 func (a *Authenticator) Login(w http.ResponseWriter, r *http.Request) {
 	state, _ := random(32)
 	nonce, _ := random(32)
 	verifier := oauth2.GenerateVerifier()
 	now := time.Now().UTC()
-	_, err := a.db.ExecContext(r.Context(), `INSERT INTO settlement_oidc_login_transaction(state_hash,tenant_id,nonce_ciphertext,code_verifier_ciphertext,return_path,expires_at,created_at) VALUES(?,?,?,?,?,?,?)`, digest(state), a.cfg.OIDCTenantID, a.encrypt([]byte(nonce)), a.encrypt([]byte(verifier)), safeReturn(r.URL.Query().Get("return_to")), now.Add(10*time.Minute), now)
+	_, err := a.db.ExecContext(r.Context(), `
+ INSERT INTO settlement_oidc_login_transaction(
+  state_hash,tenant_id,nonce_ciphertext,code_verifier_ciphertext,
+  return_path,expires_at,created_at
+ ) VALUES(?,?,?,?,?,?,?)`,
+		digest(state), a.cfg.OIDCTenantID, a.encrypt([]byte(nonce)), a.encrypt([]byte(verifier)),
+		safeReturn(r.URL.Query().Get("return_to")),
+		oidcSQLTime(now.Add(10*time.Minute)), oidcSQLTime(now),
+	)
 	if err != nil {
 		http.Error(w, "login service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	http.Redirect(w, r, a.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
 }
+
+// Callback 用途：核验OIDC回调并按UTC保存独立会话和令牌有效期。
+// 参数：w 为响应，r 为携带一次性状态与授权码的回调。
+// 返回值：无；校验失败不建立会话，成功设置Cookie并返回业务入口。
 func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 	state, code := strings.TrimSpace(r.URL.Query().Get("state")), strings.TrimSpace(r.URL.Query().Get("code"))
 	if state == "" || code == "" {
@@ -173,7 +189,16 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 	if token.Expiry.Before(expires) {
 		expires = token.Expiry
 	}
-	_, err = tx.ExecContext(r.Context(), `INSERT INTO settlement_oidc_session(session_id_hash,tenant_id,identity_id,principal_json,oauth_token_ciphertext,id_token_ciphertext,authorization_revision,authorization_checked_at,token_expires_at,session_expires_at,created_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, digest(rawSession), p.TenantID, p.UserID, principalJSON, a.encrypt(tokenJSON), a.encrypt([]byte(raw)), authz.AuthorizationRevision, time.Now().UTC(), token.Expiry, expires)
+	_, err = tx.ExecContext(r.Context(), `
+ INSERT INTO settlement_oidc_session(
+  session_id_hash,tenant_id,identity_id,principal_json,oauth_token_ciphertext,
+  id_token_ciphertext,authorization_revision,authorization_checked_at,
+  token_expires_at,session_expires_at,created_at,last_seen_at
+ ) VALUES(?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		digest(rawSession), p.TenantID, p.UserID, principalJSON,
+		a.encrypt(tokenJSON), a.encrypt([]byte(raw)), authz.AuthorizationRevision,
+		oidcSQLTime(time.Now()), oidcSQLTime(token.Expiry), oidcSQLTime(expires),
+	)
 	if err != nil {
 		http.Error(w, "create session failed", 503)
 		return
@@ -185,6 +210,10 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, a.cookie(rawSession, expires))
 	http.Redirect(w, r, "/settlement/"+strings.TrimLeft(returnPath, "/"), http.StatusFound)
 }
+
+// Authenticate 用途：核验独立会话、令牌与当前授权，空闲期限统一使用数据库UTC时钟。
+// 参数：ctx 为请求上下文，r 为携带不透明会话Cookie的请求。
+// 返回值：返回可信业务主体；失效或校验失败返回认证错误。
 func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (service.Principal, error) {
 	cookie, err := r.Cookie(a.cfg.OIDCSessionCookieName)
 	if err != nil || cookie.Value == "" {
@@ -192,9 +221,14 @@ func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (serv
 	}
 	var tenant, identity string
 	var principalJSON, tokenCipher []byte
-	var expires time.Time
-	idleCutoff := time.Now().UTC().Add(-a.cfg.OIDCSessionIdleTTL)
-	err = a.db.QueryRowContext(ctx, `SELECT tenant_id,identity_id,principal_json,oauth_token_ciphertext,session_expires_at FROM settlement_oidc_session WHERE session_id_hash=? AND revoked_at IS NULL AND session_expires_at>UTC_TIMESTAMP(3) AND last_seen_at>?`, digest(cookie.Value), idleCutoff).Scan(&tenant, &identity, &principalJSON, &tokenCipher, &expires)
+	err = a.db.QueryRowContext(ctx, `
+ SELECT tenant_id,identity_id,principal_json,oauth_token_ciphertext
+ FROM settlement_oidc_session
+ WHERE session_id_hash=? AND revoked_at IS NULL
+  AND session_expires_at>UTC_TIMESTAMP(3)
+  AND last_seen_at>DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ? MICROSECOND)`,
+		digest(cookie.Value), a.cfg.OIDCSessionIdleTTL.Microseconds(),
+	).Scan(&tenant, &identity, &principalJSON, &tokenCipher)
 	if err != nil {
 		return service.Principal{}, ErrUnauthenticated
 	}
@@ -415,4 +449,11 @@ func (t *rewriteTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		clone.Host = t.public.Host
 	}
 	return t.base.RoundTrip(clone)
+}
+
+// oidcSQLTime 用途：将安全会话时间写为UTC文本，避免MySQL驱动loc再次转换时区。
+// 参数：value 为登录、授权或会话的真实时间点。
+// 返回值：返回与会话表DATETIME(3)一致的UTC毫秒文本。
+func oidcSQLTime(value time.Time) string {
+	return value.UTC().Format("2006-01-02 15:04:05.000")
 }
