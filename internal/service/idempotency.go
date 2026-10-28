@@ -51,6 +51,7 @@ type InvoiceAllocationInput struct {
 	ReservedAmount string `json:"reserved_amount"`
 }
 type InvoiceRequestInput struct {
+	SpecialReason      string                   `json:"special_reason"`
 	ContractSnapshotID string                   `json:"contract_snapshot_id"`
 	BuyerProfile       map[string]any           `json:"buyer_profile"`
 	InvoiceType        string                   `json:"invoice_type"`

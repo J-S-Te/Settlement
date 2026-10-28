@@ -89,7 +89,7 @@ func TestAuthenticateSessionAcrossMySQLTimezones(t *testing.T) {
 					http.Error(w, "denied", 403)
 					return
 				}
-				json.NewEncoder(w).Encode(authorizationContext{Subject: "op-user", SubjectID: "identity-1", IdentityID: "identity-1", TenantID: "tenant-1", ClientID: "settlement-web", ApplicationCode: "settlement", EnvironmentCode: "prod", CatalogVersion: "2", RoleConfigHash: "settlement-v2-invoice-read", CompatibleCatalogVersions: []string{"2"}, CompatibleRoleConfigHashes: []string{"settlement-v2-invoice-read"}, AuthorizationRevision: 1, Permissions: []string{"settlement.invoice.read"}})
+				json.NewEncoder(w).Encode(authorizationContext{Subject: "op-user", SubjectID: "identity-1", IdentityID: "identity-1", TenantID: "tenant-1", ClientID: "settlement-web", ApplicationCode: "settlement", EnvironmentCode: "prod", CatalogVersion: "3", RoleConfigHash: "settlement-v3-business-roles-scopes", CompatibleCatalogVersions: []string{"3"}, CompatibleRoleConfigHashes: []string{"settlement-v3-business-roles-scopes"}, Roles: []string{"settlement_reviewer"}, DataScopes: []authorizationDataScope{{RoleCode: "settlement_reviewer", ScopeType: "APPLICATION"}}, AuthorizationRevision: 1, Permissions: []string{"settlement.invoice.read"}})
 			}))
 			defer server.Close()
 			block, _ := aes.NewCipher(make([]byte, 32))

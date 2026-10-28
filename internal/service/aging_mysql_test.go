@@ -2,39 +2,30 @@ package service
 
 import (
 	"context"
-	"database/sql"
-	"os"
-	"strings"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
 )
 
+// TestAgingSummaryOnMySQL 用途：在新建隔离schema验证默认五档账龄及按币种汇总。
+// 参数：t为测试上下文，仅接受SETTLEMENT_TEST_DSN的专用测试库。
+// 返回值：无，实际账龄分档或余额异常时测试失败。
 func TestAgingSummaryOnMySQL(t *testing.T) {
-	dsn := strings.TrimSpace(os.Getenv("SETTLEMENT_DUNNING_TEST_MYSQL_DSN"))
-	if dsn == "" {
-		t.Skip("SETTLEMENT_DUNNING_TEST_MYSQL_DSN is required")
-	}
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
+	db, _ := invoiceArchiveMySQL(t)
+	tenant := "tenant-aging"
+	invoice := seedArchiveInvoice(t, db, tenant)
+	var snapshot string
+	if err := db.QueryRow(`SELECT ir.contract_snapshot_id FROM settlement_invoice_request ir JOIN settlement_tax_invoice ti ON ti.invoice_request_id=ir.id AND ti.tenant_id=ir.tenant_id WHERE ti.id=? AND ti.tenant_id=?`, invoice, tenant).Scan(&snapshot); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	for _, q := range []string{
-		`DROP TABLE IF EXISTS settlement_receivable`,
-		`CREATE TABLE settlement_receivable (id CHAR(32) PRIMARY KEY,tenant_id VARCHAR(64) NOT NULL,open_amount DECIMAL(18,2) NOT NULL,currency CHAR(3) NOT NULL,due_date DATE NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-	} {
-		if _, err := db.Exec(q); err != nil {
+	for _, entry := range []struct {
+		days             int
+		amount, currency string
+	}{{10, "50.00", "CNY"}, {70, "100.00", "CNY"}, {100, "20.00", "USD"}, {200, "30.00", "USD"}, {10, "0.00", "CNY"}} {
+		id := newID()
+		if _, err := db.Exec(`INSERT INTO settlement_receivable(id,tenant_id,receivable_no,contract_snapshot_id,due_date,original_amount,open_amount,currency,recognition_status,collection_status,invoice_status,created_at,updated_at) VALUES(?,?,?,?,DATE_SUB(CURDATE(),INTERVAL ? DAY),100,?,?, 'CONFIRMED','UNPAID','NOT_INVOICED',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, tenant, "AR-"+id[:12], snapshot, entry.days, entry.amount, entry.currency); err != nil {
 			t.Fatal(err)
 		}
-	}
-	tenant := "tenant-aging"
-	if _, err := db.Exec(`INSERT INTO settlement_receivable(id,tenant_id,open_amount,currency,due_date) VALUES
-('a1',?,50.00,'CNY',DATE_SUB(CURDATE(),INTERVAL 10 DAY)),
-('a2',?,100.00,'CNY',DATE_SUB(CURDATE(),INTERVAL 70 DAY)),
-('a3',?,20.00,'USD',DATE_SUB(CURDATE(),INTERVAL 100 DAY)),
-('a4',?,0.00,'CNY',DATE_SUB(CURDATE(),INTERVAL 10 DAY))`, tenant, tenant, tenant, tenant); err != nil {
-		t.Fatal(err)
 	}
 	items, err := (&Service{DB: db}).AgingSummary(context.Background(), Principal{TenantID: tenant})
 	if err != nil {
@@ -44,7 +35,7 @@ func TestAgingSummaryOnMySQL(t *testing.T) {
 	for _, item := range items {
 		got[item.Currency+"/"+item.Bucket] = item
 	}
-	if len(items) != 3 || got["CNY/0-30"].Amount != "50.00" || got["CNY/61-90"].Amount != "100.00" || got["USD/90+"].Amount != "20.00" {
+	if len(items) != 4 || got["CNY/0-30"].Amount != "50.00" || got["CNY/61-90"].Amount != "100.00" || got["USD/91-180"].Amount != "20.00" || got["USD/180+"].Amount != "30.00" {
 		t.Fatalf("aging=%+v", items)
 	}
 }

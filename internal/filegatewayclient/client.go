@@ -45,6 +45,12 @@ func New(baseURL string, httpClient *http.Client, token TokenSource) (*Client, e
 }
 
 // Upload 上传结算附件并返回文件 ID；requestID 用于完整请求哈希幂等。
+// Upload 用途：按财务用途上传文件，回单与发票使用独立purpose。
+// 参数：ctx为上下文，requestID为幂等键，applicationID为应用，classification为用途，
+//
+//	name与mediaType为文件元数据，content为文件内容流。
+//
+// 返回值：返回网关文件ID；上传或回执无效时返回错误。
 func (c *Client) Upload(ctx context.Context, requestID, applicationID, classification, name, mediaType string, content io.Reader) (string, error) {
 	if strings.TrimSpace(requestID) == "" || strings.TrimSpace(applicationID) == "" || strings.TrimSpace(name) == "" || content == nil {
 		return "", errors.New("request ID, application ID, file name and content are required")
@@ -56,6 +62,9 @@ func (c *Client) Upload(ctx context.Context, requestID, applicationID, classific
 	switch classificationValue {
 	case "INVOICE_DOCUMENT", "ELECTRONIC_INVOICE":
 		_ = writer.WriteField("purpose", "settlement.invoice.document")
+		classificationValue = "CONFIDENTIAL"
+	case "RECEIPT_DOCUMENT":
+		_ = writer.WriteField("purpose", "settlement.receipt.document")
 		classificationValue = "CONFIDENTIAL"
 	case "REPORT_EXPORT":
 		classificationValue = "INTERNAL"

@@ -7,6 +7,9 @@ import (
 	"strings"
 )
 
+// CompleteDunningAction 用途：核对收件人与现行合同范围后完成催收反馈。
+// 参数：ctx为上下文，p为主体，actionID为动作，version为版本，note为反馈。
+// 返回值：成功无错误；失权、过期状态或存储失败返回错误。
 func (s *Service) CompleteDunningAction(ctx context.Context, p Principal, actionID string, version uint64, note string) error {
 	actionID = strings.TrimSpace(actionID)
 	note = strings.TrimSpace(note)
@@ -29,6 +32,16 @@ func (s *Service) CompleteDunningAction(ctx context.Context, p Principal, action
 	}
 	if recipient != p.UserID && !p.Allows("settlement.admin") {
 		return ErrForbidden
+	}
+	if !p.Unrestricted("settlement.dunning.feedback") {
+		var snapshot string
+		err = tx.QueryRowContext(ctx, `SELECT cs.id FROM settlement_dunning_action da JOIN settlement_dunning_case dc ON dc.id=da.dunning_case_id AND dc.tenant_id=da.tenant_id LEFT JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id LEFT JOIN settlement_receivable_plan rp ON rp.id=dc.plan_id AND rp.tenant_id=dc.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=COALESCE(r.contract_snapshot_id,rp.contract_snapshot_id) AND cs.tenant_id=dc.tenant_id WHERE da.tenant_id=? AND da.id=?`, p.TenantID, actionID).Scan(&snapshot)
+		if err != nil {
+			return ErrNotFound
+		}
+		if err = s.RequireContractAccessTx(ctx, tx, p, "settlement.dunning.feedback", snapshot); err != nil {
+			return err
+		}
 	}
 	if status == "COMPLETED" {
 		return tx.Commit()

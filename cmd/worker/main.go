@@ -23,6 +23,9 @@ import (
 	"golang.org/x/oauth2/clientcredentials"
 )
 
+// main 用途：装配结算投递、导出、回单恢复和负责人提醒消费者。
+// 参数：无，读取专属租户及机器身份配置。
+// 返回值：无，失败记录日志并保留持久任务供重试。
 func main() {
 	dsn := strings.TrimSpace(os.Getenv("SETTLEMENT_MYSQL_DSN"))
 	platform := strings.TrimRight(strings.TrimSpace(os.Getenv("PLATFORM_BASE_URL")), "/")
@@ -131,6 +134,10 @@ func main() {
 		os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_SECRET"),
 		5*time.Second,
 	)
+	roleReminder := &dunning.RoleReminderWorker{DB: db, TenantID: strings.TrimSpace(os.Getenv("OIDC_TENANT_ID")), Service: &service.Service{DB: db}, CheckBusinessLicense: checkBusiness, BatchSize: 50}
+	if directory, ok := scanner.Directory.(dunning.RoleReminderDirectory); ok {
+		roleReminder.Directory = directory
+	}
 	exporter, exportErr := newReportExporter(db, workerID)
 	if exportErr != nil {
 		slog.Error("report export configuration failed", "error", exportErr)
@@ -164,11 +171,15 @@ func main() {
 	if exporter.Gateway != nil {
 		archiveRecovery.Gateway = exporter.Gateway
 	}
+	receiptRecovery := &service.ReceiptArchiveWorker{DB: db, Identity: archiveRecovery.Identity, Gateway: archiveRecovery.Gateway, CheckBusinessLicense: checkBusiness}
 	if exporter.GatewayMode == "dual" || exporter.GatewayMode == "required" {
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
 			for {
+				if err := receiptRecovery.RunOnce(ctx); err != nil && ctx.Err() == nil {
+					slog.Error("receipt archive recovery failed", "error", err)
+				}
 				if err := archiveRecovery.RunOnce(ctx); err != nil && ctx.Err() == nil {
 					slog.Error("invoice archive recovery failed", "error", err)
 				}
@@ -184,6 +195,9 @@ func main() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for {
+			if err := roleReminder.RunOnce(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("contract owner reminders failed", "error", err)
+			}
 			if err := scanner.RunOnce(ctx); err != nil && ctx.Err() == nil {
 				slog.Error("dunning scan failed", "error", err)
 			}

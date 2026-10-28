@@ -45,7 +45,20 @@ func NewPersonnelDirectory(baseURL, clientID, clientSecret string, timeout time.
 	}
 }
 
+// ListCollectors 用途：查询旧催收专员目录。
+// 参数：ctx为上下文，keyword为关键词，page/pageSize为分页。
+// 返回值：有效人员、总数及目录调用错误。
 func (c *HTTPPersonnelDirectory) ListCollectors(ctx context.Context, keyword string, page, pageSize int) ([]Personnel, int64, error) {
+	return c.ListRole(ctx, "settlement_collector", keyword, page, pageSize)
+}
+
+// ListRole 用途：查询指定结算角色的有效人员候选。
+// 参数：ctx为上下文，role为固定结算角色，keyword为查询词，page/pageSize为分页。
+// 返回值：有效人员、总数及目录调用错误。
+func (c *HTTPPersonnelDirectory) ListRole(ctx context.Context, role, keyword string, page, pageSize int) ([]Personnel, int64, error) {
+	if role != "settlement_collector" && role != "settlement_project_assistant" && role != "settlement_sales" && role != "settlement_finance_manager" && role != "settlement_management" {
+		return nil, 0, fmt.Errorf("unsupported personnel role")
+	}
 	if c == nil || c.client == nil {
 		return nil, 0, fmt.Errorf("personnel directory is not configured")
 	}
@@ -60,7 +73,7 @@ func (c *HTTPPersonnelDirectory) ListCollectors(ctx context.Context, keyword str
 		return nil, 0, err
 	}
 	query := url.Values{
-		"role_code": {"settlement_collector"},
+		"role_code": {role},
 		"page":      {strconv.Itoa(page)},
 		"page_size": {strconv.Itoa(pageSize)},
 	}
@@ -98,7 +111,7 @@ func (c *HTTPPersonnelDirectory) ListCollectors(ctx context.Context, keyword str
 		if item.UserID == "" || item.DisplayName == "" {
 			return nil, 0, fmt.Errorf("personnel directory returned incomplete user")
 		}
-		item.Roles = []string{"settlement_collector"}
+		item.Roles = []string{role}
 	}
 	sort.Slice(envelope.Data.Items, func(i, j int) bool {
 		if envelope.Data.Items[i].DisplayName == envelope.Data.Items[j].DisplayName {
@@ -109,7 +122,20 @@ func (c *HTTPPersonnelDirectory) ListCollectors(ctx context.Context, keyword str
 	return envelope.Data.Items, envelope.Data.Total, nil
 }
 
+// ContainsCollector 用途：核验旧催收专员资格。
+// 参数：ctx为上下文，userID为平台用户ID。
+// 返回值：返回有效资格及目录调用错误。
 func (c *HTTPPersonnelDirectory) ContainsCollector(ctx context.Context, userID string) (bool, error) {
+	return c.ContainsRole(ctx, userID, "settlement_collector")
+}
+
+// ContainsRole 用途：按当前有效角色核验结算履职资格。
+// 参数：ctx为上下文，userID为平台用户，role为代码内指定结算角色。
+// 返回值：返回是否具备有效角色；依赖失败不返回可履职。
+func (c *HTTPPersonnelDirectory) ContainsRole(ctx context.Context, userID, role string) (bool, error) {
+	if c == nil || c.client == nil || (role != "settlement_collector" && role != "settlement_sales" && role != "settlement_project_assistant" && role != "settlement_finance_manager" && role != "settlement_management") {
+		return false, fmt.Errorf("unsupported personnel role")
+	}
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		return false, fmt.Errorf("personnel user ID is required")
@@ -118,7 +144,7 @@ func (c *HTTPPersonnelDirectory) ContainsCollector(ctx context.Context, userID s
 	if err != nil {
 		return false, err
 	}
-	query := url.Values{"role_code": {"settlement_collector"}, "user_id": {userID}, "page": {"1"}, "page_size": {"1"}}
+	query := url.Values{"role_code": {role}, "user_id": {userID}, "page": {"1"}, "page_size": {"1"}}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/internal/owner-directory?"+query.Encode(), nil)
 	if err != nil {
 		return false, err

@@ -9,6 +9,9 @@ import (
 
 const createInvoiceRequestCommand = "CREATE_INVOICE_REQUEST"
 
+// CreateInvoiceRequest 创建并冻结开票申请与特殊规则。
+// 参数：ctx 上下文，p 可信主体，key 幂等键，in 开票内容。
+// 返回值：申请标识或校验及持久化错误。
 func (s *Service) CreateInvoiceRequest(ctx context.Context, p Principal, key string, in InvoiceRequestInput) (string, error) {
 	if _, err := required(key, "Idempotency-Key"); err != nil {
 		return "", err
@@ -21,6 +24,9 @@ func (s *Service) CreateInvoiceRequest(ctx context.Context, p Principal, key str
 			textTooLong(item.Specification, 128) || textTooLong(item.Unit, 32) {
 			return "", fmt.Errorf("%w: item %d text exceeds the length limit", ErrInvalid, index+1)
 		}
+	}
+	if textTooLong(in.SpecialReason, 500) {
+		return "", ErrInvalid
 	}
 	buyer, _ := json.Marshal(in.BuyerProfile)
 	normalized, excl, tax, incl, err := normalizeInvoiceItems(in.Items)
@@ -39,11 +45,17 @@ func (s *Service) CreateInvoiceRequest(ctx context.Context, p Principal, key str
 	if allocationTotal.Cmp(incl) != 0 {
 		return "", fmt.Errorf("%w: allocation total must equal invoice total", ErrInvalid)
 	}
+	if !p.Allows("settlement.invoice.request") {
+		return "", ErrForbidden
+	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
+	if err = s.RequireContractAccessTx(ctx, tx, p, "settlement.invoice.request", in.ContractSnapshotID); err != nil {
+		return "", err
+	}
 	id := newID()
 	idempotencyRequest := struct {
 		ContractSnapshotID string                   `json:"contract_snapshot_id"`
@@ -51,7 +63,8 @@ func (s *Service) CreateInvoiceRequest(ctx context.Context, p Principal, key str
 		InvoiceType        string                   `json:"invoice_type"`
 		Items              []InvoiceItemInput       `json:"items"`
 		Allocations        []InvoiceAllocationInput `json:"allocations"`
-	}{in.ContractSnapshotID, buyer, in.InvoiceType, normalized, in.Allocations}
+		SpecialReason      string                   `json:"special_reason"`
+	}{in.ContractSnapshotID, buyer, in.InvoiceType, normalized, in.Allocations, in.SpecialReason}
 	if existing, replay, claimErr := claimIdempotency(ctx, tx, p.TenantID, createInvoiceRequestCommand, key, id, idempotencyRequest); claimErr != nil {
 		return "", claimErr
 	} else if replay {
@@ -63,9 +76,11 @@ func (s *Service) CreateInvoiceRequest(ctx context.Context, p Principal, key str
 	}
 	for _, allocation := range in.Allocations {
 		reserved := allocation.ReservedAmount
-		var available string
-		err = tx.QueryRowContext(ctx, `SELECT original_amount-invoiced_amount-COALESCE((SELECT SUM(reserved_amount-invoiced_amount-released_amount) FROM settlement_invoice_request_allocation a WHERE a.tenant_id=r.tenant_id AND a.receivable_id=r.id AND a.status='RESERVED'),0) FROM settlement_receivable r WHERE r.id=? AND r.tenant_id=? AND r.contract_snapshot_id=? AND r.recognition_status='CONFIRMED' FOR UPDATE`, allocation.ReceivableID, p.TenantID, in.ContractSnapshotID).Scan(&available)
-		if err != nil || decimalGreater(reserved, available) {
+		available, availabilityErr := invoiceAvailableForUpdate(ctx, tx, p.TenantID, in.ContractSnapshotID, allocation.ReceivableID)
+		if availabilityErr != nil {
+			return "", availabilityErr
+		}
+		if decimalGreater(reserved, available) {
 			return "", ErrConflict
 		}
 	}
@@ -91,6 +106,17 @@ func (s *Service) CreateInvoiceRequest(ctx context.Context, p Principal, key str
 		if err != nil {
 			return "", err
 		}
+	}
+	settings, settingsErr := s.loadSettlementSettings(ctx, p.TenantID)
+	if settingsErr != nil {
+		return "", settingsErr
+	}
+	if err = validateConfiguredTaxRates(normalized, settings.TaxRates); err != nil {
+		return "", err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_invoice_special_review(tenant_id,invoice_request_id,special_reason,threshold_snapshot,settings_version,required_review,status) VALUES(?,?,?,?,?,?,'PENDING')`, p.TenantID, id, in.SpecialReason, settings.SpecialInvoiceThreshold, settings.Version, specialInvoiceRequired(incl.FloatString(2), settings.SpecialInvoiceThreshold, in.SpecialReason))
+	if err != nil {
+		return "", err
 	}
 	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_INVOICE_REQUEST_SUBMITTED", "invoice_request", id, map[string]any{"actor_id": p.UserID, "request_id": id, "result": "SUCCESS", "risk_level": "MEDIUM"}); err != nil {
 		return "", err

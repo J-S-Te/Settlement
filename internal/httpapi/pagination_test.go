@@ -46,7 +46,14 @@ func (pageDriver) Open(string) (driver.Conn, error)                   { return n
 func (c *pageConn) Prepare(string) (driver.Stmt, error)               { return nil, errors.New("unexpected prepare") }
 func (c *pageConn) Close() error                                      { return nil }
 func (c *pageConn) Begin() (driver.Tx, error)                         { return nil, errors.New("no transaction expected") }
+
+// QueryContext 用途：校验分页SQL并支持租户唯一设置读取。
+// 参数：上下文为测试请求，q为固定SQL，args为租户和分页绑定参数。
+// 返回值：返回空列表游标，分页契约错误时测试失败。
 func (c *pageConn) QueryContext(_ context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
+	if q == "SELECT settings_json,version FROM settlement_settings WHERE tenant_id=?" {
+		return emptyPageRows{}, nil
+	}
 	c.c.queried = true
 	if !strings.Contains(q, "LIMIT ? OFFSET ?") || !strings.Contains(q, "tenant_id=?") || !strings.Contains(q, "ORDER BY") || !strings.Contains(q, "id") {
 		c.c.t.Fatalf("unbounded/unstable query: %s", q)

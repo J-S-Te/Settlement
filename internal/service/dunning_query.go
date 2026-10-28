@@ -25,16 +25,19 @@ func (s *Service) DunningCoverage(ctx context.Context, p Principal) (DunningCove
 	return out, nil
 }
 
+// AgingSummary 用途：按配置的五档账龄和币种汇总未结清应收。
+// 参数：ctx为上下文，p为可信报表主体。
+// 返回值：返回各币种分档金额和笔数，规则或存储失败返回错误。
 func (s *Service) AgingSummary(ctx context.Context, p Principal) ([]AgingBucket, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT currency,
-		CASE WHEN DATEDIFF(CURDATE(),due_date)<=30 THEN '0-30'
-		     WHEN DATEDIFF(CURDATE(),due_date)<=60 THEN '31-60'
-		     WHEN DATEDIFF(CURDATE(),due_date)<=90 THEN '61-90'
-		     ELSE '90+' END AS bucket,
-		COALESCE(SUM(open_amount),0) AS amount, COUNT(*) AS count
-		FROM settlement_receivable WHERE tenant_id=? AND open_amount>0
-		GROUP BY currency,bucket
-		ORDER BY currency, FIELD(bucket,'0-30','31-60','61-90','90+')`, p.TenantID)
+	days, err := s.AgingDays(ctx, p.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	bucket, err := BuildAgingCase(days, "due_date")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT currency,`+bucket+` AS bucket,COALESCE(SUM(open_amount),0),COUNT(*) FROM settlement_receivable WHERE tenant_id=? AND open_amount>0 GROUP BY currency,bucket ORDER BY currency,MIN(DATEDIFF(UTC_DATE(),due_date))`, p.TenantID)
 	if err != nil {
 		return nil, err
 	}

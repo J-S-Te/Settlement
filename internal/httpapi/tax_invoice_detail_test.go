@@ -48,7 +48,13 @@ func (c *taxDetailConn) Prepare(string) (driver.Stmt, error) {
 func (c *taxDetailConn) Close() error              { return nil }
 func (c *taxDetailConn) Begin() (driver.Tx, error) { return nil, errors.New("no transaction expected") }
 
+// QueryContext 用途：编排详情SQL和默认字段策略的测试边界。
+// 参数：上下文为测试请求，query为SQL，绑定参数由详情fixture确定。
+// 返回值：返回预设持久化结果；未知SQL时测试失败。
 func (c *taxDetailConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if query == "SELECT settings_json,version FROM settlement_settings WHERE tenant_id=?" {
+		return &taxDetailRows{}, nil
+	}
 	for _, step := range c.connector.queries {
 		if strings.Contains(query, step.match) {
 			c.connector.calls[step.match]++

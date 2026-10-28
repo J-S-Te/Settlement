@@ -20,9 +20,13 @@ import (
 	"github.com/j-s-te/settlement/internal/handover"
 	"github.com/j-s-te/settlement/internal/httpapi"
 	"github.com/j-s-te/settlement/internal/platform"
+	"github.com/j-s-te/settlement/internal/projectreference"
 	"golang.org/x/oauth2/clientcredentials"
 )
 
+// main 用途：装配结算API、身份、文件及权威项目引用服务并管理退出。
+// 参数：无，读取经过校验的进程配置。
+// 返回值：无，启动失败通过日志与进程退出报告。
 func main() {
 	licenseCtx, licenseStop := context.WithCancel(context.Background())
 	defer licenseStop()
@@ -140,6 +144,14 @@ func main() {
 			os.Exit(1)
 		}
 		dependencies = append(dependencies, handoverService, handoverMachine)
+	}
+	if cfg.ProjectReferenceURL != "" {
+		projectClient, clientErr := projectreference.New(cfg.ProjectReferenceURL, cfg.ProjectReferenceClientID, cfg.ProjectReferenceClientSecret, cfg.ProjectReferenceTokenURL, 10*time.Second)
+		if clientErr != nil {
+			slog.Error("initialize project reference client", "error", clientErr)
+			os.Exit(1)
+		}
+		dependencies = append(dependencies, projectClient)
 	}
 	server := &http.Server{Addr: cfg.HTTPAddress, Handler: httpapi.New(db, cfg, slog.Default(), auth, machine, taxMachine, dependencies...), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	slog.Info("settlement API started", "address", cfg.HTTPAddress, "development_auth", cfg.DevelopmentAuth)

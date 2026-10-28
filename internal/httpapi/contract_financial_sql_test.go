@@ -35,6 +35,9 @@ import (
 // 使用新建回环测试数据库及真实源 HTTP、工作流、SQL Outbox
 // 产物。浏览器 OIDC 会话和授权服务器为夹具；
 // 接收 API、生产机器校验器及财务事务均为真实实现。
+// TestApprovedContractFinancialEventIngestConfirmSQL 用途：核验已批准源事件与当前目录的真实入站SQL。
+// 参数：t为隔离上下文，需显式源产物及测试库。
+// 返回值：无，鉴权或财务结果不满足时失败。
 func TestApprovedContractFinancialEventIngestConfirmSQL(t *testing.T) {
 	dsn := os.Getenv("SETTLEMENT_TEST_DSN")
 	artifact := os.Getenv("CONTRACT_APPROVED_FINANCIAL_EVENT_INPUT")
@@ -129,7 +132,7 @@ func TestApprovedContractFinancialEventIngestConfirmSQL(t *testing.T) {
 		if token == "foreign" {
 			tenant += "-foreign"
 		}
-		json.NewEncoder(w).Encode(map[string]any{"sub": "qa-oidc-sub", "subject_id": "qa-finance", "identity_id": "qa-finance", "tenant_id": tenant, "client_id": c.OIDCClientID, "application_code": "settlement", "environment_code": "prod", "permissions": permission, "catalog_version": "2", "compatible_catalog_versions": []string{"2"}, "role_config_hash": "settlement-v2-invoice-read", "compatible_role_config_hashes": []string{"settlement-v2-invoice-read"}, "authorization_revision": 1})
+		json.NewEncoder(w).Encode(map[string]any{"sub": "qa-oidc-sub", "subject_id": "qa-finance", "identity_id": "qa-finance", "tenant_id": tenant, "client_id": c.OIDCClientID, "application_code": "settlement", "environment_code": "prod", "permissions": permission, "catalog_version": "3", "compatible_catalog_versions": []string{"3"}, "role_config_hash": "settlement-v3-business-roles-scopes", "compatible_role_config_hashes": []string{"settlement-v3-business-roles-scopes"}, "roles": []string{"settlement_accountant"}, "data_scopes": []map[string]string{{"role_code": "settlement_accountant", "scope_type": "APPLICATION"}}, "authorization_revision": 1})
 	}))
 	defer fixture.Close()
 	c.PlatformBaseURL = fixture.URL
