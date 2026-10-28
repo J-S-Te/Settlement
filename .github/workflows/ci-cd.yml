@@ -16,6 +16,19 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      oidc-test-mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: isolated-oidc-ci
+          MYSQL_DATABASE: settlement_e2e
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pisolated-oidc-ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -23,6 +36,11 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - run: go test ./...
+      - name: Verify OIDC session expiry across MySQL connection timezones
+        env:
+          # 仅连接本作业独占的临时服务；测试按时区创建/删除独占schema。
+          SETTLEMENT_E2E_TEST_DSN: root:isolated-oidc-ci@tcp(127.0.0.1:3306)/settlement_e2e?parseTime=true
+        run: go test ./internal/platform -run '^TestAuthenticateSessionAcrossMySQLTimezones$' -count=1 -v
       - run: go vet ./...
       # CI 构建范围须与不可变运行时镜像及远程部署契约
       # 实际执行的二进制程序保持一致。
