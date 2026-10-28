@@ -1,27 +1,397 @@
 {
-  "catalog_version": "2",
-  "claims_role_config_hash": "settlement-v2-invoice-read",
-  "policy": {"max_effective_roles": 12},
+  "catalog_version": "3",
+  "claims_role_config_hash": "settlement-v3-business-roles-scopes",
+  "policy": {
+    "max_effective_roles": 12
+  },
   "permissions": [
-    {"code":"settlement.receivable.read","name":"查看应收","action":"read","resource_code":"receivable","resource_name":"应收","risk_level":"LOW"},
-    {"code":"settlement.receivable.confirm","name":"确认应收计划","action":"confirm","resource_code":"receivable","resource_name":"应收","risk_level":"HIGH"},
-    {"code":"settlement.receipt.record","name":"登记回款","action":"record","resource_code":"receipt","resource_name":"回款","risk_level":"MEDIUM"},
-    {"code":"settlement.allocation.confirm","name":"确认回款核销","action":"confirm","resource_code":"allocation","resource_name":"核销","risk_level":"HIGH"},
-    {"code":"settlement.allocation.reverse","name":"审批核销冲销","action":"reverse","resource_code":"allocation","resource_name":"核销","risk_level":"HIGH"},
-    {"code":"settlement.invoice.read","name":"查看开票申请与发票","action":"read","resource_code":"invoice","resource_name":"发票","risk_level":"LOW"},
-    {"code":"settlement.invoice.request","name":"提交开票申请","action":"request","resource_code":"invoice","resource_name":"发票","risk_level":"MEDIUM"},
-    {"code":"settlement.invoice.approve","name":"审批开票申请","action":"approve","resource_code":"invoice","resource_name":"发票","risk_level":"HIGH"},
-    {"code":"settlement.invoice.issue","name":"登记及开具发票","action":"issue","resource_code":"invoice","resource_name":"发票","risk_level":"HIGH"},
-    {"code":"settlement.dunning.manage","name":"管理催收策略与案件","action":"manage","resource_code":"dunning","resource_name":"催收","risk_level":"HIGH"},
-    {"code":"settlement.report.read","name":"查看结算报表","action":"read","resource_code":"report","resource_name":"结算报表","risk_level":"LOW"},
-    {"code":"settlement.report.export","name":"导出结算报表","action":"export","resource_code":"report","resource_name":"结算报表","risk_level":"MEDIUM"},
-    {"code":"settlement.notification.read","name":"查看个人结算通知","action":"read","resource_code":"notification","resource_name":"站内通知","risk_level":"LOW"},
-    {"code":"settlement.credit.resend","name":"重发信用同步事件","action":"resend","resource_code":"credit_sync","resource_name":"信用同步","risk_level":"HIGH"}
+    {
+      "code": "settlement.receivable.read",
+      "name": "查看应收",
+      "action": "read",
+      "resource_code": "receivable",
+      "resource_name": "应收",
+      "risk_level": "LOW"
+    },
+    {
+      "code": "settlement.receivable.confirm",
+      "name": "确认应收计划",
+      "action": "confirm",
+      "resource_code": "receivable",
+      "resource_name": "应收",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.receipt.record",
+      "name": "登记回款",
+      "action": "record",
+      "resource_code": "receipt",
+      "resource_name": "回款",
+      "risk_level": "MEDIUM"
+    },
+    {
+      "code": "settlement.allocation.confirm",
+      "name": "确认回款核销",
+      "action": "confirm",
+      "resource_code": "allocation",
+      "resource_name": "核销",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.allocation.reverse",
+      "name": "审批核销冲销",
+      "action": "reverse",
+      "resource_code": "allocation",
+      "resource_name": "核销",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.invoice.read",
+      "name": "查看开票申请与发票",
+      "action": "read",
+      "resource_code": "invoice",
+      "resource_name": "发票",
+      "risk_level": "LOW"
+    },
+    {
+      "code": "settlement.invoice.request",
+      "name": "提交开票申请",
+      "action": "request",
+      "resource_code": "invoice",
+      "resource_name": "发票",
+      "risk_level": "MEDIUM"
+    },
+    {
+      "code": "settlement.invoice.approve",
+      "name": "审批开票申请",
+      "action": "approve",
+      "resource_code": "invoice",
+      "resource_name": "发票",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.invoice.issue",
+      "name": "登记及开具发票",
+      "action": "issue",
+      "resource_code": "invoice",
+      "resource_name": "发票",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.dunning.manage",
+      "name": "管理催收策略与案件",
+      "action": "manage",
+      "resource_code": "dunning",
+      "resource_name": "催收",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.report.read",
+      "name": "查看结算报表",
+      "action": "read",
+      "resource_code": "report",
+      "resource_name": "结算报表",
+      "risk_level": "LOW"
+    },
+    {
+      "code": "settlement.report.export",
+      "name": "导出结算报表",
+      "action": "export",
+      "resource_code": "report",
+      "resource_name": "结算报表",
+      "risk_level": "MEDIUM"
+    },
+    {
+      "code": "settlement.notification.read",
+      "name": "查看个人结算通知",
+      "action": "read",
+      "resource_code": "notification",
+      "resource_name": "站内通知",
+      "risk_level": "LOW"
+    },
+    {
+      "code": "settlement.credit.resend",
+      "name": "重发信用同步事件",
+      "action": "resend",
+      "resource_code": "credit_sync",
+      "resource_name": "信用同步",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.receivable.create",
+      "name": "人工创建收款计划",
+      "action": "create",
+      "resource_code": "receivable",
+      "resource_name": "人工创建收款计划",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.receivable.adjust",
+      "name": "调整已确认收款计划",
+      "action": "adjust",
+      "resource_code": "receivable",
+      "resource_name": "调整已确认收款计划",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.receipt.read",
+      "name": "查看财务回款",
+      "action": "read",
+      "resource_code": "receipt",
+      "resource_name": "查看财务回款",
+      "risk_level": "LOW"
+    },
+    {
+      "code": "settlement.allocation.read",
+      "name": "查看核销记录",
+      "action": "read",
+      "resource_code": "allocation",
+      "resource_name": "查看核销记录",
+      "risk_level": "LOW"
+    },
+    {
+      "code": "settlement.dunning.read",
+      "name": "查看本人范围催收",
+      "action": "read",
+      "resource_code": "dunning",
+      "resource_name": "查看本人范围催收",
+      "risk_level": "LOW"
+    },
+    {
+      "code": "settlement.dunning.feedback",
+      "name": "反馈催收结果",
+      "action": "feedback",
+      "resource_code": "dunning",
+      "resource_name": "反馈催收结果",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.settings.manage",
+      "name": "维护结算配置",
+      "action": "manage",
+      "resource_code": "settings",
+      "resource_name": "维护结算配置",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.collaboration.read",
+      "name": "查看项目协作范围",
+      "action": "read",
+      "resource_code": "collaboration",
+      "resource_name": "查看项目协作范围",
+      "risk_level": "LOW"
+    },
+    {
+      "code": "settlement.collaboration.manage",
+      "name": "分配项目协作责任",
+      "action": "manage",
+      "resource_code": "collaboration",
+      "resource_name": "分配项目协作责任",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.mapping.manage",
+      "name": "维护负责项目映射",
+      "action": "manage",
+      "resource_code": "mapping",
+      "resource_name": "维护负责项目映射",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.invoice.special_approve",
+      "name": "特殊开票加签",
+      "action": "special_approve",
+      "resource_code": "invoice",
+      "resource_name": "特殊开票加签",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.difference.manage",
+      "name": "登记处置收款差异",
+      "action": "manage",
+      "resource_code": "difference",
+      "resource_name": "登记处置收款差异",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.difference.approve",
+      "name": "审批收款差异处置",
+      "action": "approve",
+      "resource_code": "difference",
+      "resource_name": "审批收款差异处置",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.voucher.manage",
+      "name": "生成回传收款凭证",
+      "action": "manage",
+      "resource_code": "voucher",
+      "resource_name": "生成回传收款凭证",
+      "risk_level": "HIGH"
+    }
   ],
   "roles": [
-    {"code":"settlement_admin","name":"结算系统管理员","permissions":["settlement.receivable.read","settlement.receivable.confirm","settlement.receipt.record","settlement.allocation.confirm","settlement.allocation.reverse","settlement.invoice.read","settlement.invoice.request","settlement.invoice.approve","settlement.invoice.issue","settlement.dunning.manage","settlement.report.read","settlement.report.export","settlement.notification.read","settlement.credit.resend"]},
-    {"code":"settlement_accountant","name":"结算会计","permissions":["settlement.receivable.read","settlement.receivable.confirm","settlement.receipt.record","settlement.allocation.confirm","settlement.invoice.read","settlement.invoice.request","settlement.report.read","settlement.report.export","settlement.notification.read"]},
-    {"code":"settlement_reviewer","name":"结算复核员","permissions":["settlement.receivable.read","settlement.allocation.reverse","settlement.invoice.read","settlement.invoice.approve","settlement.invoice.issue","settlement.report.read","settlement.report.export","settlement.notification.read"]},
-    {"code":"settlement_collector","name":"催收专员","permissions":["settlement.receivable.read","settlement.dunning.manage","settlement.report.read","settlement.notification.read"]}
+    {
+      "code": "settlement_admin",
+      "name": "结算系统管理员",
+      "permissions": [
+        "settlement.receivable.read",
+        "settlement.receivable.confirm",
+        "settlement.receipt.record",
+        "settlement.allocation.confirm",
+        "settlement.allocation.reverse",
+        "settlement.invoice.read",
+        "settlement.invoice.request",
+        "settlement.invoice.approve",
+        "settlement.invoice.issue",
+        "settlement.dunning.manage",
+        "settlement.report.read",
+        "settlement.report.export",
+        "settlement.notification.read",
+        "settlement.credit.resend",
+        "settlement.receivable.create",
+        "settlement.receivable.adjust",
+        "settlement.receipt.read",
+        "settlement.allocation.read",
+        "settlement.dunning.read",
+        "settlement.dunning.feedback",
+        "settlement.settings.manage",
+        "settlement.collaboration.read",
+        "settlement.collaboration.manage",
+        "settlement.mapping.manage",
+        "settlement.invoice.special_approve",
+        "settlement.difference.manage",
+        "settlement.difference.approve",
+        "settlement.voucher.manage"
+      ]
+    },
+    {
+      "code": "settlement_accountant",
+      "name": "结算会计",
+      "permissions": [
+        "settlement.receivable.read",
+        "settlement.receivable.confirm",
+        "settlement.receipt.record",
+        "settlement.allocation.confirm",
+        "settlement.invoice.read",
+        "settlement.invoice.request",
+        "settlement.report.read",
+        "settlement.report.export",
+        "settlement.notification.read",
+        "settlement.invoice.issue",
+        "settlement.receipt.read",
+        "settlement.allocation.read",
+        "settlement.difference.manage",
+        "settlement.voucher.manage"
+      ]
+    },
+    {
+      "code": "settlement_reviewer",
+      "name": "结算复核员",
+      "permissions": [
+        "settlement.receivable.read",
+        "settlement.allocation.reverse",
+        "settlement.invoice.read",
+        "settlement.invoice.approve",
+        "settlement.invoice.issue",
+        "settlement.report.read",
+        "settlement.report.export",
+        "settlement.notification.read"
+      ]
+    },
+    {
+      "code": "settlement_collector",
+      "name": "催收专员",
+      "permissions": [
+        "settlement.receivable.read",
+        "settlement.dunning.manage",
+        "settlement.report.read",
+        "settlement.notification.read",
+        "settlement.dunning.read",
+        "settlement.dunning.feedback"
+      ]
+    },
+    {
+      "code": "settlement_sales",
+      "name": "销售/客户经理",
+      "permissions": [
+        "settlement.receivable.read",
+        "settlement.receivable.confirm",
+        "settlement.receivable.create",
+        "settlement.receivable.adjust",
+        "settlement.invoice.read",
+        "settlement.invoice.request",
+        "settlement.dunning.read",
+        "settlement.dunning.feedback",
+        "settlement.notification.read",
+        "settlement.collaboration.read"
+      ]
+    },
+    {
+      "code": "settlement_project_assistant",
+      "name": "项目助理",
+      "permissions": [
+        "settlement.receivable.read",
+        "settlement.invoice.read",
+        "settlement.invoice.request",
+        "settlement.notification.read",
+        "settlement.collaboration.read",
+        "settlement.mapping.manage"
+      ]
+    },
+    {
+      "code": "settlement_finance_manager",
+      "name": "财务经理",
+      "permissions": [
+        "settlement.receivable.read",
+        "settlement.receivable.confirm",
+        "settlement.receivable.create",
+        "settlement.receivable.adjust",
+        "settlement.receipt.read",
+        "settlement.allocation.read",
+        "settlement.allocation.reverse",
+        "settlement.invoice.read",
+        "settlement.invoice.approve",
+        "settlement.dunning.read",
+        "settlement.dunning.manage",
+        "settlement.dunning.feedback",
+        "settlement.report.read",
+        "settlement.report.export",
+        "settlement.notification.read",
+        "settlement.settings.manage",
+        "settlement.collaboration.read",
+        "settlement.collaboration.manage",
+        "settlement.mapping.manage",
+        "settlement.difference.manage",
+        "settlement.difference.approve",
+        "settlement.voucher.manage"
+      ]
+    },
+    {
+      "code": "settlement_sales_director",
+      "name": "销售总监",
+      "permissions": [
+        "settlement.invoice.read",
+        "settlement.invoice.special_approve",
+        "settlement.report.read",
+        "settlement.notification.read"
+      ]
+    },
+    {
+      "code": "settlement_management",
+      "name": "管理层",
+      "permissions": [
+        "settlement.report.read",
+        "settlement.notification.read"
+      ]
+    },
+    {
+      "code": "settlement_system_admin",
+      "name": "结算配置管理员",
+      "permissions": [
+        "settlement.settings.manage",
+        "settlement.notification.read"
+      ]
+    }
   ]
 }

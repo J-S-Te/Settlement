@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"errors"
+	"github.com/j-s-te/settlement/internal/service"
 	"io"
 	"strings"
 	"time"
@@ -124,8 +125,19 @@ func (w *Worker) csv(ctx context.Context, tenantID string) ([]byte, error) {
 	return buffer.Bytes(), nil
 }
 
+// agingCSV 用途：按实际租户账龄规则生成可追溯CSV。
+// 参数：ctx为任务上下文，tenantID为部署绑定租户。
+// 返回值：返回CSV字节；规则、账务读取或编码失败时返回错误。
 func (w *Worker) agingCSV(ctx context.Context, tenantID string) ([]byte, error) {
-	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,GREATEST(TIMESTAMPDIFF(DAY,r.due_date,UTC_DATE()),0),CASE WHEN r.due_date>=UTC_DATE() OR TIMESTAMPDIFF(DAY,r.due_date,UTC_DATE())<=30 THEN '0-30' WHEN TIMESTAMPDIFF(DAY,r.due_date,UTC_DATE())<=60 THEN '31-60' WHEN TIMESTAMPDIFF(DAY,r.due_date,UTC_DATE())<=90 THEN '61-90' ELSE '90+' END,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY r.due_date ASC,r.id ASC LIMIT 10000`, tenantID)
+	days, rulesErr := (&service.Service{DB: w.DB}).AgingDays(ctx, tenantID)
+	if rulesErr != nil {
+		return nil, rulesErr
+	}
+	bucket, rulesErr := service.BuildAgingCase(days, "r.due_date")
+	if rulesErr != nil {
+		return nil, rulesErr
+	}
+	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,GREATEST(TIMESTAMPDIFF(DAY,r.due_date,UTC_DATE()),0),`+bucket+`,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY r.due_date ASC,r.id ASC LIMIT 10000`, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +160,10 @@ func (w *Worker) agingCSV(ctx context.Context, tenantID string) ([]byte, error) 
 		for i := range values {
 			values[i] = safeCell(values[i])
 		}
-		values[8] = map[string]string{"0-30": "0–30 天", "31-60": "31–60 天", "61-90": "61–90 天", "90+": "90 天以上"}[values[8]]
+		values[8] = strings.ReplaceAll(values[8], "-", "–") + " 天"
+		if strings.Contains(values[8], "+") {
+			values[8] = strings.ReplaceAll(values[8], "+ 天", " 天以上")
+		}
 		values[9] = collectionStatusLabel(values[9])
 		values[10] = invoiceStatusLabel(values[10])
 		if err := writer.Write(values[:]); err != nil {

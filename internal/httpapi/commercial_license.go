@@ -18,6 +18,9 @@ func (a *API) checkInvoiceArchiveLicense(ctx context.Context) error {
 	return a.commercial.Check(ctx, core.MUTATE_BUSINESS)
 }
 
+// commercialOperation 用途：为实际历史读取、下载与新业务写入确定许可操作。
+// 参数：method为HTTP方法，path为代码内匹配的API路径。
+// 返回值：返回对应许可类别；未知路径继续按业务变更处理。
 func commercialOperation(method, path string) core.Operation {
 	if method == http.MethodOptions {
 		return core.ESSENTIAL_SERVICE
@@ -28,6 +31,19 @@ func commercialOperation(method, path string) core.Operation {
 		}
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if method == http.MethodGet {
+		for _, known := range []string{"/api/v1/contract-references", "/api/v1/project-assignments", "/api/v1/settings", "/api/v1/receipt-differences", "/api/v1/accounting-vouchers"} {
+			if path == known {
+				return core.READ_HISTORY
+			}
+		}
+		if len(parts) == 5 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "receipts" && parts[3] != "" && parts[4] == "documents" {
+			return core.READ_HISTORY
+		}
+		if len(parts) == 7 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "receipts" && parts[3] != "" && parts[4] == "documents" && parts[5] != "" && parts[6] == "download" {
+			return core.EXPORT_HISTORY
+		}
+	}
 	if len(parts) == 5 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "notifications" && parts[4] == "read" && method == http.MethodPost {
 		return core.ESSENTIAL_SERVICE
 	}

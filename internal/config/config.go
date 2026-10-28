@@ -15,22 +15,26 @@ import (
 // API 为独立子系统，不得复用其他应用的数据库、
 // 浏览器 Cookie 或机器客户端凭据。
 type Config struct {
-	HTTPAddress            string
-	MySQLDSN               string
-	DevelopmentAuth        bool
-	IntegrationEnabled     bool
-	IntegrationBearerToken string
-	OutboxWorkerEnabled    bool
-	OutboxWorkerBatchSize  int
-	PlatformBaseURL        string
-	OIDCIssuer             string
-	OIDCBackchannelBaseURL string
-	OIDCClientID           string
-	OIDCClientSecret       string
-	OIDCRedirectURI        string
-	OIDCPostLogoutURI      string
-	OIDCTenantID           string
-	OIDCEnvironmentCode    string
+	ProjectReferenceURL          string
+	ProjectReferenceTokenURL     string
+	ProjectReferenceClientID     string
+	ProjectReferenceClientSecret string
+	HTTPAddress                  string
+	MySQLDSN                     string
+	DevelopmentAuth              bool
+	IntegrationEnabled           bool
+	IntegrationBearerToken       string
+	OutboxWorkerEnabled          bool
+	OutboxWorkerBatchSize        int
+	PlatformBaseURL              string
+	OIDCIssuer                   string
+	OIDCBackchannelBaseURL       string
+	OIDCClientID                 string
+	OIDCClientSecret             string
+	OIDCRedirectURI              string
+	OIDCPostLogoutURI            string
+	OIDCTenantID                 string
+	OIDCEnvironmentCode          string
 	// TrustedProxies 是唯一允许采信转发头的直接对端（AUD-IP-2026，默认仅回环）。
 	TrustedProxies                    []netip.Prefix
 	OIDCSessionCookieName             string
@@ -78,16 +82,23 @@ type Config struct {
 	OIDCSessionAbsoluteTTL         time.Duration
 }
 
+// Load 用途：读取并校验结算启动配置，拒绝不完整的项目引用机器身份。
+// 参数：无，从进程环境读取配置。
+// 返回值：返回经校验配置及配置错误，不输出凭据。
 func Load() (Config, error) {
 	trustedProxies, trustedErr := parseTrustedProxies(env("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128"))
 	if trustedErr != nil {
 		return Config{}, fmt.Errorf("APP_TRUSTED_PROXIES: %w", trustedErr)
 	}
 	c := Config{
-		HTTPAddress:            env("SETTLEMENT_HTTP_ADDR", ":8085"),
-		MySQLDSN:               strings.TrimSpace(os.Getenv("SETTLEMENT_MYSQL_DSN")),
-		IntegrationBearerToken: strings.TrimSpace(os.Getenv("SETTLEMENT_INTEGRATION_BEARER_TOKEN")),
-		PlatformBaseURL:        strings.TrimSpace(os.Getenv("PLATFORM_BASE_URL")), OIDCIssuer: strings.TrimSpace(os.Getenv("OIDC_ISSUER")), OIDCBackchannelBaseURL: strings.TrimSpace(os.Getenv("OIDC_BACKCHANNEL_BASE_URL")),
+		ProjectReferenceURL:          strings.TrimSpace(os.Getenv("SETTLEMENT_PROJECT_REFERENCE_URL")),
+		ProjectReferenceTokenURL:     strings.TrimSpace(os.Getenv("SETTLEMENT_PROJECT_REFERENCE_TOKEN_URL")),
+		ProjectReferenceClientID:     strings.TrimSpace(os.Getenv("SETTLEMENT_PROJECT_REFERENCE_CLIENT_ID")),
+		ProjectReferenceClientSecret: os.Getenv("SETTLEMENT_PROJECT_REFERENCE_CLIENT_SECRET"),
+		HTTPAddress:                  env("SETTLEMENT_HTTP_ADDR", ":8085"),
+		MySQLDSN:                     strings.TrimSpace(os.Getenv("SETTLEMENT_MYSQL_DSN")),
+		IntegrationBearerToken:       strings.TrimSpace(os.Getenv("SETTLEMENT_INTEGRATION_BEARER_TOKEN")),
+		PlatformBaseURL:              strings.TrimSpace(os.Getenv("PLATFORM_BASE_URL")), OIDCIssuer: strings.TrimSpace(os.Getenv("OIDC_ISSUER")), OIDCBackchannelBaseURL: strings.TrimSpace(os.Getenv("OIDC_BACKCHANNEL_BASE_URL")),
 		OIDCClientID: strings.TrimSpace(os.Getenv("OIDC_CLIENT_ID")), OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"), OIDCRedirectURI: strings.TrimSpace(os.Getenv("OIDC_REDIRECT_URI")), OIDCPostLogoutURI: strings.TrimSpace(os.Getenv("OIDC_POST_LOGOUT_REDIRECT_URI")),
 		OIDCTenantID: strings.TrimSpace(os.Getenv("OIDC_TENANT_ID")), OIDCEnvironmentCode: env("PLATFORM_ENVIRONMENT_CODE", "dev"),
 		TrustedProxies: trustedProxies, OIDCSessionCookieName: env("OIDC_SESSION_COOKIE_NAME", "settlement_session"),
@@ -122,6 +133,11 @@ func Load() (Config, error) {
 		FileGatewayApplicationID: strings.TrimSpace(os.Getenv("SETTLEMENT_FILE_GATEWAY_APPLICATION_ID")),
 		InvoiceIssuanceMode:      strings.ToLower(env("SETTLEMENT_INVOICE_ISSUANCE_MODE", "manual")),
 		PublicOrigin:             env("SETTLEMENT_PUBLIC_ORIGIN", "http://localhost:5173"),
+	}
+	if c.ProjectReferenceURL != "" || c.ProjectReferenceClientID != "" || c.ProjectReferenceClientSecret != "" || c.ProjectReferenceTokenURL != "" {
+		if c.ProjectReferenceURL == "" || c.ProjectReferenceClientID == "" || c.ProjectReferenceClientSecret == "" || c.ProjectReferenceTokenURL == "" {
+			return c, fmt.Errorf("project reference OAuth configuration is incomplete")
+		}
 	}
 	var err error
 	if c.DevelopmentAuth, err = boolEnv("SETTLEMENT_DEVELOPMENT_AUTH", false); err != nil {

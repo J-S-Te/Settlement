@@ -30,6 +30,9 @@ import (
 // 或专用 Settlement 数据库运行：
 //
 // SETTLEMENT_E2E_TEST=1 SETTLEMENT_E2E_TEST_DSN='...' go test ./integration -v
+// TestInvoiceFlow 用途：在显式隔离环境验证发票与核销流程。
+// 参数：t为测试上下文，外部条件由测试环境显式提供。
+// 返回值：无，财务状态或接口契约不满足时测试失败。
 func TestInvoiceFlow(t *testing.T) {
 	if os.Getenv("SETTLEMENT_E2E_TEST") != "1" {
 		t.Skip("set SETTLEMENT_E2E_TEST=1 to run the database-backed business flow")
@@ -70,6 +73,7 @@ func TestInvoiceFlow(t *testing.T) {
 	event.Aggregate.ID = contractID
 	event.Aggregate.Version = 1
 	event.Contract = struct {
+		OwnerUserID  string                `json:"owner_user_id"`
 		ID           string                `json:"id"`
 		No           string                `json:"no"`
 		Version      int                   `json:"version"`

@@ -48,7 +48,12 @@ type InvoiceFileGateway interface {
 	Download(context.Context, string) ([]byte, error)
 }
 
+// New 用途：按结算权限、责任范围和错误契约处理请求。
+// 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
+// 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
 func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Authenticator, machine, taxMachine *platform.ServiceTokenVerifier, dependencies ...any) http.Handler {
+	var erp service.ERPProvider
+	var projectReferences service.ProjectReferenceResolver
 	var directory platform.PersonnelDirectory
 	var publisher service.CreditEventPublisher
 	var files InvoiceFileGateway
@@ -56,6 +61,12 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 	var handoverService *handover.Service
 	var handoverMachine handoverVerifier
 	for _, dependency := range dependencies {
+		if value, ok := dependency.(service.ERPProvider); ok {
+			erp = value
+		}
+		if value, ok := dependency.(service.ProjectReferenceResolver); ok {
+			projectReferences = value
+		}
 		if value, ok := dependency.(*handover.Service); ok {
 			handoverService = value
 		}
@@ -76,6 +87,11 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 		}
 	}
 	api := &API{service: &service.Service{DB: db, CreditPublisher: publisher, InvoiceIssuanceMode: cfg.InvoiceIssuanceMode, TaxProviderCode: cfg.TaxProviderCode}, cfg: cfg, logger: logger, auth: auth, machine: machine, taxMachine: taxMachine, directory: directory, files: files}
+	api.service.ERPProvider = erp
+	api.service.ProjectReferences = projectReferences
+	if roles, ok := directory.(service.RoleDirectory); ok {
+		api.service.RoleDirectory = roles
+	}
 	api.commercial = commercial
 	api.service.CheckInvoiceArchiveLicense = api.checkInvoiceArchiveLicense
 	if handoverService != nil && handoverMachine != nil {
@@ -124,6 +140,9 @@ func (a *API) csrfWriteAllowed(r *http.Request) bool {
 	return true
 }
 
+// ServeHTTP 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
 	if requestID == "" {
@@ -147,6 +166,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusForbidden, "SETTLEMENT_CSRF_REJECTED", "写请求来源校验失败")
 			return
 		}
+	}
+	if a.serveRoleFinance(w, r) || a.serveRoleCollaboration(w, r) {
+		return
 	}
 	switch {
 	case r.URL.Path == "/healthz":
@@ -464,6 +486,10 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	}
 	a.auth.Login(w, r)
 }
+
+// me 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) me(w http.ResponseWriter, r *http.Request) {
 	p, err := a.principal(r)
 	if err != nil {
@@ -484,6 +510,7 @@ func (a *API) me(w http.ResponseWriter, r *http.Request) {
 		"tenant_id": p.TenantID, "user_id": p.UserID, "identity_id": p.IdentityID,
 		"person_id": p.PersonID, "name": p.DisplayName, "preferred_username": p.Username,
 		"permissions": permissions, "catalog_version": p.CatalogVersion,
+		"roles": p.Roles, "data_scopes": p.DataScopes,
 		"authorization_revision": p.AuthorizationRevision,
 	})
 }
@@ -688,6 +715,9 @@ func (a *API) retryOutboxEvent(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]string{"id": id, "status": "PENDING"})
 }
 
+// agingSummary 用途：按结算权限、责任范围和错误契约处理请求。
+// 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
+// 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
 func (a *API) agingSummary(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.report.read")
 	if !ok {
@@ -698,7 +728,12 @@ func (a *API) agingSummary(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
-	write(w, http.StatusOK, map[string]any{"items": items})
+	days, err := a.service.AgingDays(r.Context(), p.TenantID)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"items": items, "aging_days": days})
 }
 
 func (a *API) invoicedReceivablesTop10(w http.ResponseWriter, r *http.Request) {
@@ -828,6 +863,10 @@ func newRequestID() string {
 	_, _ = rand.Read(b)
 	return strings.ToUpper(hex.EncodeToString(b))
 }
+
+// listPlans 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.receivable.read")
 	if !ok {
@@ -838,7 +877,7 @@ func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.tenant_id=? ORDER BY rp.due_date ASC,rp.id ASC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.receivable.read", `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.tenant_id=? ORDER BY rp.due_date ASC,rp.id ASC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -860,12 +899,19 @@ func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusOK, items)
 }
+
+// confirmPlan 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) confirmPlan(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.receivable.confirm")
 	if !ok {
 		return
 	}
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/receivable-plans/"), "/confirm")
+	if !a.recordAllowed(w, r, p, "settlement.receivable.confirm", "plan", id) {
+		return
+	}
 	var body service.PlanConfirmationInput
 	if !decode(w, r, &body) {
 		return
@@ -905,8 +951,16 @@ func (a *API) receiptMatches(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusOK, items)
 }
+
+// listReceivables 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) listReceivables(w http.ResponseWriter, r *http.Request, invoiceEligibleOnly bool) {
-	p, ok := a.user(w, r, "settlement.receivable.read")
+	permission := "settlement.receivable.read"
+	if invoiceEligibleOnly {
+		permission = "settlement.invoice.request"
+	}
+	p, ok := a.user(w, r, permission)
 	if !ok {
 		return
 	}
@@ -928,7 +982,7 @@ func (a *API) listReceivables(w http.ResponseWriter, r *http.Request, invoiceEli
 	}
 	query := `SELECT r.id,r.receivable_no,r.contract_snapshot_id,cs.source_contract_no,cs.customer_id,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,r.collection_status,r.invoice_status,r.version, r.original_amount-r.invoiced_amount-COALESCE((SELECT SUM(a.reserved_amount-a.invoiced_amount-a.released_amount) FROM settlement_invoice_request_allocation a WHERE a.tenant_id=r.tenant_id AND a.receivable_id=r.id AND a.status='RESERVED'),0) FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE ` + strings.Join(where, " AND ") + ` ORDER BY r.due_date ASC,r.id ASC LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
-	rows, err := a.service.DB.QueryContext(r.Context(), query, args...)
+	rows, err := a.queryScoped(r.Context(), p, permission, query, args...)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -950,8 +1004,12 @@ func (a *API) listReceivables(w http.ResponseWriter, r *http.Request, invoiceEli
 	}
 	write(w, http.StatusOK, items)
 }
+
+// listReceipts 用途：按结算权限、责任范围和错误契约处理请求。
+// 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
+// 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
 func (a *API) listReceipts(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.user(w, r, "settlement.receipt.record")
+	p, ok := a.user(w, r, "settlement.receipt.read")
 	if !ok {
 		return
 	}
@@ -1036,8 +1094,12 @@ func (a *API) createAllocation(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusCreated, map[string]string{"id": id, "status": "CONFIRMED"})
 }
+
+// listAllocations 用途：按结算权限、责任范围和错误契约处理请求。
+// 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
+// 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
 func (a *API) listAllocations(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.user(w, r, "settlement.allocation.confirm")
+	p, ok := a.user(w, r, "settlement.allocation.read")
 	if !ok {
 		return
 	}
@@ -1086,6 +1148,10 @@ func (a *API) reverseAllocation(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusCreated, map[string]string{"id": result, "status": "REVERSED"})
 }
+
+// createInvoiceRequest 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) createInvoiceRequest(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.invoice.request")
 	if !ok {
@@ -1095,6 +1161,10 @@ func (a *API) createInvoiceRequest(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+	if err := a.service.RequireContractAccess(r.Context(), p, "settlement.invoice.request", in.ContractSnapshotID); err != nil {
+		respondError(w, err)
+		return
+	}
 	id, err := a.service.CreateInvoiceRequest(r.Context(), p, r.Header.Get("Idempotency-Key"), in)
 	if err != nil {
 		respondError(w, err)
@@ -1102,6 +1172,10 @@ func (a *API) createInvoiceRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusCreated, map[string]string{"id": id, "status": "SUBMITTED"})
 }
+
+// approveInvoiceRequest 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) approveInvoiceRequest(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.invoice.approve")
 	if !ok {
@@ -1119,7 +1193,11 @@ func (a *API) approveInvoiceRequest(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
-	write(w, http.StatusAccepted, map[string]string{"id": id, "attempt_id": attempt, "status": "ISSUE_PENDING"})
+	status := "ISSUE_PENDING"
+	if attempt == "" {
+		status = "SPECIAL_REVIEW"
+	}
+	write(w, http.StatusAccepted, map[string]string{"id": id, "attempt_id": attempt, "status": status})
 }
 func (a *API) rejectInvoiceRequest(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.invoice.approve")
@@ -1157,17 +1235,30 @@ func (a *API) manualIssueInvoice(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusCreated, map[string]string{"id": invoiceID, "status": "ISSUED"})
 }
+
+// listInvoiceRequests 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.invoice.read")
 	if !ok {
 		return
+	}
+	taxNumberVisible := true
+	if p.CatalogVersion != "" {
+		var policyErr error
+		taxNumberVisible, policyErr = a.service.TaxNumberVisible(r.Context(), p.TenantID)
+		if policyErr != nil {
+			respondError(w, policyErr)
+			return
+		}
 	}
 	limit, offset, err := page(r)
 	if err != nil {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.rejection_reason,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),COALESCE((SELECT ia.channel FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_code FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_message FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),'') FROM settlement_invoice_request ir JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? ORDER BY ir.created_at DESC,ir.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.rejection_reason,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),COALESCE((SELECT ia.channel FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_code FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_message FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE(sr.special_reason,''),COALESCE(sr.threshold_snapshot,''),COALESCE(sr.settings_version,0) FROM settlement_invoice_request ir LEFT JOIN settlement_invoice_special_review sr ON sr.invoice_request_id=ir.id AND sr.tenant_id=ir.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? ORDER BY ir.created_at DESC,ir.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1178,15 +1269,20 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 		var id, no, contract, kind, excl, tax, incl, status, submitted, approved, rejectionReason, issueChannel, failureCode, failureMessage string
 		var buyer []byte
 		var taxRate sql.NullString
+		var specialReason, thresholdSnapshot string
+		var settingsVersion int
 		var taxRateCount int
 		var version int
 		var created any
-		if err := rows.Scan(&id, &no, &contract, &buyer, &kind, &excl, &tax, &incl, &status, &submitted, &approved, &rejectionReason, &version, &created, &taxRateCount, &taxRate, &issueChannel, &failureCode, &failureMessage); err != nil {
+		if err := rows.Scan(&id, &no, &contract, &buyer, &kind, &excl, &tax, &incl, &status, &submitted, &approved, &rejectionReason, &version, &created, &taxRateCount, &taxRate, &issueChannel, &failureCode, &failureMessage, &specialReason, &thresholdSnapshot, &settingsVersion); err != nil {
 			respondError(w, err)
 			return
 		}
 		buyerName, buyerTaxNo := buyerSummary(buyer)
-		items = append(items, map[string]any{"id": id, "request_no": no, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "tax_rate_display": taxRateDisplay(taxRate.String, taxRateCount), "status": status, "submitted_by": submitted, "approved_by": approved, "rejection_reason": rejectionReason, "version": version, "created_at": created, "issue_channel": issueChannel, "failure_code": failureCode, "failure_message": failureMessage})
+		if !taxNumberVisible {
+			buyerTaxNo = ""
+		}
+		items = append(items, map[string]any{"id": id, "request_no": no, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "tax_rate_display": taxRateDisplay(taxRate.String, taxRateCount), "status": status, "submitted_by": submitted, "approved_by": approved, "rejection_reason": rejectionReason, "version": version, "created_at": created, "issue_channel": issueChannel, "failure_code": failureCode, "failure_message": failureMessage, "special_reason": specialReason, "threshold_snapshot": thresholdSnapshot, "settings_version": settingsVersion})
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -1195,17 +1291,29 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, items)
 }
 
+// listTaxInvoices 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.invoice.read")
 	if !ok {
 		return
+	}
+	taxNumberVisible := true
+	if p.CatalogVersion != "" {
+		var policyErr error
+		taxNumberVisible, policyErr = a.service.TaxNumberVisible(r.Context(), p.TenantID)
+		if policyErr != nil {
+			respondError(w, policyErr)
+			return
+		}
 	}
 	limit, offset, err := page(r)
 	if err != nil {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,COALESCE((SELECT rf.status FROM settlement_invoice_red_flush_request rf WHERE rf.tenant_id=ti.tenant_id AND rf.original_invoice_id=ti.id ORDER BY rf.created_at DESC LIMIT 1),'') FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.tenant_id=? ORDER BY ti.issue_date DESC,ti.created_at DESC,ti.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,COALESCE((SELECT rf.status FROM settlement_invoice_red_flush_request rf WHERE rf.tenant_id=ti.tenant_id AND rf.original_invoice_id=ti.id ORDER BY rf.created_at DESC LIMIT 1),'') FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.tenant_id=? ORDER BY ti.issue_date DESC,ti.created_at DESC,ti.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1220,6 +1328,9 @@ func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		buyerName, buyerTaxNo := buyerSummary(buyer)
+		if !taxNumberVisible {
+			buyerTaxNo = ""
+		}
 		items = append(items, map[string]any{"id": id, "invoice_request_id": requestID, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_incl_tax": amount, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "red_flush_status": redFlushStatus})
 	}
 	if err := rows.Err(); err != nil {
@@ -1319,6 +1430,9 @@ func verifyTaxInvoiceDetailLines(headerExcl, headerTax, headerIncl string, lines
 	return nil
 }
 
+// taxInvoiceDetail 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.invoice.read")
 	if !ok {
@@ -1328,6 +1442,18 @@ func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 	if id == "" || strings.Contains(id, "/") {
 		fail(w, http.StatusNotFound, "TAX_INVOICE_NOT_FOUND", "发票不存在")
 		return
+	}
+	if !a.recordAllowed(w, r, p, "settlement.invoice.read", "invoice", id) {
+		return
+	}
+	taxNumberVisible := true
+	if p.CatalogVersion != "" {
+		var policyErr error
+		taxNumberVisible, policyErr = a.service.TaxNumberVisible(r.Context(), p.TenantID)
+		if policyErr != nil {
+			respondError(w, policyErr)
+			return
+		}
 	}
 	var invoiceID, requestID, requestNo, code, number, contract, kind, excl, tax, incl, issueDate, status, channel string
 	var buyer, seller []byte
@@ -1341,6 +1467,9 @@ func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	buyerName, buyerTaxNo := buyerSummary(buyer)
+	if !taxNumberVisible {
+		buyerTaxNo = ""
+	}
 	sellerName, _ := buyerSummary(seller)
 	issuedLines, err := a.taxInvoiceDetailLines(r.Context(), `SELECT line_no,item_name,tax_classification_code,amount_excl_tax,tax_rate,tax_amount,amount_incl_tax FROM settlement_tax_invoice_item WHERE tenant_id=? AND tax_invoice_id=? ORDER BY line_no`, p.TenantID, invoiceID)
 	if err != nil {
@@ -1506,6 +1635,9 @@ func (a *API) uploadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
 	write(w, status, map[string]string{"id": documentID, "status": "ARCHIVED"})
 }
 
+// downloadInvoiceDocument 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) downloadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.invoice.read")
 	if !ok {
@@ -1519,6 +1651,9 @@ func (a *API) downloadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(path, "/")
 	if len(parts) != 4 || parts[1] != "documents" || parts[3] != "download" {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", "电子发票文件标识不合法")
+		return
+	}
+	if !a.recordAllowed(w, r, p, "settlement.invoice.read", "invoice", parts[0]) {
 		return
 	}
 	var objectID, originalName, mediaType string
@@ -1763,8 +1898,11 @@ func (a *API) dunningCoverage(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, coverage)
 }
 
+// completeDunningAction 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) completeDunningAction(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.user(w, r, "settlement.dunning.manage")
+	p, ok := a.user(w, r, "settlement.dunning.feedback")
 	if !ok {
 		return
 	}
@@ -1787,8 +1925,11 @@ func (a *API) completeDunningAction(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]string{"id": actionID, "status": "COMPLETED"})
 }
 
+// listDunningCases 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) listDunningCases(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.user(w, r, "settlement.dunning.manage")
+	p, ok := a.user(w, r, "settlement.dunning.read")
 	if !ok {
 		return
 	}
@@ -1797,7 +1938,7 @@ func (a *API) listDunningCases(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT dc.id,r.receivable_no,cs.customer_name_snapshot,DATEDIFF(CURDATE(),r.due_date),r.open_amount,dc.current_escalation_level,dc.status,dc.next_action_at,dc.last_action_at,COALESCE((SELECT da.recipient_user_id FROM settlement_dunning_action da WHERE da.tenant_id=dc.tenant_id AND da.dunning_case_id=dc.id ORDER BY da.created_at DESC,da.id DESC LIMIT 1),'') FROM settlement_dunning_case dc JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE dc.tenant_id=? ORDER BY dc.next_action_at,dc.id LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.dunning.read", `SELECT dc.id,COALESCE(r.receivable_no,CONCAT('PLAN-',rp.installment_no)),cs.customer_name_snapshot,DATEDIFF(CURDATE(),COALESCE(r.due_date,rp.due_date)),COALESCE(r.open_amount,rp.planned_amount),dc.current_escalation_level,dc.status,dc.next_action_at,dc.last_action_at,COALESCE((SELECT da.recipient_user_id FROM settlement_dunning_action da WHERE da.tenant_id=dc.tenant_id AND da.dunning_case_id=dc.id ORDER BY da.created_at DESC,da.id DESC LIMIT 1),'') FROM settlement_dunning_case dc LEFT JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id LEFT JOIN settlement_receivable_plan rp ON rp.id=dc.plan_id AND rp.tenant_id=dc.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=COALESCE(r.contract_snapshot_id,rp.contract_snapshot_id) AND cs.tenant_id=dc.tenant_id WHERE dc.tenant_id=? ORDER BY dc.next_action_at,dc.id LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1820,8 +1961,12 @@ func (a *API) listDunningCases(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusOK, items)
 }
+
+// listDunningActions 用途：按可信权限及责任范围处理结算请求。
+// 参数：w 为HTTP响应，r 为携带当前会话的请求。
+// 返回值：无，结果通过HTTP响应返回。
 func (a *API) listDunningActions(w http.ResponseWriter, r *http.Request) {
-	p, ok := a.user(w, r, "settlement.dunning.manage")
+	p, ok := a.user(w, r, "settlement.dunning.read")
 	if !ok {
 		return
 	}
@@ -1830,7 +1975,7 @@ func (a *API) listDunningActions(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT da.id,r.receivable_no,da.channel,da.sent_at,da.created_at,da.recipient_user_id,da.priority,da.status,dc.current_escalation_level,da.version,da.completed_at,da.completed_by,da.result_detail FROM settlement_dunning_action da JOIN settlement_dunning_case dc ON dc.id=da.dunning_case_id AND dc.tenant_id=da.tenant_id JOIN settlement_receivable r ON r.id=dc.receivable_id WHERE da.tenant_id=? ORDER BY COALESCE(da.sent_at,da.created_at) DESC,da.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.dunning.read", `SELECT da.id,COALESCE(r.receivable_no,CONCAT('PLAN-',rp.installment_no)),da.channel,da.sent_at,da.created_at,da.recipient_user_id,da.priority,da.status,dc.current_escalation_level,da.version,da.completed_at,da.completed_by,da.result_detail FROM settlement_dunning_action da JOIN settlement_dunning_case dc ON dc.id=da.dunning_case_id AND dc.tenant_id=da.tenant_id LEFT JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id LEFT JOIN settlement_receivable_plan rp ON rp.id=dc.plan_id AND rp.tenant_id=dc.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=COALESCE(r.contract_snapshot_id,rp.contract_snapshot_id) AND cs.tenant_id=dc.tenant_id WHERE da.tenant_id=? ORDER BY COALESCE(da.sent_at,da.created_at) DESC,da.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1920,6 +2065,10 @@ func (a *API) readNotification(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusOK, map[string]string{"status": "read"})
 }
+
+// user 用途：按结算权限、责任范围和错误契约处理请求。
+// 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
+// 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
 func (a *API) user(w http.ResponseWriter, r *http.Request, permission string) (service.Principal, bool) {
 	p, err := a.principal(r)
 	if err != nil {
@@ -1933,6 +2082,13 @@ func (a *API) user(w http.ResponseWriter, r *http.Request, permission string) (s
 	if !p.Allows(permission) {
 		fail(w, http.StatusForbidden, "SETTLEMENT_FORBIDDEN", "当前用户没有执行此操作的权限")
 		return p, false
+	}
+	switch permission {
+	case "settlement.receipt.record", "settlement.receipt.read", "settlement.allocation.read", "settlement.allocation.confirm", "settlement.allocation.reverse", "settlement.invoice.approve", "settlement.invoice.issue", "settlement.invoice.special_approve", "settlement.settings.manage", "settlement.collaboration.manage":
+		if !p.Unrestricted(permission) {
+			fail(w, http.StatusForbidden, "SETTLEMENT_FORBIDDEN", "当前角色的数据范围不允许执行此财务操作")
+			return p, false
+		}
 	}
 	return p, true
 }
@@ -1951,8 +2107,14 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 	}
 	return true
 }
+
+// respondError 用途：按结算权限、责任范围和错误契约处理请求。
+// 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
+// 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
 func respondError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, service.ErrDependency):
+		fail(w, http.StatusServiceUnavailable, "SETTLEMENT_DEPENDENCY_UNAVAILABLE", "人员目录或项目服务暂不可用，请稍后重试")
 	case errors.Is(err, service.ErrInvalid):
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 	case errors.Is(err, service.ErrNotFound):
@@ -1960,7 +2122,7 @@ func respondError(w http.ResponseWriter, err error) {
 	case errors.Is(err, service.ErrConflict):
 		fail(w, http.StatusConflict, "SETTLEMENT_CONFLICT", "记录已变化、重复或余额不足")
 	case errors.Is(err, service.ErrForbidden):
-		fail(w, http.StatusForbidden, "SETTLEMENT_FORBIDDEN", "无权处理该催收动作")
+		fail(w, http.StatusForbidden, "SETTLEMENT_FORBIDDEN", "当前用户无权执行此操作")
 	default:
 		fail(w, http.StatusInternalServerError, "SETTLEMENT_INTERNAL_ERROR", "服务处理失败")
 	}

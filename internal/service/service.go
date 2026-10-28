@@ -16,10 +16,11 @@ import (
 )
 
 var (
-	ErrNotFound  = errors.New("not found")
-	ErrConflict  = errors.New("conflict")
-	ErrInvalid   = errors.New("invalid input")
-	ErrForbidden = errors.New("forbidden")
+	ErrNotFound   = errors.New("not found")
+	ErrConflict   = errors.New("conflict")
+	ErrInvalid    = errors.New("invalid input")
+	ErrForbidden  = errors.New("forbidden")
+	ErrDependency = errors.New("business dependency unavailable")
 )
 
 type CreditEventPublisher interface {
@@ -27,6 +28,9 @@ type CreditEventPublisher interface {
 }
 
 type Service struct {
+	ProjectReferences   ProjectReferenceResolver
+	RoleDirectory       RoleDirectory
+	ERPProvider         ERPProvider
 	DB                  *sql.DB
 	CreditPublisher     CreditEventPublisher
 	InvoiceIssuanceMode string
@@ -60,6 +64,7 @@ type ContractEvent struct {
 		Version int    `json:"version"`
 	} `json:"aggregate"`
 	Contract struct {
+		OwnerUserID  string        `json:"owner_user_id"`
 		ID           string        `json:"id"`
 		No           string        `json:"no"`
 		Version      int           `json:"version"`
@@ -80,6 +85,8 @@ type PaymentTerm struct {
 type Principal struct {
 	TenantID, UserID      string
 	Permissions           map[string]bool
+	Roles                 []string
+	DataScopes            []DataScope
 	IdentityID            string
 	PersonID              string
 	DisplayName           string
@@ -91,8 +98,30 @@ type Principal struct {
 	LoginIP string
 }
 
+// DataScope 用途：保存平台返回的角色级可信应用范围。
+type DataScope struct {
+	RoleCode        string `json:"role_code"`
+	ScopeType       string `json:"scope_type"`
+	ScopeID         string `json:"scope_id"`
+	EnvironmentCode string `json:"environment_code"`
+}
+
+// Allows 用途：校验可信有效权限，并兼容原管理能力包含的只读与反馈动作。
+// 参数：permission 为接口要求的结算能力。
+// 返回值：当前主体拥有该能力时返回真。
 func (p Principal) Allows(permission string) bool {
-	return p.Permissions[permission] || p.Permissions["settlement.admin"]
+	if p.Permissions[permission] || p.Permissions["settlement.admin"] {
+		return true
+	}
+	switch permission {
+	case "settlement.dunning.read", "settlement.dunning.feedback":
+		return p.Permissions["settlement.dunning.manage"]
+	case "settlement.receipt.read":
+		return p.Permissions["settlement.receipt.record"]
+	case "settlement.allocation.read":
+		return p.Permissions["settlement.allocation.confirm"]
+	}
+	return false
 }
 
 func newID() string {
@@ -269,9 +298,13 @@ type PlanConfirmationInput struct {
 	Reason        string `json:"reason"`
 }
 
-// ConfirmPlan 对待确认计划执行最后允许的编辑，并在创建应收前，
-// 将新旧值一并记录到审计 Outbox。
+// ConfirmPlan 用途：核对本人责任和合同预算后确认计划并生成应收。
+// 参数：ctx为上下文，p为可信主体，id为计划ID，in为当前版本和调整字段。
+// 返回值：成功无错误，授权、预算、版本或存储失败时返回错误。
 func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, in PlanConfirmationInput) error {
+	if !p.Allows("settlement.receivable.confirm") {
+		return ErrForbidden
+	}
 	if in.Version < 1 {
 		return fmt.Errorf("%w: version must be positive", ErrInvalid)
 	}
@@ -286,6 +319,9 @@ func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, in Pl
 		return ErrConflict
 	}
 	if err != nil {
+		return err
+	}
+	if err = s.RequireContractAccessTx(ctx, tx, p, "settlement.receivable.confirm", snapshot); err != nil {
 		return err
 	}
 	confirmedDue := strings.TrimSpace(in.DueDate)
@@ -307,6 +343,11 @@ func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, in Pl
 	}
 	if (confirmedDue != due || confirmedAmount != planned) && reason == "" {
 		return fmt.Errorf("%w: reason is required when plan values change", ErrInvalid)
+	}
+	if confirmedAmount != planned {
+		if err = checkPlanBudget(ctx, tx, p.TenantID, snapshot, id, confirmedAmount); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE settlement_receivable_plan SET due_date=?,planned_amount=?,confirmation_status='CONFIRMED',confirmation_reason=?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=? AND version=?`, confirmedDue, confirmedAmount, reason, id, p.TenantID, in.Version); err != nil {
 		return err

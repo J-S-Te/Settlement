@@ -82,6 +82,9 @@ WHERE dc.status='ACTIVE' AND r.open_amount=0`)
 	return err
 }
 
+// reopenSettled 重新打开恢复欠款的旧定制催收案件。
+// 参数：ctx 扫描上下文。
+// 返回值：扫描及持久化错误。
 func (s *Scanner) reopenSettled(ctx context.Context) error {
 	if err := s.checkBusinessLicense(ctx); err != nil {
 		return err
@@ -92,19 +95,22 @@ func (s *Scanner) reopenSettled(ctx context.Context) error {
 JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id
 JOIN settlement_dunning_policy p ON p.id=dc.dunning_policy_id AND p.tenant_id=dc.tenant_id AND p.version=dc.policy_version
 SET dc.status='ACTIVE',dc.closed_reason='',dc.closed_at=NULL,dc.current_escalation_level=0,dc.last_action_at=NULL,dc.next_action_at=UTC_TIMESTAMP(3),dc.updated_at=UTC_TIMESTAMP(3)
-WHERE dc.status='CLOSED' AND dc.closed_reason='RECEIVABLE_SETTLED' AND p.enabled=TRUE
+WHERE dc.status='CLOSED' AND dc.closed_reason='RECEIVABLE_SETTLED' AND p.enabled=TRUE AND p.recipient_rule<>'CONTRACT_OWNER'
   AND r.open_amount>0 AND r.due_date<CURDATE()
   AND DATEDIFF(CURDATE(),r.due_date) BETWEEN p.aging_from_days AND p.aging_to_days`)
 	return err
 }
 
+// createInitialCases 选取旧用户定制策略候选，避免重复负责人提醒。
+// 参数：ctx 扫描上下文。
+// 返回值：扫描及持久化错误。
 func (s *Scanner) createInitialCases(ctx context.Context) error {
 	rows, err := s.DB.QueryContext(ctx, `SELECT r.tenant_id,r.id,r.receivable_no,cs.customer_name_snapshot,p.id,p.version,p.action_type,p.recipient_rule,p.channel,p.priority,p.repeat_interval_days,DATEDIFF(CURDATE(),r.due_date)
 FROM settlement_receivable r
 JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id
 JOIN settlement_dunning_policy p ON p.id=(
   SELECT p2.id FROM settlement_dunning_policy p2
-  WHERE p2.tenant_id=r.tenant_id AND p2.enabled=TRUE
+  WHERE p2.tenant_id=r.tenant_id AND p2.enabled=TRUE AND p2.recipient_rule<>'CONTRACT_OWNER'
     AND DATEDIFF(CURDATE(),r.due_date) BETWEEN p2.aging_from_days AND p2.aging_to_days
   ORDER BY p2.aging_from_days DESC,p2.id LIMIT 1
 )
@@ -149,6 +155,9 @@ ORDER BY r.due_date,r.id LIMIT ?`, s.BatchSize)
 	return nil
 }
 
+// runDueCases 执行旧定制策略到期动作。
+// 参数：ctx 扫描上下文。
+// 返回值：扫描及持久化错误。
 func (s *Scanner) runDueCases(ctx context.Context) error {
 	rows, err := s.DB.QueryContext(ctx, `SELECT dc.tenant_id,dc.id,dc.dunning_policy_id,dc.policy_version,dc.current_escalation_level,
 r.id,r.receivable_no,cs.customer_name_snapshot,DATEDIFF(CURDATE(),r.due_date),
@@ -159,7 +168,7 @@ COALESCE((SELECT da.recipient_user_id FROM settlement_dunning_action da
 FROM settlement_dunning_case dc
 JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id
 JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id
-JOIN settlement_dunning_policy p ON p.id=dc.dunning_policy_id AND p.tenant_id=dc.tenant_id AND p.version=dc.policy_version AND p.enabled=TRUE
+JOIN settlement_dunning_policy p ON p.id=dc.dunning_policy_id AND p.tenant_id=dc.tenant_id AND p.version=dc.policy_version AND p.enabled=TRUE AND p.recipient_rule<>'CONTRACT_OWNER'
 WHERE dc.status='ACTIVE' AND r.open_amount>0 AND dc.next_action_at<=UTC_TIMESTAMP(3)
 ORDER BY dc.next_action_at,dc.id LIMIT ?`, s.BatchSize)
 	if err != nil {

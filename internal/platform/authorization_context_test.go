@@ -10,8 +10,11 @@ import (
 	"github.com/j-s-te/settlement/internal/config"
 )
 
+// TestSettlementCatalogCompatibilityAcceptsNMinusOneAndRejectsPartialWindow 用途：校验目录升级兼容窗口。
+// 参数：t为测试上下文。
+// 返回值：无，N/N-1兼容或残缺窗口拒绝行为异常时失败。
 func TestSettlementCatalogCompatibilityAcceptsNMinusOneAndRejectsPartialWindow(t *testing.T) {
-	value := authorizationContext{CatalogVersion: "3", CompatibleCatalogVersions: []string{"3", "2"}, RoleConfigHash: "hash-3", CompatibleRoleConfigHashes: []string{"hash-3", "settlement-v2-invoice-read"}}
+	value := authorizationContext{CatalogVersion: "4", CompatibleCatalogVersions: []string{"4", "3"}, RoleConfigHash: "hash-4", CompatibleRoleConfigHashes: []string{"hash-4", "settlement-v3-business-roles-scopes"}}
 	if err := validateSettlementCatalogCompatibility(value); err != nil {
 		t.Fatalf("N-1 catalog rejected: %v", err)
 	}
