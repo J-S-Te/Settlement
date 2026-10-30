@@ -14,9 +14,7 @@ import (
 // 返回值：返回已限定责任范围的查询游标或真实错误。
 func (a *API) queryScoped(ctx context.Context, p service.Principal, permission, query string, args ...any) (*sql.Rows, error) {
 	clause, scopeArgs := p.ContractPredicate(permission, "cs")
-	if clause == "1=1" {
-		return a.service.DB.QueryContext(ctx, query, args...)
-	}
+	clause = "cs.migration_state='RELEASED' AND (" + clause + ")"
 	index := strings.LastIndex(query, " ORDER BY")
 	if index < 0 || len(args) < 2 {
 		return nil, service.ErrInvalid

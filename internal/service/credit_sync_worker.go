@@ -82,6 +82,9 @@ func (w *CreditSyncWorker) RunOnce(ctx context.Context) error {
 	return nil
 }
 
+// claim 认领可投递信用事件并排除暂存财务，进程重启仍执行同一门禁。
+// 参数：ctx为上下文，now为当前时间，lease为租期，batch为批量上限。
+// 返回值：已认领事件或数据库与许可错误。
 func (w *CreditSyncWorker) claim(ctx context.Context, now time.Time, lease time.Duration, batch int) ([]claimedCreditEvent, error) {
 	if err := w.checkBusinessLicense(ctx); err != nil {
 		return nil, err
@@ -91,7 +94,7 @@ func (w *CreditSyncWorker) claim(ctx context.Context, now time.Time, lease time.
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT id,tenant_id,event_id,payload_json FROM settlement_credit_sync WHERE status IN ('PENDING','RETRY_WAIT') OR (status='PROCESSING' AND locked_at IS NOT NULL AND locked_at<?) ORDER BY updated_at,id LIMIT ? FOR UPDATE SKIP LOCKED`, now.Add(-lease), batch)
+	rows, err := tx.QueryContext(ctx, `SELECT id,tenant_id,event_id,payload_json FROM settlement_credit_sync WHERE (status IN ('PENDING','RETRY_WAIT') OR (status='PROCESSING' AND locked_at IS NOT NULL AND locked_at<?)) AND NOT EXISTS(SELECT 1 FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.id=settlement_credit_sync.receivable_id AND r.tenant_id=settlement_credit_sync.tenant_id AND cs.migration_state='HOLD') ORDER BY updated_at,id LIMIT ? FOR UPDATE SKIP LOCKED`, now.Add(-lease), batch)
 	if err != nil {
 		return nil, err
 	}

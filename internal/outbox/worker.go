@@ -190,6 +190,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 	}
 }
+
+// RunOnce 认领并投递事件，在发送前执行许可和历史财务放行门禁。
+// 参数：ctx为工作器上下文。
+// 返回值：存储或投递状态记录错误；已阻止的旧提醒不发送。
 func (w *Worker) RunOnce(ctx context.Context) error {
 	for _, destination := range w.Destinations {
 		if destination.Name != "PLATFORM_AUDIT" && destination.Name != "PLATFORM_NOTIFICATION" && w.CheckBusinessLicense != nil {
@@ -198,6 +202,13 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 			}
 		}
 		events, err := w.Store.Acquire(ctx, destination.Name, w.BatchSize)
+		if err != nil {
+			return err
+		}
+		if len(events) == 0 {
+			continue
+		}
+		events, err = w.Store.filterImportNotifications(ctx, events)
 		if err != nil {
 			return err
 		}

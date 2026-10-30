@@ -105,6 +105,9 @@ func TestDunningExpiredStateChangesDoNotWrite(t *testing.T) {
 	}
 }
 
+// TestDunningMidTransactionExpiryRollsBackAllNewWork 验证DunningMidTransactionExpiryRollsBackAllNewWork的业务约束与回归行为。
+// 参数：t为测试上下文，使用独立夹具。
+// 返回值：无；预期结果或状态不一致时测试失败。
 func TestDunningMidTransactionExpiryRollsBackAllNewWork(t *testing.T) {
 	for _, stop := range []string{"case", "action", "notification", "outbox"} {
 		t.Run(stop, func(t *testing.T) {
@@ -117,6 +120,9 @@ func TestDunningMidTransactionExpiryRollsBackAllNewWork(t *testing.T) {
 				{"notification", "INSERT INTO settlement_local_notification"},
 				{"outbox", "INSERT INTO settlement_outbox_event"},
 			} {
+				if write.name == "action" {
+					steps = append(steps, scriptdb.Step{Kind: "query", SQL: "SELECT cs.migration_state", Rows: [][]driver.Value{{"RELEASED", int64(0)}}})
+				}
 				step := scriptdb.Step{Kind: "exec", SQL: write.sql}
 				if write.name == stop {
 					step.After = func() { expired = true }
@@ -139,6 +145,9 @@ func TestDunningMidTransactionExpiryRollsBackAllNewWork(t *testing.T) {
 	}
 }
 
+// TestDunningLicensedCreationStillCommits 验证DunningLicensedCreationStillCommits的业务约束与回归行为。
+// 参数：t为测试上下文，使用独立夹具。
+// 返回值：无；预期结果或状态不一致时测试失败。
 func TestDunningLicensedCreationStillCommits(t *testing.T) {
 	for _, repeat := range []bool{false, true} {
 		t.Run(map[bool]string{false: "initial", true: "repeat"}[repeat], func(t *testing.T) {
@@ -148,7 +157,7 @@ func TestDunningLicensedCreationStillCommits(t *testing.T) {
 			} else {
 				steps = append(steps, scriptdb.Step{Kind: "exec", SQL: "INSERT IGNORE INTO settlement_dunning_case"})
 			}
-			steps = append(steps, scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_dunning_action"}, scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_local_notification"}, scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_outbox_event"})
+			steps = append(steps, scriptdb.Step{Kind: "query", SQL: "SELECT cs.migration_state", Rows: [][]driver.Value{{"RELEASED", int64(0)}}}, scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_dunning_action"}, scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_local_notification"}, scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_outbox_event"})
 			if repeat {
 				steps = append(steps, scriptdb.Step{Kind: "exec", SQL: "SET current_escalation_level="})
 			}

@@ -123,6 +123,18 @@ func (s *Service) RequireContractAccessTx(ctx context.Context, tx *sql.Tx, p Pri
 	if !p.Allows(permission) {
 		return ErrForbidden
 	}
+	if strings.HasPrefix(permission, "settlement.invoice.") || permission == "settlement.receivable.create" || permission == "settlement.receivable.adjust" {
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT migration_state FROM settlement_contract_snapshot WHERE tenant_id=? AND id=?`, p.TenantID, snapshotID).Scan(&state); err != nil {
+			return err
+		}
+		if state == "HOLD" {
+			return ErrImportBlocked
+		}
+	}
+	if err := lockImportWrite(ctx, tx, p, snapshotID); err != nil {
+		return err
+	}
 	if p.Unrestricted(permission) {
 		return nil
 	}

@@ -86,7 +86,7 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 			files = value
 		}
 	}
-	api := &API{service: &service.Service{DB: db, CreditPublisher: publisher, InvoiceIssuanceMode: cfg.InvoiceIssuanceMode, TaxProviderCode: cfg.TaxProviderCode}, cfg: cfg, logger: logger, auth: auth, machine: machine, taxMachine: taxMachine, directory: directory, files: files}
+	api := &API{service: &service.Service{DB: db, CreditPublisher: publisher, ContractImportEnabled: cfg.ContractImportEnabled, InvoiceIssuanceMode: cfg.InvoiceIssuanceMode, TaxProviderCode: cfg.TaxProviderCode}, cfg: cfg, logger: logger, auth: auth, machine: machine, taxMachine: taxMachine, directory: directory, files: files}
 	api.service.ERPProvider = erp
 	api.service.ProjectReferences = projectReferences
 	if roles, ok := directory.(service.RoleDirectory); ok {
@@ -166,6 +166,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusForbidden, "SETTLEMENT_CSRF_REJECTED", "写请求来源校验失败")
 			return
 		}
+	}
+	if a.serveContractImports(w, r) {
+		return
 	}
 	if a.serveRoleFinance(w, r) || a.serveRoleCollaboration(w, r) {
 		return
@@ -605,21 +608,25 @@ func (a *API) taxResult(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, http.StatusAccepted, map[string]any{"event_id": event.EventID, "accepted": true, "processing_status": result, "duplicate": result != "APPLIED"})
 }
+
+// dashboard 按可信租户和业务权限查询已放行的结算数据。
+// 参数：w为响应，r为已验证入口的请求。
+// 返回值：无，成功响应或真实查询错误写入HTTP。
 func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.report.read")
 	if !ok {
 		return
 	}
 	var receivables, overdue, plans, invoices int
-	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*),COALESCE(SUM(CASE WHEN due_date<CURDATE() AND open_amount>0 THEN 1 ELSE 0 END),0) FROM settlement_receivable WHERE tenant_id=?`, p.TenantID).Scan(&receivables, &overdue); err != nil {
+	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*),COALESCE(SUM(CASE WHEN due_date<CURDATE() AND open_amount>0 THEN 1 ELSE 0 END),0) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.tenant_id=settlement_receivable.tenant_id AND import_cs.id=settlement_receivable.contract_snapshot_id AND import_cs.migration_state='RELEASED')`, p.TenantID).Scan(&receivables, &overdue); err != nil {
 		respondError(w, err)
 		return
 	}
-	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM settlement_receivable_plan WHERE tenant_id=? AND confirmation_status='PENDING_CONFIRMATION'`, p.TenantID).Scan(&plans); err != nil {
+	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM settlement_receivable_plan WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.tenant_id=settlement_receivable_plan.tenant_id AND import_cs.id=settlement_receivable_plan.contract_snapshot_id AND import_cs.migration_state='RELEASED') AND confirmation_status='PENDING_CONFIRMATION'`, p.TenantID).Scan(&plans); err != nil {
 		respondError(w, err)
 		return
 	}
-	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM settlement_invoice_request WHERE tenant_id=? AND status IN ('SUBMITTED','UNDER_REVIEW','ISSUE_PENDING')`, p.TenantID).Scan(&invoices); err != nil {
+	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM settlement_invoice_request WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.tenant_id=settlement_invoice_request.tenant_id AND import_cs.id=settlement_invoice_request.contract_snapshot_id AND import_cs.migration_state='RELEASED') AND status IN ('SUBMITTED','UNDER_REVIEW','ISSUE_PENDING')`, p.TenantID).Scan(&invoices); err != nil {
 		respondError(w, err)
 		return
 	}
@@ -663,19 +670,19 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		return rows.Err()
 	}
-	if err := addRows(`SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND open_amount>0 GROUP BY currency ORDER BY currency`, "open"); err != nil {
+	if err := addRows(`SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.tenant_id=settlement_receivable.tenant_id AND import_cs.id=settlement_receivable.contract_snapshot_id AND import_cs.migration_state='RELEASED') AND open_amount>0 GROUP BY currency ORDER BY currency`, "open"); err != nil {
 		respondError(w, err)
 		return
 	}
-	if err := addRows(`SELECT currency,COALESCE(SUM(amount),0) FROM settlement_receipt WHERE tenant_id=? AND receipt_date>=DATE_FORMAT(CURDATE(),'%Y-%m-01') AND receipt_date<DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'),INTERVAL 1 MONTH) GROUP BY currency ORDER BY currency`, "receipts"); err != nil {
+	if err := addRows(`SELECT currency,COALESCE(SUM(amount),0) FROM settlement_receipt WHERE tenant_id=? AND NOT EXISTS(SELECT 1 FROM settlement_import_fact import_f JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_f.contract_snapshot_id AND import_cs.tenant_id=import_f.tenant_id WHERE import_f.tenant_id=settlement_receipt.tenant_id AND import_f.target_business_id=settlement_receipt.id AND import_f.fact_type='RECEIPT' AND import_cs.migration_state='HOLD') AND receipt_date>=DATE_FORMAT(CURDATE(),'%Y-%m-01') AND receipt_date<DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'),INTERVAL 1 MONTH) GROUP BY currency ORDER BY currency`, "receipts"); err != nil {
 		respondError(w, err)
 		return
 	}
-	if err := addRows(`SELECT cs.currency,COALESCE(SUM(ir.amount_incl_tax),0) FROM settlement_invoice_request ir JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? AND ir.status IN ('SUBMITTED','UNDER_REVIEW','ISSUE_PENDING') GROUP BY cs.currency ORDER BY cs.currency`, "pending"); err != nil {
+	if err := addRows(`SELECT cs.currency,COALESCE(SUM(ir.amount_incl_tax),0) FROM settlement_invoice_request ir JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? AND cs.migration_state='RELEASED' AND ir.status IN ('SUBMITTED','UNDER_REVIEW','ISSUE_PENDING') GROUP BY cs.currency ORDER BY cs.currency`, "pending"); err != nil {
 		respondError(w, err)
 		return
 	}
-	if err := addRows(`SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND open_amount>0 AND due_date<CURDATE() GROUP BY currency ORDER BY currency`, "overdue"); err != nil {
+	if err := addRows(`SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.tenant_id=settlement_receivable.tenant_id AND import_cs.id=settlement_receivable.contract_snapshot_id AND import_cs.migration_state='RELEASED') AND open_amount>0 AND due_date<CURDATE() GROUP BY currency ORDER BY currency`, "overdue"); err != nil {
 		respondError(w, err)
 		return
 	}
@@ -736,12 +743,15 @@ func (a *API) agingSummary(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]any{"items": items, "aging_days": days})
 }
 
+// invoicedReceivablesTop10 查询排除历史HOLD的经营开票应收前十项。
+// 参数：w为响应，r为已鉴权查询请求。
+// 返回值：无；按当前授权范围返回经营数据或错误。
 func (a *API) invoicedReceivablesTop10(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.report.read")
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.currency ASC,r.open_amount DESC,r.due_date ASC,r.id ASC LIMIT 10`, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND cs.migration_state='RELEASED' AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.currency ASC,r.open_amount DESC,r.due_date ASC,r.id ASC LIMIT 10`, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -877,7 +887,7 @@ func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.queryScoped(r.Context(), p, "settlement.receivable.read", `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.tenant_id=? ORDER BY rp.due_date ASC,rp.id ASC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.receivable.read", `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.tenant_id=? AND cs.migration_state='RELEASED' ORDER BY rp.due_date ASC,rp.id ASC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1018,7 +1028,7 @@ func (a *API) listReceipts(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,receipt_no,customer_name_snapshot,amount,unallocated_amount,currency,DATE_FORMAT(receipt_date,'%Y-%m-%d'),payment_method,bank_transaction_reference,status FROM settlement_receipt WHERE tenant_id=? ORDER BY receipt_date DESC,id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT id,receipt_no,customer_name_snapshot,amount,unallocated_amount,currency,DATE_FORMAT(receipt_date,'%Y-%m-%d'),payment_method,bank_transaction_reference,status FROM settlement_receipt WHERE tenant_id=? AND NOT EXISTS(SELECT 1 FROM settlement_import_fact import_f JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_f.contract_snapshot_id AND import_cs.tenant_id=import_f.tenant_id WHERE import_f.tenant_id=settlement_receipt.tenant_id AND import_f.target_business_id=settlement_receipt.id AND import_f.fact_type='RECEIPT' AND import_cs.migration_state='HOLD') ORDER BY receipt_date DESC,id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1108,7 +1118,7 @@ func (a *API) listAllocations(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT a.id,a.allocation_no,rc.receipt_no,rv.receivable_no,a.allocated_amount,a.currency,a.status,a.match_mode,a.match_confidence,a.confirmed_by,a.confirmed_at FROM settlement_receipt_allocation a JOIN settlement_receipt rc ON rc.id=a.receipt_id AND rc.tenant_id=a.tenant_id JOIN settlement_receivable rv ON rv.id=a.receivable_id AND rv.tenant_id=a.tenant_id WHERE a.tenant_id=? ORDER BY a.confirmed_at DESC,a.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT a.id,a.allocation_no,rc.receipt_no,rv.receivable_no,a.allocated_amount,a.currency,a.status,a.match_mode,a.match_confidence,a.confirmed_by,a.confirmed_at FROM settlement_receipt_allocation a JOIN settlement_receipt rc ON rc.id=a.receipt_id AND rc.tenant_id=a.tenant_id JOIN settlement_receivable rv ON rv.id=a.receivable_id AND rv.tenant_id=a.tenant_id WHERE a.tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.id=rv.contract_snapshot_id AND import_cs.tenant_id=rv.tenant_id AND import_cs.migration_state='RELEASED') ORDER BY a.confirmed_at DESC,a.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1258,7 +1268,7 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.rejection_reason,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),COALESCE((SELECT ia.channel FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_code FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_message FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE(sr.special_reason,''),COALESCE(sr.threshold_snapshot,''),COALESCE(sr.settings_version,0) FROM settlement_invoice_request ir LEFT JOIN settlement_invoice_special_review sr ON sr.invoice_request_id=ir.id AND sr.tenant_id=ir.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? ORDER BY ir.created_at DESC,ir.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.rejection_reason,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),COALESCE((SELECT ia.channel FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_code FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_message FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE(sr.special_reason,''),COALESCE(sr.threshold_snapshot,''),COALESCE(sr.settings_version,0) FROM settlement_invoice_request ir LEFT JOIN settlement_invoice_special_review sr ON sr.invoice_request_id=ir.id AND sr.tenant_id=ir.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? AND cs.migration_state='RELEASED' ORDER BY ir.created_at DESC,ir.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1313,7 +1323,7 @@ func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,COALESCE((SELECT rf.status FROM settlement_invoice_red_flush_request rf WHERE rf.tenant_id=ti.tenant_id AND rf.original_invoice_id=ti.id ORDER BY rf.created_at DESC LIMIT 1),'') FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.tenant_id=? ORDER BY ti.issue_date DESC,ti.created_at DESC,ti.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,COALESCE((SELECT rf.status FROM settlement_invoice_red_flush_request rf WHERE rf.tenant_id=ti.tenant_id AND rf.original_invoice_id=ti.id ORDER BY rf.created_at DESC LIMIT 1),'') FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.tenant_id=? AND cs.migration_state='RELEASED' ORDER BY ti.issue_date DESC,ti.created_at DESC,ti.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -2111,6 +2121,9 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 // respondError 用途：按结算权限、责任范围和错误契约处理请求。
 // 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
 // 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
+// respondError 将真实业务错误映射为稳定HTTP契约，包括明确的历史恢复阻塞。
+// 参数：w为响应，err为业务错误。
+// 返回值：无，错误响应写入HTTP。
 func respondError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, service.ErrDependency):
@@ -2119,6 +2132,8 @@ func respondError(w http.ResponseWriter, err error) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 	case errors.Is(err, service.ErrNotFound):
 		fail(w, http.StatusNotFound, "SETTLEMENT_NOT_FOUND", "未找到记录")
+	case errors.Is(err, service.ErrImportBlocked):
+		fail(w, http.StatusConflict, "SETTLEMENT_IMPORT_FACT_BLOCKED", "历史财务事实未恢复或尚不支持安全恢复，禁止对账及放行")
 	case errors.Is(err, service.ErrConflict):
 		fail(w, http.StatusConflict, "SETTLEMENT_CONFLICT", "记录已变化、重复或余额不足")
 	case errors.Is(err, service.ErrForbidden):

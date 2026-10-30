@@ -85,8 +85,11 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
+// csv 从单个数据库快照生成全部已放行账务行，避免历史暂存及万行截断。
+// 参数：ctx为导出上下文，tenantID为绑定租户。
+// 返回值：完整CSV；查询或编码失败返回错误。
 func (w *Worker) csv(ctx context.Context, tenantID string) ([]byte, error) {
-	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.open_amount DESC,r.due_date ASC,r.id ASC LIMIT 10000`, tenantID)
+	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE cs.migration_state='RELEASED' AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.open_amount DESC,r.due_date ASC,r.id ASC`, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +140,7 @@ func (w *Worker) agingCSV(ctx context.Context, tenantID string) ([]byte, error) 
 	if rulesErr != nil {
 		return nil, rulesErr
 	}
-	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,GREATEST(TIMESTAMPDIFF(DAY,r.due_date,UTC_DATE()),0),`+bucket+`,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY r.due_date ASC,r.id ASC LIMIT 10000`, tenantID)
+	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,GREATEST(TIMESTAMPDIFF(DAY,r.due_date,UTC_DATE()),0),`+bucket+`,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE cs.migration_state='RELEASED' AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY r.due_date ASC,r.id ASC`, tenantID)
 	if err != nil {
 		return nil, err
 	}

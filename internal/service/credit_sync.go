@@ -16,14 +16,17 @@ func insertCreditSync(ctx context.Context, tx *sql.Tx, tenant, eventID, allocati
 	return insertCreditSyncEvent(ctx, tx, tenant, eventID, allocationID, receivableID, creditEventCompleted, "", payload)
 }
 
+// insertCreditSyncEvent 将历史结清事件暂存，普通事件维持待投递。
+// 参数：ctx为上下文，tx为账务事务，其余参数为事件和业务引用及不可变内容。
+// 返回值：持久化错误。
 func insertCreditSyncEvent(ctx context.Context, tx *sql.Tx, tenant, eventID, allocationID, receivableID, eventType, originalEventID string, payload []byte) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO settlement_credit_sync(id,tenant_id,event_id,event_type,original_event_id,allocation_id,receivable_id,status,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?, 'PENDING',?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, newID(), tenant, eventID, eventType, originalEventID, allocationID, receivableID, payload)
+	_, err := tx.ExecContext(ctx, `INSERT INTO settlement_credit_sync(id,tenant_id,event_id,event_type,original_event_id,allocation_id,receivable_id,status,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?, (SELECT CASE WHEN EXISTS(SELECT 1 FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.id=? AND cs.migration_state='HOLD') THEN 'HOLD' ELSE 'PENDING' END),?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, newID(), tenant, eventID, eventType, originalEventID, allocationID, receivableID, tenant, receivableID, payload)
 	return err
 }
 
-// RetryCreditSync 认领一个事件，发送一次并记录结果。
-// 有意由原请求或财务重试触发，
-// 不涉及后台扫描器。
+// RetryCreditSync 认领并重试信用同步，历史HOLD保持不可投递。
+// 参数：ctx为上下文，tenant/eventID为可信租户及目标信用事件。
+// 返回值：同步结果错误；历史暂存事件不会对外发送。
 func (s *Service) RetryCreditSync(ctx context.Context, tenant, eventID string) error {
 	if s.CreditPublisher == nil {
 		return errors.New("CRM credit publisher is not configured")
@@ -35,7 +38,7 @@ func (s *Service) RetryCreditSync(ctx context.Context, tenant, eventID string) e
 	defer tx.Rollback()
 	var id string
 	var payload []byte
-	err = tx.QueryRowContext(ctx, `SELECT id,payload_json FROM settlement_credit_sync WHERE tenant_id=? AND event_id=? AND status<>'DELIVERED' FOR UPDATE`, tenant, eventID).Scan(&id, &payload)
+	err = tx.QueryRowContext(ctx, `SELECT id,payload_json FROM settlement_credit_sync WHERE tenant_id=? AND event_id=? AND status IN ('PENDING','RETRY_WAIT') AND NOT EXISTS(SELECT 1 FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.id=settlement_credit_sync.receivable_id AND r.tenant_id=settlement_credit_sync.tenant_id AND cs.migration_state='HOLD') FOR UPDATE`, tenant, eventID).Scan(&id, &payload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}

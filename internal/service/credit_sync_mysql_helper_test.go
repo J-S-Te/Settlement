@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"github.com/j-s-te/settlement/internal/migration"
+	"github.com/j-s-te/settlement/migrations"
 	"os"
 	"regexp"
 	"strings"
@@ -33,9 +35,9 @@ func creditSyncMySQLRunDatabase() (string, error) {
 	return "settlement_e2e_" + hex.EncodeToString(nonce[:]), nil
 }
 
-// 工作器有意跨租户认领。为其提供新建数据库，
-// 不能向生产查询添加仅供测试的租户筛选。
-// 此辅助方法不迁移、认领或清理任何既有数据库。
+// newCreditSyncMySQLTestDB 新建独占信用同步测试库，避免跨租户worker认领其他任务记录。
+// 参数：t为测试上下文，只允许显式隔离DSN。
+// 返回值：独占连接及测试库名；不迁移或清理既有数据库。
 func newCreditSyncMySQLTestDB(t *testing.T) (*sql.DB, string) {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("SETTLEMENT_E2E_TEST_DSN"))
@@ -84,14 +86,9 @@ func newCreditSyncMySQLTestDB(t *testing.T) (*sql.DB, string) {
 	if err := db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&selected); err != nil || selected != name {
 		t.Fatal("MySQL test connection is not bound to the owned database (DSN withheld)")
 	}
-	for _, migration := range []string{"000008_credit_sync.sql", "000012_credit_sync_contract.sql"} {
-		body, err := os.ReadFile("../../migrations/" + migration)
-		if err != nil {
-			t.Fatalf("read credit-sync migration %s failed", migration)
-		}
-		if _, err := db.ExecContext(ctx, string(body)); err != nil {
-			t.Fatalf("apply credit-sync migration %s in owned database failed (DSN withheld)", migration)
-		}
+	if err := migration.Run(ctx, runCfg.FormatDSN(), migrations.Files); err != nil {
+		t.Fatalf("apply complete settlement test migrations: %v", err)
 	}
+
 	return db, strings.TrimPrefix(name, "settlement_e2e_")
 }
