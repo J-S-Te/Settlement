@@ -288,3 +288,37 @@ func TestMySQLRoleReminderDoesNotStarveBehindInvalidOwners(t *testing.T) {
 		})
 	}
 }
+
+// TestImportedFinanceHoldNoNotifications 验证历史逾期及待确认计划在重复扫描和重启时不催收。
+// 参数：t为测试上下文，只运行显式隔离MySQL。
+// 返回值：无，任一催收动作、通知或待发事件产生时失败。
+func TestImportedFinanceHoldNoNotifications(t *testing.T) {
+	db, _ := roleReminderMySQL(t)
+	ctx := context.Background()
+	tenant := "import-hold"
+	for _, q := range []string{
+		`INSERT INTO settlement_contract_snapshot(id,tenant_id,source_application,source_event_id,source_contract_id,source_contract_no,source_contract_version,customer_id,customer_name_snapshot,currency,contract_amount,financial_status,effective_at,created_at,updated_at,migration_state) VALUES('snapshot','import-hold','contract_management','event','source','IMPORT-1',1,'42','历史客户','CNY',100,'EFFECTIVE',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),'HOLD')`,
+		`INSERT INTO settlement_receivable_plan(id,tenant_id,contract_snapshot_id,installment_no,due_date,planned_amount,generation_source,confirmation_status,created_at,updated_at) VALUES('confirmed','import-hold','snapshot',1,'2020-01-01',60,'CONTRACT_EVENT','CONFIRMED',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3)),('pending','import-hold','snapshot',2,'2020-01-01',40,'CONTRACT_EVENT','PENDING_CONFIRMATION',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		`INSERT INTO settlement_receivable(id,tenant_id,receivable_no,contract_snapshot_id,receivable_plan_id,due_date,original_amount,open_amount,currency,recognition_status,collection_status,invoice_status,created_at,updated_at) VALUES('receivable','import-hold','AR-1','snapshot','confirmed','2020-01-01',60,60,'CNY','CONFIRMED','UNPAID','NOT_INVOICED',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		`INSERT INTO settlement_contract_responsibility(tenant_id,source_contract_id,owner_user_id,version,active,updated_at) VALUES('import-hold','source','sales',1,TRUE,UTC_TIMESTAMP(3))`,
+		`INSERT INTO settlement_dunning_policy(id,tenant_id,name,version,aging_from_days,aging_to_days,action_type,recipient_rule,channel,repeat_interval_days,priority,enabled,created_at,updated_at) VALUES('policy','import-hold','定制催收',1,1,36500,'REMIND','USER:collector','PLATFORM',1,'NORMAL',TRUE,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if err := (&Scanner{DB: db}).RunOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := (&RoleReminderWorker{DB: db, TenantID: tenant, Service: &service.Service{DB: db}, Directory: &roleDirectoryFixture{}}).RunOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, table := range []string{"settlement_dunning_action", "settlement_local_notification"} {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM "+table+" WHERE tenant_id=?", tenant).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("HOLD generated %s count=%d err=%v", table, n, err)
+		}
+	}
+}

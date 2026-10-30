@@ -28,13 +28,14 @@ type CreditEventPublisher interface {
 }
 
 type Service struct {
-	ProjectReferences   ProjectReferenceResolver
-	RoleDirectory       RoleDirectory
-	ERPProvider         ERPProvider
-	DB                  *sql.DB
-	CreditPublisher     CreditEventPublisher
-	InvoiceIssuanceMode string
-	TaxProviderCode     string
+	ProjectReferences     ProjectReferenceResolver
+	RoleDirectory         RoleDirectory
+	ERPProvider           ERPProvider
+	DB                    *sql.DB
+	ContractImportEnabled bool
+	CreditPublisher       CreditEventPublisher
+	InvoiceIssuanceMode   string
+	TaxProviderCode       string
 	// Optional only for directly constructed component tests. The HTTP API
 	// installs its live commercial gate for every invoice archive operation.
 	CheckInvoiceArchiveLicense func(context.Context) error
@@ -176,13 +177,17 @@ func textTooLong(value string, max int) bool {
 	return len([]rune(strings.TrimSpace(value))) > max
 }
 
-// IngestContract 在创建财务快照前存储原始事件。
-// 重放事件 ID 为成功空操作；若同一版本已存在但属于
-// 其他事件 ID，则拒绝，防止旧合同更新覆盖事实。
-// trustedTenant 是机器令牌验签得到的可信租户（AUD-2026-001）：报文声明的租户
-// 必须与之一致，否则持合法令牌的调用方可声明任意租户写入财务快照与应收计划
-// （对齐 ApplyTaxCallback 的租户一致性校验）。
+// IngestContract 用途：按普通v1语义接收财务事件。
+// 参数：ctx为上下文，source为来源，trustedTenant为验签租户，event为原事件。
+// 返回值：首次创建返回真，重复返回假；业务或存储错误保持失败。
 func (s *Service) IngestContract(ctx context.Context, source, trustedTenant string, event ContractEvent) (bool, error) {
+	return s.ingestContract(ctx, source, trustedTenant, event, nil)
+}
+
+// ingestContract 在原入站事务内可选建立导入暂存，保留普通合同首次生效语义。
+// 参数：ctx为上下文，source为来源，trustedTenant为可信租户，event为财务事件，imported为新协议命令。
+// 返回值：首次创建标识及协议、幂等或存储错误。
+func (s *Service) ingestContract(ctx context.Context, source, trustedTenant string, event ContractEvent, imported *ContractImportCommand) (bool, error) {
 	if _, err := required(event.EventID, "event_id"); err != nil {
 		return false, err
 	}
@@ -219,9 +224,21 @@ func (s *Service) IngestContract(ctx context.Context, source, trustedTenant stri
 		return false, err
 	}
 	defer tx.Rollback()
+	if imported != nil {
+		_, replay, e := claimIdempotency(ctx, tx, event.TenantID, "IMPORT_PREPARE", imported.EventID, event.Contract.ID, imported)
+		if e != nil {
+			return false, e
+		}
+		if replay {
+			return false, nil
+		}
+	}
 	var duplicateID string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM settlement_inbox_event WHERE tenant_id=? AND source_application=? AND event_id=?`, event.TenantID, source, event.EventID).Scan(&duplicateID)
 	if err == nil {
+		if imported != nil {
+			return false, ErrConflict
+		}
 		return false, nil
 	}
 	if err != sql.ErrNoRows {
@@ -257,6 +274,19 @@ func (s *Service) IngestContract(ctx context.Context, source, trustedTenant stri
 			return false, ErrConflict
 		}
 		return false, err
+	}
+	if imported != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE settlement_contract_snapshot SET migration_state='HOLD',import_snapshot_version=1 WHERE id=? AND tenant_id=?`, contractID, event.TenantID); err != nil {
+			return false, err
+		}
+		expectedFacts, _ := json.Marshal(imported.ExpectedFacts)
+		_, err = tx.ExecContext(ctx, `INSERT INTO settlement_contract_import(tenant_id,contract_snapshot_id,origin_import_item_id,source_revision,policy_digest,release_version,import_mode,owner_user_id,prepare_event_id,expected_facts_json) VALUES(?,?,?,?,?,?,?,?,?,?)`, event.TenantID, contractID, imported.OriginImportItemID, imported.SourceRevision, imported.PolicyDigest, imported.ReleaseVersion, imported.ImportMode, event.Contract.OwnerUserID, imported.EventID, expectedFacts)
+		if err != nil {
+			if mysqlDuplicate(err) {
+				return false, ErrConflict
+			}
+			return false, err
+		}
 	}
 	termTotal := new(big.Rat)
 	for _, term := range event.Contract.PaymentTerms {
@@ -344,6 +374,13 @@ func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, in Pl
 	if (confirmedDue != due || confirmedAmount != planned) && reason == "" {
 		return fmt.Errorf("%w: reason is required when plan values change", ErrInvalid)
 	}
+	var migrationState string
+	if err = tx.QueryRowContext(ctx, `SELECT migration_state FROM settlement_contract_snapshot WHERE tenant_id=? AND id=?`, p.TenantID, snapshot).Scan(&migrationState); err != nil {
+		return err
+	}
+	if migrationState == "HOLD" && (confirmedAmount != planned || confirmedDue != due) {
+		return ErrImportBlocked
+	}
 	if confirmedAmount != planned {
 		if err = checkPlanBudget(ctx, tx, p.TenantID, snapshot, id, confirmedAmount); err != nil {
 			return err
@@ -368,16 +405,21 @@ func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, in Pl
 }
 
 type ReceiptInput struct {
-	CustomerID    string `json:"customer_id"`
-	CustomerName  string `json:"customer_name"`
-	Amount        string `json:"amount"`
-	Currency      string `json:"currency"`
-	ReceiptDate   string `json:"receipt_date"`
-	PaymentMethod string `json:"payment_method"`
-	BankReference string `json:"bank_transaction_reference"`
+	ImportFact    *ImportFact `json:"import_fact,omitempty"`
+	CustomerID    string      `json:"customer_id"`
+	CustomerName  string      `json:"customer_name"`
+	Amount        string      `json:"amount"`
+	Currency      string      `json:"currency"`
+	ReceiptDate   string      `json:"receipt_date"`
+	PaymentMethod string      `json:"payment_method"`
+	BankReference string      `json:"bank_transaction_reference"`
 }
 
+// CreateReceipt 通过原回款校验记录凭证，并原子映射历史来源事实。
+// 参数：ctx为上下文，p为主体，key为幂等键，in为回款内容。
+// 返回值：凭证ID或参数、授权、幂等及存储错误。
 func (s *Service) CreateReceipt(ctx context.Context, p Principal, key string, in ReceiptInput) (string, error) {
+	key = importFactKey(in.ImportFact, key)
 	a, err := amount(in.Amount)
 	if err != nil {
 		return "", err
@@ -415,6 +457,28 @@ func (s *Service) CreateReceipt(ctx context.Context, p Principal, key string, in
 		return "", err
 	}
 	defer tx.Rollback()
+	if in.ImportFact != nil && !p.Allows("settlement.receipt.record") {
+		return "", ErrForbidden
+	}
+	existing, replay, err := claimImportFact(ctx, tx, p, in.ImportFact, "RECEIPT", id, in)
+	if err != nil {
+		return "", err
+	}
+	if replay {
+		return existing, nil
+	}
+	if in.ImportFact != nil {
+		if !p.Allows("settlement.receipt.record") {
+			return "", ErrForbidden
+		}
+		var customer, currency string
+		if err = tx.QueryRowContext(ctx, `SELECT customer_id,currency FROM settlement_contract_snapshot WHERE tenant_id=? AND id=?`, p.TenantID, in.ImportFact.ContractSnapshotID).Scan(&customer, &currency); err != nil {
+			return "", err
+		}
+		if customer != in.CustomerID || currency != in.Currency {
+			return "", ErrInvalid
+		}
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receipt(id,tenant_id,receipt_no,customer_id,customer_name_snapshot,amount,unallocated_amount,currency,receipt_date,payment_method,bank_transaction_reference,source_type,status,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, no, in.CustomerID, in.CustomerName, a, a, in.Currency, in.ReceiptDate, in.PaymentMethod, in.BankReference, "MANUAL", "AVAILABLE", key)
 	if err != nil {
 		if mysqlDuplicate(err) {
@@ -434,14 +498,19 @@ func (s *Service) CreateReceipt(ctx context.Context, p Principal, key string, in
 }
 
 type AllocationInput struct {
-	ReceiptID       string `json:"receipt_id"`
-	ReceivableID    string `json:"receivable_id"`
-	Amount          string `json:"amount"`
-	MatchMode       string `json:"match_mode"`
-	MatchConfidence int    `json:"match_confidence"`
+	ImportFact      *ImportFact `json:"import_fact,omitempty"`
+	ReceiptID       string      `json:"receipt_id"`
+	ReceivableID    string      `json:"receivable_id"`
+	Amount          string      `json:"amount"`
+	MatchMode       string      `json:"match_mode"`
+	MatchConfidence int         `json:"match_confidence"`
 }
 
+// ConfirmAllocation 核验客户币种和余额后核销，并原子映射历史分配关系。
+// 参数：ctx为上下文，p为主体，key为幂等键，in为核销内容。
+// 返回值：核销ID或参数、授权、幂等及存储错误。
 func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string, in AllocationInput) (string, error) {
+	key = importFactKey(in.ImportFact, key)
 	a, err := amount(in.Amount)
 	if err != nil {
 		return "", err
@@ -461,6 +530,54 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 		return "", err
 	}
 	defer tx.Rollback()
+	id := newID()
+	if in.ImportFact != nil && !p.Allows("settlement.allocation.confirm") {
+		return "", ErrForbidden
+	}
+	var snapshot string
+	if err = tx.QueryRowContext(ctx, `SELECT contract_snapshot_id FROM settlement_receivable WHERE tenant_id=? AND id=?`, p.TenantID, in.ReceivableID).Scan(&snapshot); err != nil {
+		return "", err
+	}
+	// 来源事实始终绑定真实应收快照，目标已放行也不能跨合同核销。
+	if in.ImportFact != nil && in.ImportFact.ContractSnapshotID != snapshot {
+		return "", ErrInvalid
+	}
+	existing, replay, err := claimImportFact(ctx, tx, p, in.ImportFact, "ALLOCATION", id, in)
+	if err != nil {
+		return "", err
+	}
+	if replay {
+		return existing, nil
+	}
+	if err = lockImportWrite(ctx, tx, p, snapshot); err != nil {
+		return "", err
+	}
+	var migration string
+	if err = tx.QueryRowContext(ctx, `SELECT migration_state FROM settlement_contract_snapshot WHERE tenant_id=? AND id=?`, p.TenantID, snapshot).Scan(&migration); err != nil {
+		return "", err
+	}
+	if migration == "HOLD" && (in.ImportFact == nil || in.ImportFact.ContractSnapshotID != snapshot || !p.Allows("settlement.allocation.confirm")) {
+		return "", ErrForbidden
+	}
+	if in.ImportFact != nil {
+		var receipt string
+		var installment int
+		if err = tx.QueryRowContext(ctx, `SELECT target_business_id FROM settlement_import_fact WHERE tenant_id=? AND contract_snapshot_id=? AND source_system=? AND fact_type='RECEIPT' AND external_fact_id=?`, p.TenantID, snapshot, in.ImportFact.SourceSystem, in.ImportFact.OriginalReceiptFactID).Scan(&receipt); err != nil {
+			return "", ErrInvalid
+		}
+		if err = tx.QueryRowContext(ctx, `SELECT rp.installment_no FROM settlement_receivable r JOIN settlement_receivable_plan rp ON rp.id=r.receivable_plan_id AND rp.tenant_id=r.tenant_id WHERE r.tenant_id=? AND r.id=?`, p.TenantID, in.ReceivableID).Scan(&installment); err != nil {
+			return "", err
+		}
+		if receipt != in.ReceiptID || installment != in.ImportFact.OriginalInstallmentNo {
+			return "", ErrInvalid
+		}
+	}
+
+	if in.ImportFact == nil {
+		if err = rejectImportedReceiptMutation(ctx, tx, p.TenantID, in.ReceiptID); err != nil {
+			return "", err
+		}
+	}
 	var receiptAvailable, receiptCurrency, receiptDate, receivableOpen, receivableOriginal, receivableCurrency, receiptCustomer, receivableCustomer string
 	var dueDate, contractNo string
 	var installment int
@@ -487,7 +604,6 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 	if decimalGreater(a, receiptAvailable) || decimalGreater(a, receivableOpen) {
 		return "", ErrConflict
 	}
-	id := newID()
 	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receipt_allocation(id,tenant_id,allocation_no,receipt_id,receivable_id,allocated_amount,currency,status,match_mode,match_confidence,confirmed_by,confirmed_at,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),?,UTC_TIMESTAMP(3))`, id, p.TenantID, "AL-"+id[:12], in.ReceiptID, in.ReceivableID, a, receiptCurrency, "CONFIRMED", in.MatchMode, in.MatchConfidence, p.UserID, key)
 	if err != nil {
 		if mysqlDuplicate(err) {

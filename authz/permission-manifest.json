@@ -1,6 +1,6 @@
 {
-  "catalog_version": "3",
-  "claims_role_config_hash": "settlement-v3-business-roles-scopes",
+  "catalog_version": "4",
+  "claims_role_config_hash": "settlement-v4-contract-import",
   "policy": {
     "max_effective_roles": 12
   },
@@ -228,6 +228,22 @@
       "resource_code": "voucher",
       "resource_name": "生成回传收款凭证",
       "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.import.reconcile",
+      "name": "核对历史导入财务",
+      "action": "reconcile",
+      "resource_code": "contract_import",
+      "resource_name": "历史合同导入",
+      "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.import.release",
+      "name": "审批历史导入财务放行",
+      "action": "release",
+      "resource_code": "contract_import",
+      "resource_name": "历史合同导入",
+      "risk_level": "HIGH"
     }
   ],
   "roles": [
@@ -262,7 +278,9 @@
         "settlement.invoice.special_approve",
         "settlement.difference.manage",
         "settlement.difference.approve",
-        "settlement.voucher.manage"
+        "settlement.voucher.manage",
+        "settlement.import.reconcile",
+        "settlement.import.release"
       ]
     },
     {
@@ -282,7 +300,9 @@
         "settlement.receipt.read",
         "settlement.allocation.read",
         "settlement.difference.manage",
-        "settlement.voucher.manage"
+        "settlement.voucher.manage",
+        "settlement.import.reconcile",
+        "settlement.import.release"
       ]
     },
     {
@@ -364,7 +384,9 @@
         "settlement.mapping.manage",
         "settlement.difference.manage",
         "settlement.difference.approve",
-        "settlement.voucher.manage"
+        "settlement.voucher.manage",
+        "settlement.import.reconcile",
+        "settlement.import.release"
       ]
     },
     {

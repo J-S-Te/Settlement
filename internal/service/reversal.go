@@ -6,6 +6,9 @@ import (
 	"math/big"
 )
 
+// ReverseAllocation 通过独立审批冲销普通核销，历史恢复缺少适配器时明确阻塞。
+// 参数：ctx为上下文，p为主体，key为幂等键，allocationID为原核销，in为原因及金额。
+// 返回值：冲销ID或校验、授权及持久化错误。
 func (s *Service) ReverseAllocation(ctx context.Context, p Principal, key, allocationID string, in ReversalInput) (string, error) {
 	if textTooLong(in.ReasonCode, 64) || textTooLong(in.ReasonDetail, 500) {
 		return "", fmt.Errorf("%w: reversal reason exceeds the length limit", ErrInvalid)
@@ -26,6 +29,9 @@ func (s *Service) ReverseAllocation(ctx context.Context, p Principal, key, alloc
 	err = tx.QueryRowContext(ctx, `SELECT a.receipt_id,a.receivable_id,a.currency,a.confirmed_by,a.allocated_amount,COALESCE((SELECT SUM(r.reversed_amount) FROM settlement_receipt_allocation_reversal r WHERE r.original_allocation_id=a.id),0) FROM settlement_receipt_allocation a WHERE a.id=? AND a.tenant_id=? AND a.status IN('CONFIRMED','PARTIALLY_REVERSED') FOR UPDATE`, allocationID, p.TenantID).Scan(&receiptID, &receivableID, &currency, &confirmedBy, &allocated, &reversed)
 	if err != nil {
 		return "", ErrConflict
+	}
+	if err = rejectImportedReceiptMutation(ctx, tx, p.TenantID, receiptID); err != nil {
+		return "", err
 	}
 	if confirmedBy == p.UserID {
 		return "", fmt.Errorf("%w: allocation confirmer cannot approve reversal", ErrInvalid)

@@ -160,11 +160,11 @@ func (s *Service) ReviewSpecialInvoice(ctx context.Context, p Principal, id stri
 	if err = tx.QueryRowContext(ctx, `SELECT submitted_by,contract_snapshot_id FROM settlement_invoice_request WHERE id=? AND tenant_id=? AND status='SPECIAL_REVIEW' AND version=? FOR UPDATE`, id, p.TenantID, version).Scan(&applicant, &snapshot); err != nil {
 		return "", ErrConflict
 	}
-	if err = s.RequireContractAccessTx(ctx, tx, p, "settlement.invoice.special_approve", snapshot); err != nil {
-		return "", err
-	}
 	if applicant == p.UserID {
 		return "", ErrForbidden
+	}
+	if err = s.RequireContractAccessTx(ctx, tx, p, "settlement.invoice.special_approve", snapshot); err != nil {
+		return "", err
 	}
 	state := "APPROVED"
 	if !approve {

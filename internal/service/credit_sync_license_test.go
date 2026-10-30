@@ -14,6 +14,9 @@ import (
 	"github.com/j-s-te/settlement/internal/testutil/scriptdb"
 )
 
+// TestRetryCreditSyncTokenExpiryKeepsClaimRecoverable 验证RetryCreditSyncTokenExpiryKeepsClaimRecoverable的业务约束与回归行为。
+// 参数：t为测试上下文，使用独立夹具。
+// 返回值：无；预期结果或状态不一致时测试失败。
 func TestRetryCreditSyncTokenExpiryKeepsClaimRecoverable(t *testing.T) {
 	var expired atomic.Bool
 	var tokens, posts atomic.Int32
@@ -42,7 +45,7 @@ func TestRetryCreditSyncTokenExpiryKeepsClaimRecoverable(t *testing.T) {
 	})
 	db := scriptdb.Open(t,
 		scriptdb.Step{Kind: "begin"},
-		scriptdb.Step{Kind: "query", SQL: "status<>'DELIVERED' FOR UPDATE", Rows: [][]driver.Value{{"row-1", []byte(`{}`)}}},
+		scriptdb.Step{Kind: "query", SQL: "status IN ('PENDING','RETRY_WAIT')", Rows: [][]driver.Value{{"row-1", []byte(`{}`)}}},
 		scriptdb.Step{Kind: "exec", SQL: "status='PROCESSING',locked_at=UTC_TIMESTAMP(3)"},
 		scriptdb.Step{Kind: "commit"},
 	)
@@ -54,6 +57,9 @@ func TestRetryCreditSyncTokenExpiryKeepsClaimRecoverable(t *testing.T) {
 	// locked_at 仍可供正常过期租约恢复。
 }
 
+// TestRetryCreditSyncNormalOutcomesStillRecorded 验证RetryCreditSyncNormalOutcomesStillRecorded的业务约束与回归行为。
+// 参数：t为测试上下文，使用独立夹具。
+// 返回值：无；预期结果或状态不一致时测试失败。
 func TestRetryCreditSyncNormalOutcomesStillRecorded(t *testing.T) {
 	for _, failed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("failed=%v", failed), func(t *testing.T) {
@@ -64,7 +70,7 @@ func TestRetryCreditSyncNormalOutcomesStillRecorded(t *testing.T) {
 			}
 			db := scriptdb.Open(t,
 				scriptdb.Step{Kind: "begin"},
-				scriptdb.Step{Kind: "query", SQL: "status<>'DELIVERED' FOR UPDATE", Rows: [][]driver.Value{{"row-1", []byte(`{}`)}}},
+				scriptdb.Step{Kind: "query", SQL: "status IN ('PENDING','RETRY_WAIT')", Rows: [][]driver.Value{{"row-1", []byte(`{}`)}}},
 				scriptdb.Step{Kind: "exec", SQL: "status='PROCESSING'"},
 				scriptdb.Step{Kind: "commit"},
 				scriptdb.Step{Kind: "exec", SQL: outcome},

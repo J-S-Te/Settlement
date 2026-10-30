@@ -54,6 +54,9 @@ func (s *Service) CreateReceiptDifference(ctx context.Context, p Principal, in R
 		return "", err
 	}
 	defer tx.Rollback()
+	if err = rejectImportedReceiptMutation(ctx, tx, p.TenantID, in.ReceiptID); err != nil {
+		return "", err
+	}
 	id := newID()
 	if existing, replay, claimErr := claimIdempotency(ctx, tx, p.TenantID, "CREATE_RECEIPT_DIFFERENCE", in.Key, id, in); claimErr != nil {
 		return "", claimErr

@@ -63,6 +63,7 @@ type Config struct {
 	PersonnelDirectoryClientID     string
 	PersonnelDirectoryClientSecret string
 	CRMCreditSyncEnabled           bool
+	ContractImportEnabled          bool
 	CRMCreditEndpoint              string
 	CRMCreditTokenEndpoint         string
 	CRMCreditClientID              string
@@ -85,6 +86,9 @@ type Config struct {
 // Load 用途：读取并校验结算启动配置，拒绝不完整的项目引用机器身份。
 // 参数：无，从进程环境读取配置。
 // 返回值：返回经校验配置及配置错误，不输出凭据。
+// Load 从实际环境加载结算配置，新历史导入入口严格布尔且默认关闭。
+// 参数：无。
+// 返回值：校验后的配置，环境值或依赖配置错误返回错误。
 func Load() (Config, error) {
 	trustedProxies, trustedErr := parseTrustedProxies(env("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128"))
 	if trustedErr != nil {
@@ -167,6 +171,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.OutboxWorkerEnabled, err = boolEnv("SETTLEMENT_OUTBOX_WORKER_ENABLED", true); err != nil {
+		return c, err
+	}
+	if c.ContractImportEnabled, err = boolEnv("SETTLEMENT_CONTRACT_IMPORT_ENABLED", false); err != nil {
 		return c, err
 	}
 	if c.CRMCreditSyncEnabled, err = boolEnv("SETTLEMENT_CRM_CREDIT_SYNC_ENABLED", false); err != nil {

@@ -77,7 +77,7 @@ func (w *RoleReminderWorker) RunOnce(ctx context.Context) error {
  JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE
  LEFT JOIN settlement_receivable r ON r.receivable_plan_id=rp.id AND r.tenant_id=rp.tenant_id
  LEFT JOIN settlement_role_reminder_cursor rc ON rc.tenant_id=rp.tenant_id AND rc.plan_id=rp.id AND rc.phase=CASE WHEN DATEDIFF(CURDATE(),rp.due_date)>=? THEN 'ESCALATED' WHEN rp.due_date<CURDATE() THEN 'OVERDUE' WHEN rp.confirmation_status<>'CONFIRMED' THEN 'PLAN_CONFIRMATION' ELSE 'DUE_SOON' END
- WHERE rp.tenant_id=? AND cs.financial_status='EFFECTIVE' AND rp.due_date<=DATE_ADD(CURDATE(),INTERVAL ? DAY)
+ WHERE rp.tenant_id=? AND cs.financial_status='EFFECTIVE' AND cs.migration_state='RELEASED' AND rp.due_date<=DATE_ADD(CURDATE(),INTERVAL ? DAY)
  AND rp.planned_amount>0 AND (r.id IS NULL OR r.open_amount>0) AND (rc.next_at IS NULL OR rc.next_at<=UTC_TIMESTAMP(3) OR rc.owner_user_id<>cr.owner_user_id)
  AND NOT EXISTS(SELECT 1 FROM settlement_handover_freeze hf WHERE hf.tenant_id=rp.tenant_id AND hf.user_id=cr.owner_user_id AND hf.status='FROZEN')
  ORDER BY COALESCE(rc.next_at,'1000-01-01 00:00:00'),rp.due_date,rp.id LIMIT ?`
@@ -223,7 +223,7 @@ func (w *RoleReminderWorker) dispatch(ctx context.Context, c roleReminderCandida
 	var owner string
 	var aging int
 	var pending, settled bool
-	err = tx.QueryRowContext(ctx, `SELECT cr.owner_user_id,DATEDIFF(CURDATE(),rp.due_date),rp.confirmation_status<>'CONFIRMED',COALESCE(r.open_amount=0,FALSE) FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE LEFT JOIN settlement_receivable r ON r.receivable_plan_id=rp.id AND r.tenant_id=rp.tenant_id WHERE rp.tenant_id=? AND rp.id=? AND cs.financial_status='EFFECTIVE' FOR UPDATE`, w.TenantID, c.PlanID).Scan(&owner, &aging, &pending, &settled)
+	err = tx.QueryRowContext(ctx, `SELECT cr.owner_user_id,DATEDIFF(CURDATE(),rp.due_date),rp.confirmation_status<>'CONFIRMED',COALESCE(r.open_amount=0,FALSE) FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE LEFT JOIN settlement_receivable r ON r.receivable_plan_id=rp.id AND r.tenant_id=rp.tenant_id WHERE rp.tenant_id=? AND rp.id=? AND cs.financial_status='EFFECTIVE' AND cs.migration_state='RELEASED' FOR UPDATE`, w.TenantID, c.PlanID).Scan(&owner, &aging, &pending, &settled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -303,6 +303,10 @@ func (w *RoleReminderWorker) dispatch(ctx context.Context, c roleReminderCandida
 // 参数：ctx 上下文，tx 事务，c 计划，caseID 案件，recipient 有效接收者，phase 阶段。
 // 返回值：持久化错误。
 func (w *RoleReminderWorker) insertRoleAction(ctx context.Context, tx *sql.Tx, c roleReminderCandidate, caseID, recipient, phase string) error {
+	var releaseVersion uint64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(ci.release_version,0) FROM settlement_contract_snapshot cs LEFT JOIN settlement_contract_import ci ON ci.contract_snapshot_id=cs.id AND ci.tenant_id=cs.tenant_id WHERE cs.tenant_id=? AND cs.id=? AND cs.migration_state='RELEASED' FOR SHARE`, w.TenantID, c.SnapshotID).Scan(&releaseVersion); err != nil {
+		return err
+	}
 	eventID, actionID := id(), id()
 	resourceType := "dunning_action"
 	target := "/settlement/dunning"
@@ -329,7 +333,7 @@ func (w *RoleReminderWorker) insertRoleAction(ctx context.Context, tx *sql.Tx, c
 	if err != nil {
 		return err
 	}
-	payload, _ := json.Marshal(map[string]any{"event_id": eventID, "event_type": "SETTLEMENT_OWNER_REMINDER", "recipient_user_ids": []string{recipient}, "title": title, "content": content, "priority": priority, "notification_scope": "CROSS_SYSTEM", "target_url": target, "reference_type": "RECEIVABLE_PLAN", "reference_id": c.PlanID, "idempotency_key": eventID, "occurred_at": time.Now().UTC().Format(time.RFC3339Nano)})
+	payload, _ := json.Marshal(map[string]any{"import_release_version": releaseVersion, "event_id": eventID, "event_type": "SETTLEMENT_OWNER_REMINDER", "recipient_user_ids": []string{recipient}, "title": title, "content": content, "priority": priority, "notification_scope": "CROSS_SYSTEM", "target_url": target, "reference_type": "RECEIVABLE_PLAN", "reference_id": c.PlanID, "idempotency_key": eventID, "occurred_at": time.Now().UTC().Format(time.RFC3339Nano)})
 	if phase == "ESCALATED" {
 		_, err = tx.ExecContext(ctx, `INSERT INTO settlement_outbox_event(id,tenant_id,event_id,destination,event_type,aggregate_type,aggregate_id,payload_json,status,available_at,created_at,updated_at) VALUES(?,?,?,'PLATFORM_NOTIFICATION','SETTLEMENT_OWNER_REMINDER',?,?,?,'PENDING',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id(), w.TenantID, eventID, resourceType, actionID, payload)
 		if err != nil {

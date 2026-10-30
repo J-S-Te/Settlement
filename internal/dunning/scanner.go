@@ -116,7 +116,7 @@ JOIN settlement_dunning_policy p ON p.id=(
 )
 LEFT JOIN settlement_dunning_case dc ON dc.receivable_id=r.id AND dc.tenant_id=r.tenant_id
   AND dc.dunning_policy_id=p.id AND dc.policy_version=p.version
-WHERE r.open_amount>0 AND r.due_date<CURDATE() AND dc.id IS NULL
+WHERE r.open_amount>0 AND cs.migration_state='RELEASED' AND r.due_date<CURDATE() AND dc.id IS NULL
 ORDER BY r.due_date,r.id LIMIT ?`, s.BatchSize)
 	if err != nil {
 		return err
@@ -169,7 +169,7 @@ FROM settlement_dunning_case dc
 JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id
 JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id
 JOIN settlement_dunning_policy p ON p.id=dc.dunning_policy_id AND p.tenant_id=dc.tenant_id AND p.version=dc.policy_version AND p.enabled=TRUE AND p.recipient_rule<>'CONTRACT_OWNER'
-WHERE dc.status='ACTIVE' AND r.open_amount>0 AND dc.next_action_at<=UTC_TIMESTAMP(3)
+WHERE cs.migration_state='RELEASED' AND dc.status='ACTIVE' AND r.open_amount>0 AND dc.next_action_at<=UTC_TIMESTAMP(3)
 ORDER BY dc.next_action_at,dc.id LIMIT ?`, s.BatchSize)
 	if err != nil {
 		return err
@@ -284,11 +284,22 @@ WHERE tenant_id=? AND id=? AND status='ACTIVE'`, repeat, d.TenantID, d.CaseID); 
 	return tx.Commit()
 }
 
+// insertAction 在发送载体创建前重核财务放行并冻结放行版本。
+// 参数：ctx为上下文，tx为事务，其余字段为候选业务、接收人及提醒内容。
+// 返回值：许可、暂存状态或持久化错误。
 func (s *Scanner) insertAction(ctx context.Context, tx *sql.Tx, tenant, caseID, receivableID, actionType, recipient, channel, priority, eventID, number, customer string, aging int) error {
 	// 目录及行锁等待可能跨越签名到期时间。检查每次
 	// 写入，暂停时由调用方回滚整个事务。
 	if err := s.checkBusinessLicense(ctx); err != nil {
 		return err
+	}
+	var state string
+	var releaseVersion uint64
+	if err := tx.QueryRowContext(ctx, `SELECT cs.migration_state,COALESCE(ci.release_version,0) FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id LEFT JOIN settlement_contract_import ci ON ci.contract_snapshot_id=cs.id AND ci.tenant_id=cs.tenant_id WHERE r.tenant_id=? AND r.id=? FOR SHARE`, tenant, receivableID).Scan(&state, &releaseVersion); err != nil {
+		return err
+	}
+	if state != "RELEASED" {
+		return nil
 	}
 	title := "应收逾期提醒"
 	content := fmt.Sprintf("%s的应收单%s已逾期%d天，请及时跟进并完成催收动作。", customer, number, aging)
@@ -314,7 +325,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3))`, id(), tenant, recipient, eventI
 		if err := s.checkBusinessLicense(ctx); err != nil {
 			return err
 		}
-		payload, _ := json.Marshal(map[string]any{"event_id": eventID, "event_type": "SETTLEMENT_RECEIVABLE_OVERDUE", "notification_scope": "CROSS_SYSTEM", "priority": priority, "title": title, "content": content, "target_url": "/settlement/dunning", "reference_type": "RECEIVABLE", "reference_id": receivableID, "idempotency_key": eventID, "recipient_user_ids": []string{recipient}, "occurred_at": s.now().UTC().Format(time.RFC3339Nano)})
+		payload, _ := json.Marshal(map[string]any{"import_release_version": releaseVersion, "event_id": eventID, "event_type": "SETTLEMENT_RECEIVABLE_OVERDUE", "notification_scope": "CROSS_SYSTEM", "priority": priority, "title": title, "content": content, "target_url": "/settlement/dunning", "reference_type": "RECEIVABLE", "reference_id": receivableID, "idempotency_key": eventID, "recipient_user_ids": []string{recipient}, "occurred_at": s.now().UTC().Format(time.RFC3339Nano)})
 		if _, err := tx.ExecContext(ctx, `INSERT INTO settlement_outbox_event(id,tenant_id,event_id,destination,event_type,aggregate_type,aggregate_id,payload_json,status,available_at,created_at,updated_at)
 VALUES(?,?,?,?,?,?,?,?,'PENDING',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id(), tenant, eventID, "PLATFORM_NOTIFICATION", "SETTLEMENT_RECEIVABLE_OVERDUE", "receivable", caseID, payload); err != nil {
 			return err

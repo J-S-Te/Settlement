@@ -211,6 +211,9 @@ func TestCreditReversalCancelsUndeliveredCompletionByReceivable(t *testing.T) {
 	}
 }
 
+// TestCreditReversalCompensatesDeliveredCompletionByIdentity 验证CreditReversalCompensatesDeliveredCompletionByIdentity的业务约束与回归行为。
+// 参数：t为测试上下文，使用独立夹具。
+// 返回值：无；预期结果或状态不一致时测试失败。
 func TestCreditReversalCompensatesDeliveredCompletionByIdentity(t *testing.T) {
 	payload := completedCreditPayload(t, "ALLOC-B")
 	var insertedEventID string
@@ -224,7 +227,7 @@ func TestCreditReversalCompensatesDeliveredCompletionByIdentity(t *testing.T) {
 		execs: []creditReversalExecStep{{
 			match: "INSERT INTO settlement_credit_sync",
 			check: func(args []driver.NamedValue) error {
-				if len(args) != 8 {
+				if len(args) != 10 {
 					return fmt.Errorf("reversal insert args=%v", args)
 				}
 				insertedEventID = fmt.Sprint(args[2].Value)
@@ -234,9 +237,9 @@ func TestCreditReversalCompensatesDeliveredCompletionByIdentity(t *testing.T) {
 						return fmt.Errorf("reversal insert arg %d=%v, want %q", index, args[index].Value, value)
 					}
 				}
-				raw, ok := args[7].Value.([]byte)
+				raw, ok := args[9].Value.([]byte)
 				if !ok {
-					return fmt.Errorf("reversal payload type %T", args[7].Value)
+					return fmt.Errorf("reversal payload type %T", args[9].Value)
 				}
 				var event map[string]any
 				if err := json.Unmarshal(raw, &event); err != nil {
