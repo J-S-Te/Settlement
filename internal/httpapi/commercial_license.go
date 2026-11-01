@@ -22,6 +22,9 @@ func (a *API) checkInvoiceArchiveLicense(ctx context.Context) error {
 // 参数：method为HTTP方法，path为代码内匹配的API路径。
 // 返回值：返回对应许可类别；未知路径继续按业务变更处理。
 func commercialOperation(method, path string) core.Operation {
+	if method == http.MethodGet && path == "/auth/session" || method == http.MethodPost && path == "/auth/activity" {
+		return core.ESSENTIAL_SERVICE
+	}
 	if method == http.MethodOptions {
 		return core.ESSENTIAL_SERVICE
 	}
