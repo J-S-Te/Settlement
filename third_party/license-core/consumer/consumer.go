@@ -76,6 +76,16 @@ func publicKey(raw []byte) (ed25519.PublicKey, error) {
 // 若缺少信任、绑定或凭据，禁止回退到其他模式。
 func FromEnvironment(application string) (*Gate, error) { return FromLookup(application, os.Getenv) }
 
+// 兼容模式（全放行）不是默认值：组件必须显式声明
+// COMMERCIAL_LICENSE_COMPATIBILITY=true 才被允许以未授权方式启动。
+// 只接受大小写/首尾空白归一后的 "true"；"1"、"yes" 等取值一律按未开启处理，
+// 避免生产用 COMMERCIAL_LICENSE_ENABLED=false 冒充已授权。
+const compatibilitySwitch = "COMMERCIAL_LICENSE_COMPATIBILITY"
+
+func compatibilityEnabled(get func(string) string) bool {
+	return strings.EqualFold(strings.TrimSpace(get(compatibilitySwitch)), "true")
+}
+
 // 兼容模式仅适用于从未登记的组件。
 // 固定的持久化挂载可防止重启后因环境文件缺失而静默关闭授权执行。
 func compatibilityAllowed(get func(string) string, stateDirectory string) error {
@@ -110,12 +120,21 @@ func registrationConfiguration(get func(string) string) (int, int, error) {
 }
 
 func FromLookup(application string, get func(string) string) (*Gate, error) {
+	return fromLookup(application, get, "/var/lib/commercial-license")
+}
+
+// fromLookup 抽离状态目录以便测试覆盖兼容模式的完整启动路径。
+func fromLookup(application string, get func(string) string, stateDirectory string) (*Gate, error) {
 	if get == nil {
 		return nil, ErrConfiguration
 	}
 	v := get("COMMERCIAL_LICENSE_ENABLED")
 	if v == "" || v == "false" {
-		if err := compatibilityAllowed(get, "/var/lib/commercial-license"); err != nil {
+		// 未启用受控授权的组件必须显式选择兼容模式，否则 fail-closed。
+		if !compatibilityEnabled(get) {
+			return nil, ErrConfiguration
+		}
+		if err := compatibilityAllowed(get, stateDirectory); err != nil {
 			return nil, err
 		}
 		return &Gate{}, nil

@@ -1,6 +1,7 @@
 module github.com/j-s-te/settlement
 
 go 1.26.4
+toolchain go1.26.10
 
 require (
 	github.com/J-S-Te/license-core v0.0.0
