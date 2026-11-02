@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"errors"
+	"github.com/j-s-te/settlement/internal/businessclock"
 	"github.com/j-s-te/settlement/internal/service"
 	"io"
 	"strings"
@@ -136,11 +137,16 @@ func (w *Worker) agingCSV(ctx context.Context, tenantID string) ([]byte, error) 
 	if rulesErr != nil {
 		return nil, rulesErr
 	}
-	bucket, rulesErr := service.BuildAgingCase(days, "r.due_date")
+	bucket, bucketArgs, rulesErr := service.BuildAgingCase(days, "r.due_date")
 	if rulesErr != nil {
 		return nil, rulesErr
 	}
-	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,GREATEST(TIMESTAMPDIFF(DAY,r.due_date,UTC_DATE()),0),`+bucket+`,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE cs.migration_state='RELEASED' AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY r.due_date ASC,r.id ASC`, tenantID)
+	// 占位符顺序：SELECT 中逾期天数基准日 → 账龄 CASE 各分档（bucketArgs）
+	// → WHERE 租户。逾期天数与账龄都以北京业务日为基准。
+	today := businessclock.Today()
+	args := append([]any{today}, bucketArgs...)
+	args = append(args, tenantID)
+	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,GREATEST(TIMESTAMPDIFF(DAY,r.due_date,?),0),`+bucket+`,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE cs.migration_state='RELEASED' AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY r.due_date ASC,r.id ASC`, args...)
 	if err != nil {
 		return nil, err
 	}

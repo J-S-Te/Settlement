@@ -45,6 +45,10 @@ func (s *Service) ReviewInvoiceRedFlush(ctx context.Context, p Principal, id str
 	if requestedBy == p.UserID {
 		return fmt.Errorf("%w: requester cannot review own red flush request", ErrConflict)
 	}
+	// 红冲复核按ID直接写入：经原票→开票申请解析合同快照并校验责任范围，范围外不得放行。
+	if err = s.requireTaxInvoiceScopeTx(ctx, tx, p, "settlement.invoice.approve", invoiceID); err != nil {
+		return err
+	}
 	if approve {
 		if s.invoiceIssuanceMode() != "tax_adapter" {
 			return fmt.Errorf("%w: red flush approval requires tax_adapter issuance mode", ErrConflict)

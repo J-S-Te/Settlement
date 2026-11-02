@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/j-s-te/settlement/internal/businessclock"
 	"github.com/j-s-te/settlement/internal/config"
 	"github.com/j-s-te/settlement/internal/handover"
 	"github.com/j-s-te/settlement/internal/platform"
@@ -178,11 +179,29 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		write(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	case r.URL.Path == "/readyz":
+		if a.service == nil || a.service.DB == nil {
+			fail(w, http.StatusServiceUnavailable, "SETTLEMENT_NOT_READY", "数据库不可用")
+			return
+		}
 		if err := a.service.DB.PingContext(r.Context()); err != nil {
 			fail(w, http.StatusServiceUnavailable, "SETTLEMENT_NOT_READY", "数据库不可用")
 			return
 		}
-		write(w, http.StatusOK, map[string]string{"status": "ready"})
+		// BIZ-XAPI-10：报告集成目的地缺失/积压；required 审计缺失 → 503，
+		// 非 required 缺失或未配置目的地积压 → 200 degraded。
+		status, body := evaluateReadiness(a.integrationSnapshot(r.Context()))
+		if status == http.StatusServiceUnavailable {
+			fail(w, status, "SETTLEMENT_AUDIT_DESTINATION_REQUIRED", "审计目的地为必开但机器凭据不全")
+			return
+		}
+		write(w, status, body)
+		return
+	case r.URL.Path == "/metrics" && r.Method == http.MethodGet:
+		// 指标只包含目的地名称、布尔与计数，不包含任何凭据或租户数据。
+		snapshot := a.integrationSnapshot(r.Context())
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(renderMetrics(snapshot)))
 		return
 	case r.URL.Path == "/auth/login":
 		a.login(w, r)
@@ -274,6 +293,12 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/api/v1/outbox/events/") && strings.HasSuffix(r.URL.Path, "/retry") && r.Method == http.MethodPost:
 		a.retryOutboxEvent(w, r)
 		return
+	case r.URL.Path == "/api/v1/tax-command-dead-letters" && r.Method == http.MethodGet:
+		a.listTaxCommandDeadLetters(w, r)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/tax-command-dead-letters/") && strings.HasSuffix(r.URL.Path, "/retry") && r.Method == http.MethodPost:
+		a.retryTaxCommandDeadLetter(w, r)
+		return
 	case r.URL.Path == "/api/v1/reports/aging" && r.Method == http.MethodGet:
 		a.agingSummary(w, r)
 		return
@@ -291,6 +316,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/receivable-plans/") && strings.HasSuffix(r.URL.Path, "/confirm") && r.Method == http.MethodPost:
 		a.confirmPlan(w, r)
+		return
+	case r.URL.Path == "/api/v1/plan-coverage" && r.Method == http.MethodGet:
+		a.planCoverage(w, r)
 		return
 	case r.URL.Path == "/api/v1/receivables" && r.Method == http.MethodGet:
 		a.listReceivables(w, r, false)
@@ -350,11 +378,22 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/recover-failure") && r.Method == http.MethodPost:
 		a.recoverInvoiceFailure(w, r)
 		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/cancel") && r.Method == http.MethodPost:
+		a.cancelInvoiceRequest(w, r)
+		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/reject") && r.Method == http.MethodPost:
 		a.rejectInvoiceRequest(w, r)
 		return
 	case strings.HasPrefix(r.URL.Path, "/api/v1/invoice-requests/") && strings.HasSuffix(r.URL.Path, "/manual-issue") && r.Method == http.MethodPost:
 		a.manualIssueInvoice(w, r)
+		return
+	case r.URL.Path == "/api/v1/contract-revision-holds" && r.Method == http.MethodGet:
+		// BIZ-XEVT2-05c：合同修订人工复核工单是财务处理差异的入口，
+		// 只按可信主体租户与合同责任范围读取。
+		a.listContractRevisionHolds(w, r)
+		return
+	case strings.HasPrefix(r.URL.Path, "/api/v1/contract-revision-holds/") && strings.HasSuffix(r.URL.Path, "/resolve") && r.Method == http.MethodPost:
+		a.resolveContractRevisionHold(w, r)
 		return
 	case r.URL.Path == "/api/v1/dunning/policies" && r.Method == http.MethodGet:
 		a.listDunningPolicies(w, r)
@@ -409,10 +448,23 @@ func (a *API) retryCreditSync(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusNotFound, "SETTLEMENT_NOT_FOUND", "未找到信用同步事件")
 			return
 		}
-		fail(w, http.StatusServiceUnavailable, "SETTLEMENT_CREDIT_SYNC_FAILED", "CRM 信用同步失败，已保留待重发状态")
+		status, code, message := creditSyncRetryFailure(err)
+		fail(w, status, code, message)
 		return
 	}
 	write(w, http.StatusOK, map[string]string{"event_id": eventID, "status": "DELIVERED"})
+}
+
+// creditSyncRetryFailure 把信用同步重试失败映射为对外错误。
+// 返回：HTTP 状态、错误码、中文提示。
+// 401/403（凭据或用途未获授权）是配置问题，必须返回不可立即重试的 409 并提示先修
+// 接入绑定；把它们统一成 503 会让运营把配置漂移当成瞬时故障反复重试（BIZ-XAPI-02）。
+// 5xx/网络类失败仍返回 503，表示事件已保留待重发、可稍后重试。
+func creditSyncRetryFailure(err error) (int, string, string) {
+	if errors.Is(err, service.ErrCreditSyncAuthorization) {
+		return http.StatusConflict, "SETTLEMENT_CREDIT_SYNC_AUTHORIZATION_FAILED", "CRM 信用同步的机器凭据或用途未获授权，请先修复 CRM 接入的 scope/用途绑定后再重试"
+	}
+	return http.StatusServiceUnavailable, "SETTLEMENT_CREDIT_SYNC_FAILED", "CRM 信用同步失败，已保留待重发状态"
 }
 
 // 开发认证必须显式且仅限本地。生产在暴露任何业务
@@ -571,7 +623,7 @@ func (a *API) contractEvent(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &event) {
 		return
 	}
-	created, err := a.service.IngestContract(r.Context(), "contract_management", trustedTenant, event)
+	result, err := a.service.IngestContract(r.Context(), "contract_management", trustedTenant, event)
 	if err != nil {
 		if a.logger != nil {
 			a.logger.Error("contract financial event ingest failed", "event_id", event.EventID, "contract_id", event.Contract.ID, "error", err)
@@ -579,7 +631,9 @@ func (a *API) contractEvent(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
-	write(w, http.StatusAccepted, map[string]any{"event_id": event.EventID, "accepted": true, "duplicate": !created})
+	// 202 是接收语义：首版、修订和转入人工复核都以 202 返回，合同侧投递即成功；
+	// 需要人工复核的差异通过 revision_hold 明示，而不是用 409 让合同侧空转重试。
+	write(w, http.StatusAccepted, map[string]any{"event_id": event.EventID, "accepted": true, "duplicate": !result.Created, "revision_hold": result.RevisionHeld, "hold_id": result.HoldID})
 }
 func (a *API) taxResult(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -632,7 +686,7 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var receivables, overdue, plans, invoices int
-	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*),COALESCE(SUM(CASE WHEN due_date<CURDATE() AND open_amount>0 THEN 1 ELSE 0 END),0) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.tenant_id=settlement_receivable.tenant_id AND import_cs.id=settlement_receivable.contract_snapshot_id AND import_cs.migration_state='RELEASED')`, p.TenantID).Scan(&receivables, &overdue); err != nil {
+	if err := a.service.DB.QueryRowContext(r.Context(), `SELECT COUNT(*),COALESCE(SUM(CASE WHEN due_date<? AND open_amount>0 THEN 1 ELSE 0 END),0) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.tenant_id=settlement_receivable.tenant_id AND import_cs.id=settlement_receivable.contract_snapshot_id AND import_cs.migration_state='RELEASED')`, businessclock.Today(), p.TenantID).Scan(&receivables, &overdue); err != nil {
 		respondError(w, err)
 		return
 	}
@@ -659,8 +713,9 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		return byCurrency[currency]
 	}
-	addRows := func(query, field string) error {
-		rows, err := a.service.DB.QueryContext(r.Context(), query, p.TenantID)
+	addRows := func(query, field string, extraArgs ...any) error {
+		args := append([]any{p.TenantID}, extraArgs...)
+		rows, err := a.service.DB.QueryContext(r.Context(), query, args...)
 		if err != nil {
 			return err
 		}
@@ -688,7 +743,12 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
-	if err := addRows(`SELECT currency,COALESCE(SUM(amount),0) FROM settlement_receipt WHERE tenant_id=? AND NOT EXISTS(SELECT 1 FROM settlement_import_fact import_f JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_f.contract_snapshot_id AND import_cs.tenant_id=import_f.tenant_id WHERE import_f.tenant_id=settlement_receipt.tenant_id AND import_f.target_business_id=settlement_receipt.id AND import_f.fact_type='RECEIPT' AND import_cs.migration_state='HOLD') AND receipt_date>=DATE_FORMAT(CURDATE(),'%Y-%m-01') AND receipt_date<DATE_ADD(DATE_FORMAT(CURDATE(),'%Y-%m-01'),INTERVAL 1 MONTH) GROUP BY currency ORDER BY currency`, "receipts"); err != nil {
+	// 本月回款窗口按北京业务月首末日绑定：月末取“当月最后一天 00:00”，与 DATE
+	// 列用 <= 比较等价于包含当月最后一天（原 < 下月 1 日）。末日由同一个已读取的
+	// 月首推导，避免两次读时钟跨月时窗口跨越两个月。
+	monthStart := businessclock.MonthStart()
+	monthEnd := monthStart.AddDate(0, 1, -1)
+	if err := addRows(`SELECT currency,COALESCE(SUM(amount),0) FROM settlement_receipt WHERE tenant_id=? AND NOT EXISTS(SELECT 1 FROM settlement_import_fact import_f JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_f.contract_snapshot_id AND import_cs.tenant_id=import_f.tenant_id WHERE import_f.tenant_id=settlement_receipt.tenant_id AND import_f.target_business_id=settlement_receipt.id AND import_f.fact_type='RECEIPT' AND import_cs.migration_state='HOLD') AND receipt_date>=? AND receipt_date<=? GROUP BY currency ORDER BY currency`, "receipts", monthStart, monthEnd); err != nil {
 		respondError(w, err)
 		return
 	}
@@ -696,7 +756,7 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
-	if err := addRows(`SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.tenant_id=settlement_receivable.tenant_id AND import_cs.id=settlement_receivable.contract_snapshot_id AND import_cs.migration_state='RELEASED') AND open_amount>0 AND due_date<CURDATE() GROUP BY currency ORDER BY currency`, "overdue"); err != nil {
+	if err := addRows(`SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot import_cs WHERE import_cs.tenant_id=settlement_receivable.tenant_id AND import_cs.id=settlement_receivable.contract_snapshot_id AND import_cs.migration_state='RELEASED') AND open_amount>0 AND due_date<? GROUP BY currency ORDER BY currency`, "overdue", businessclock.Today()); err != nil {
 		respondError(w, err)
 		return
 	}
@@ -730,6 +790,46 @@ func (a *API) retryOutboxEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/outbox/events/"), "/retry")
 	if err := a.service.RetryOutboxEvent(r.Context(), p, id); err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]string{"id": id, "status": "PENDING"})
+}
+
+// listTaxCommandDeadLetters 列出税控命令死信，供财务显式处置。
+// 参数：w为响应，r为已鉴权查询请求；租户只取可信主体。
+// 返回值：无，结果或错误写入HTTP。
+func (a *API) listTaxCommandDeadLetters(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.invoice.issue")
+	if !ok {
+		return
+	}
+	items, err := a.service.ListTaxCommandDeadLetters(r.Context(), p, r.URL.Query().Get("invoice_request_id"), r.URL.Query().Get("command_id"))
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// retryTaxCommandDeadLetter 由财务显式重投税控命令死信。
+// 参数：w为响应，r为携带幂等键和原因的重试请求。
+// 返回值：无；成功仅把同一命令重置为待投递，不释放额度或改申请状态。
+func (a *API) retryTaxCommandDeadLetter(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.invoice.issue")
+	if !ok {
+		return
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/tax-command-dead-letters/"), "/retry")
+	if id == "" || strings.Contains(id, "/") {
+		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", "税控命令标识不合法")
+		return
+	}
+	var in service.TaxCommandDeadLetterRetryInput
+	if !decode(w, r, &in) {
+		return
+	}
+	if err := a.service.RetryTaxCommandDeadLetter(r.Context(), p, r.Header.Get("Idempotency-Key"), id, in); err != nil {
 		respondError(w, err)
 		return
 	}
@@ -784,7 +884,7 @@ func (a *API) invoicedReceivablesTop10(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
-	write(w, http.StatusOK, map[string]any{"as_of_date": time.Now().UTC().Format("2006-01-02"), "items": items})
+	write(w, http.StatusOK, map[string]any{"as_of_date": businessclock.DateString(businessclock.Now()), "items": items})
 }
 func (a *API) createInvoicedReceivablesExport(w http.ResponseWriter, r *http.Request) {
 	a.createReportExport(w, r, "INVOICED_RECEIVABLES_CSV")
@@ -945,6 +1045,32 @@ func (a *API) confirmPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusOK, map[string]string{"status": "confirmed"})
+}
+
+// planCoverage 用途：返回计划合计与合同金额的差额，供财务持续可见。
+// 参数：w为响应，r为带可选contract_snapshot_id的只读查询。
+// 返回值：无；单个合同返回一条视图，缺省返回可见范围内所有差额合同。
+func (a *API) planCoverage(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.user(w, r, "settlement.receivable.read")
+	if !ok {
+		return
+	}
+	snapshot := strings.TrimSpace(r.URL.Query().Get("contract_snapshot_id"))
+	if snapshot != "" {
+		item, err := a.service.PlanCoverage(r.Context(), p, snapshot)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		write(w, http.StatusOK, map[string]any{"items": []service.PlanCoverageView{item}})
+		return
+	}
+	items, err := a.service.ListPlanCoverageDeviations(r.Context(), p)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	write(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (a *API) receiptMatches(w http.ResponseWriter, r *http.Request) {
@@ -1962,7 +2088,7 @@ func (a *API) listDunningCases(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.queryScoped(r.Context(), p, "settlement.dunning.read", `SELECT dc.id,COALESCE(r.receivable_no,CONCAT('PLAN-',rp.installment_no)),cs.customer_name_snapshot,DATEDIFF(CURDATE(),COALESCE(r.due_date,rp.due_date)),COALESCE(r.open_amount,rp.planned_amount),dc.current_escalation_level,dc.status,dc.next_action_at,dc.last_action_at,COALESCE((SELECT da.recipient_user_id FROM settlement_dunning_action da WHERE da.tenant_id=dc.tenant_id AND da.dunning_case_id=dc.id ORDER BY da.created_at DESC,da.id DESC LIMIT 1),'') FROM settlement_dunning_case dc LEFT JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id LEFT JOIN settlement_receivable_plan rp ON rp.id=dc.plan_id AND rp.tenant_id=dc.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=COALESCE(r.contract_snapshot_id,rp.contract_snapshot_id) AND cs.tenant_id=dc.tenant_id WHERE dc.tenant_id=? ORDER BY dc.next_action_at,dc.id LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.dunning.read", `SELECT dc.id,COALESCE(r.receivable_no,CONCAT('PLAN-',rp.installment_no)),cs.customer_name_snapshot,DATEDIFF(?,COALESCE(r.due_date,rp.due_date)),COALESCE(r.open_amount,rp.planned_amount),dc.current_escalation_level,dc.status,dc.next_action_at,dc.last_action_at,COALESCE((SELECT da.recipient_user_id FROM settlement_dunning_action da WHERE da.tenant_id=dc.tenant_id AND da.dunning_case_id=dc.id ORDER BY da.created_at DESC,da.id DESC LIMIT 1),'') FROM settlement_dunning_case dc LEFT JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id LEFT JOIN settlement_receivable_plan rp ON rp.id=dc.plan_id AND rp.tenant_id=dc.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=COALESCE(r.contract_snapshot_id,rp.contract_snapshot_id) AND cs.tenant_id=dc.tenant_id WHERE dc.tenant_id=? ORDER BY dc.next_action_at,dc.id LIMIT ? OFFSET ?`, businessclock.Today(), p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -2140,6 +2266,12 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 // 返回值：无，错误响应写入HTTP。
 func respondError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, service.ErrProjectReferenceMismatch):
+		// 权威项目服务在同一版本更换了合同/客户：已对账映射不被静默覆盖，
+		// 返回可识别的冲突码要求人工核对，而不是通用“记录已变化”。
+		fail(w, http.StatusConflict, "SETTLEMENT_PROJECT_REFERENCE_MISMATCH", "项目服务在同一版本返回了不同合同或客户，请人工核对项目映射后再重试")
+	case errors.Is(err, service.ErrProjectReferenceInactive):
+		fail(w, http.StatusBadRequest, "SETTLEMENT_PROJECT_REFERENCE_INACTIVE", "权威项目引用已失效，不能新增或刷新项目协作分配")
 	case errors.Is(err, service.ErrDependency):
 		fail(w, http.StatusServiceUnavailable, "SETTLEMENT_DEPENDENCY_UNAVAILABLE", "人员目录或项目服务暂不可用，请稍后重试")
 	case errors.Is(err, service.ErrInvalid):

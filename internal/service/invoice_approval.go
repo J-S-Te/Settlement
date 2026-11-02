@@ -24,6 +24,10 @@ func (s *Service) ApproveInvoiceRequest(ctx context.Context, p Principal, id str
 	if applicant == p.UserID {
 		return "", fmt.Errorf("%w: applicant cannot approve own invoice", ErrInvalid)
 	}
+	// 审批按ID直接写入：先从数据库解析合同快照并校验责任范围，范围外一律不存在。
+	if err = s.requireInvoiceRequestScopeTx(ctx, tx, p, "settlement.invoice.approve", id); err != nil {
+		return "", err
+	}
 	var special bool
 	err = tx.QueryRowContext(ctx, `SELECT required_review FROM settlement_invoice_special_review WHERE tenant_id=? AND invoice_request_id=?`, p.TenantID, id).Scan(&special)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -118,6 +122,10 @@ func (s *Service) RejectInvoiceRequest(ctx context.Context, p Principal, id stri
 	}
 	if applicant == p.UserID {
 		return fmt.Errorf("%w: applicant cannot review own invoice", ErrInvalid)
+	}
+	// 驳回同属按ID写操作：范围外不得释放余额预留。
+	if err = s.requireInvoiceRequestScopeTx(ctx, tx, p, "settlement.invoice.approve", id); err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_request SET status='REJECTED',approved_by=?,rejection_reason=?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=? AND version=?`, p.UserID, reason, id, p.TenantID, version); err != nil {
 		return err

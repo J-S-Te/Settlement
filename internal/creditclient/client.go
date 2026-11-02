@@ -18,6 +18,39 @@ import (
 
 var ErrLicensePaused = errors.New("commercial license paused CRM credit delivery")
 
+// DeliveryError 表示 CRM 信用入口返回了非 2xx 响应。
+// 401/403 是凭据或用途配置错误，不是瞬时故障：调用方必须能把它们与
+// 5xx/网络错误分开，否则运营会把接入配置漂移当成可重试的投递失败反复重试。
+type DeliveryError struct {
+	StatusCode int
+}
+
+func (e *DeliveryError) Error() string {
+	return fmt.Sprintf("CRM credit endpoint returned HTTP %d", e.StatusCode)
+}
+
+// AuthorizationDenied 判断信用投递失败是否属于凭据/用途授权错误。
+// 覆盖 CRM 业务入口的 401/403，以及平台令牌端点的 invalid_client /
+// invalid_scope / unauthorized_client（平台没有该用途时正落在这里）。
+// 这些错误只能通过修复受控接入配置解决，重试不会自愈。
+func AuthorizationDenied(err error) bool {
+	var delivery *DeliveryError
+	if errors.As(err, &delivery) {
+		return delivery.StatusCode == http.StatusUnauthorized || delivery.StatusCode == http.StatusForbidden
+	}
+	var retrieve *oauth2.RetrieveError
+	if errors.As(err, &retrieve) {
+		switch retrieve.ErrorCode {
+		case "invalid_client", "invalid_scope", "unauthorized_client":
+			return true
+		}
+		if retrieve.Response != nil && (retrieve.Response.StatusCode == http.StatusUnauthorized || retrieve.Response.StatusCode == http.StatusForbidden) {
+			return true
+		}
+	}
+	return false
+}
+
 type Client struct {
 	endpoint             string
 	client               *http.Client
@@ -104,7 +137,7 @@ func (c *Client) Publish(ctx context.Context, tenant, eventID string, payload []
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("CRM credit endpoint returned HTTP %d", resp.StatusCode)
+		return &DeliveryError{StatusCode: resp.StatusCode}
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"github.com/J-S-Te/license-core/consumer"
 	"log/slog"
 	"net/http"
@@ -13,11 +14,13 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/j-s-te/settlement/internal/config"
 	"github.com/j-s-te/settlement/internal/creditclient"
 	"github.com/j-s-te/settlement/internal/dunning"
 	"github.com/j-s-te/settlement/internal/filegatewayclient"
 	"github.com/j-s-te/settlement/internal/outbox"
 	platformdir "github.com/j-s-te/settlement/internal/platform"
+	"github.com/j-s-te/settlement/internal/projectreference"
 	"github.com/j-s-te/settlement/internal/service"
 	"github.com/j-s-te/settlement/internal/taxreconcile"
 	"golang.org/x/oauth2/clientcredentials"
@@ -46,6 +49,7 @@ func main() {
 	host, _ := os.Hostname()
 	workerID := host + "-" + time.Now().UTC().Format("20060102150405.000000000")
 	destinations := []outbox.Destination{}
+	var degradedDestinations []outbox.DegradedDestination
 	var taxReconciler *taxreconcile.Worker
 	issuanceMode := strings.ToLower(strings.TrimSpace(os.Getenv("SETTLEMENT_INVOICE_ISSUANCE_MODE")))
 	if issuanceMode == "" {
@@ -55,12 +59,36 @@ func main() {
 		slog.Error("SETTLEMENT_INVOICE_ISSUANCE_MODE must be manual or tax_adapter")
 		os.Exit(1)
 	}
-	if id, secret := os.Getenv("SETTLEMENT_NOTIFICATION_CLIENT_ID"), os.Getenv("SETTLEMENT_NOTIFICATION_CLIENT_SECRET"); id != "" && secret != "" {
-		destinations = append(destinations, outbox.Destination{Name: "PLATFORM_NOTIFICATION", Endpoint: platform + "/api/v1/notifications/events/batch", Scope: "notification.ingest", ClientID: id, ClientSecret: secret, ApplicationCode: "settlement", EnvironmentCode: environment})
+	// BIZ-XAPI-10：审计目的地按“显式开关 > 生产环境”判定，生产缺失即失败关闭；
+	// 通知目的地缺失只登记 degraded，不阻断 worker 启动，积压由 /readyz、/metrics 与扫描告警暴露。
+	auditRequired, auditRequiredErr := config.AuditDestinationRequired(
+		os.Getenv("SETTLEMENT_AUDIT_REQUIRED"),
+		os.Getenv("APP_ENV"),
+		environment,
+	)
+	if auditRequiredErr != nil {
+		slog.Error("invalid settlement audit destination switch", "error", auditRequiredErr)
+		os.Exit(1)
 	}
-	if id, secret := os.Getenv("SETTLEMENT_AUDIT_CLIENT_ID"), os.Getenv("SETTLEMENT_AUDIT_CLIENT_SECRET"); id != "" && secret != "" {
-		destinations = append(destinations, outbox.Destination{Name: "PLATFORM_AUDIT", Endpoint: platform + "/api/v1/audit/events/batch", Scope: "audit.ingest", ClientID: id, ClientSecret: secret, ApplicationCode: "settlement", EnvironmentCode: environment})
+	destinationPlan, destinationErr := outbox.PlanPlatformDestinations(outbox.PlatformDestinationInput{
+		PlatformBaseURL:          platform,
+		EnvironmentCode:          environment,
+		ApplicationCode:          "settlement",
+		NotificationClientID:     os.Getenv("SETTLEMENT_NOTIFICATION_CLIENT_ID"),
+		NotificationClientSecret: os.Getenv("SETTLEMENT_NOTIFICATION_CLIENT_SECRET"),
+		AuditClientID:            os.Getenv("SETTLEMENT_AUDIT_CLIENT_ID"),
+		AuditClientSecret:        os.Getenv("SETTLEMENT_AUDIT_CLIENT_SECRET"),
+		AuditRequired:            auditRequired,
+	})
+	if destinationErr != nil {
+		slog.Error("settlement integration destination configuration failed", "error", destinationErr)
+		os.Exit(1)
 	}
+	for _, warning := range destinationPlan.Warnings {
+		slog.Warn(warning)
+	}
+	destinations = append(destinations, destinationPlan.Destinations...)
+	degradedDestinations = append(degradedDestinations, destinationPlan.Degraded...)
 	if issuanceMode == "tax_adapter" {
 		endpoint, statusURL, id, secret := strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_ADAPTER_URL")), strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_STATUS_URL")), strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_CLIENT_ID")), os.Getenv("SETTLEMENT_TAX_CLIENT_SECRET")
 		if endpoint == "" || statusURL == "" || id == "" || secret == "" {
@@ -91,9 +119,16 @@ func main() {
 		}
 		clientID := strings.TrimSpace(os.Getenv("CRM_CREDIT_CLIENT_ID"))
 		clientSecret := os.Getenv("CRM_CREDIT_CLIENT_SECRET")
+		// scope 与平台受控用途 crm_credit_payment_ingest 及 CRM 机器权限白名单
+		// 必须完全一致；这里拒绝环境文件里的历史名字，避免 worker 继续 401。
 		scope := strings.TrimSpace(os.Getenv("CRM_CREDIT_SCOPE"))
 		if scope == "" {
-			scope = "crm.credit.payment.ingest"
+			scope = config.CRMCreditPaymentIngestScope
+		}
+		if scope != config.CRMCreditPaymentIngestScope {
+			slog.Error("CRM_CREDIT_SCOPE does not match the CRM machine permission and platform purpose binding",
+				"scope", scope, "required_scope", config.CRMCreditPaymentIngestScope)
+			os.Exit(1)
 		}
 		var creditErr error
 		creditPublisher, creditErr = creditclient.New(endpoint, tokenURL, clientID, clientSecret, scope, &http.Client{Timeout: 8 * time.Second})
@@ -104,7 +139,7 @@ func main() {
 		creditWorker = &service.CreditSyncWorker{DB: db, Publisher: creditPublisher, BatchSize: 50, Lease: 2 * time.Minute}
 	}
 	httpClient := &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	worker := &outbox.Worker{Store: &outbox.Store{DB: db, WorkerID: workerID, Lease: 30 * time.Second}, HTTP: httpClient, TokenEndpoint: platform + "/oauth2/token", BatchSize: 50, Destinations: destinations}
+	worker := &outbox.Worker{Store: &outbox.Store{DB: db, WorkerID: workerID, Lease: 30 * time.Second}, HTTP: httpClient, TokenEndpoint: platform + "/oauth2/token", BatchSize: 50, Destinations: destinations, DegradedDestinations: degradedDestinations}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	commercialGate, licenseErr := consumer.FromEnvironment("settlement")
@@ -137,6 +172,34 @@ func main() {
 	roleReminder := &dunning.RoleReminderWorker{DB: db, TenantID: strings.TrimSpace(os.Getenv("OIDC_TENANT_ID")), Service: &service.Service{DB: db}, CheckBusinessLicense: checkBusiness, BatchSize: 50}
 	if directory, ok := scanner.Directory.(dunning.RoleReminderDirectory); ok {
 		roleReminder.Directory = directory
+	}
+	// BIZ-XAPI-05b：项目引用快照周期刷新。项目换合同/失效后由本刷新器按权威
+	// 项目服务收口 settlement_project_reference.active，避免助理继续读写旧合同范围。
+	// 机器身份与 API 共用 SETTLEMENT_PROJECT_REFERENCE_*；未配置时只告警并关闭
+	// 刷新器，不阻断投递、导出与对账等主流程启动。
+	projectReferenceSyncInterval, projectReferenceSyncBatch, syncConfigErr := config.ProjectReferenceSyncSettings()
+	if syncConfigErr != nil {
+		slog.Error("project reference sync configuration failed", "error", syncConfigErr)
+		os.Exit(1)
+	}
+	var projectReferenceSync *service.ProjectReferenceSyncWorker
+	if projectReferenceSyncInterval > 0 {
+		referenceEndpoint := strings.TrimRight(strings.TrimSpace(os.Getenv("SETTLEMENT_PROJECT_REFERENCE_URL")), "/")
+		referenceTokenURL := strings.TrimSpace(os.Getenv("SETTLEMENT_PROJECT_REFERENCE_TOKEN_URL"))
+		referenceClientID := strings.TrimSpace(os.Getenv("SETTLEMENT_PROJECT_REFERENCE_CLIENT_ID"))
+		referenceSecret := os.Getenv("SETTLEMENT_PROJECT_REFERENCE_CLIENT_SECRET")
+		if referenceEndpoint == "" || referenceTokenURL == "" || referenceClientID == "" || referenceSecret == "" {
+			slog.Warn("project reference sync disabled: SETTLEMENT_PROJECT_REFERENCE_* machine credentials are incomplete")
+		} else {
+			resolver, resolverErr := projectreference.New(referenceEndpoint, referenceClientID, referenceSecret, referenceTokenURL, 8*time.Second)
+			if resolverErr != nil {
+				slog.Error("project reference sync client configuration failed", "error", resolverErr)
+				os.Exit(1)
+			}
+			projectReferenceSync = &service.ProjectReferenceSyncWorker{DB: db, Resolver: resolver, BatchSize: projectReferenceSyncBatch, CheckBusinessLicense: checkBusiness, Logf: func(format string, args ...any) {
+				slog.Warn(fmt.Sprintf(format, args...), "task", "project_reference_sync")
+			}}
+		}
 	}
 	exporter, exportErr := newReportExporter(db, workerID)
 	if exportErr != nil {
@@ -245,6 +308,22 @@ func main() {
 			for {
 				if err := creditWorker.RunOnce(ctx); err != nil && ctx.Err() == nil {
 					slog.Error("CRM credit retry failed", "error", err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
+	if projectReferenceSync != nil {
+		go func() {
+			ticker := time.NewTicker(projectReferenceSyncInterval)
+			defer ticker.Stop()
+			for {
+				if err := projectReferenceSync.RunOnce(ctx); err != nil && ctx.Err() == nil {
+					slog.Error("project reference sync failed", "error", err)
 				}
 				select {
 				case <-ctx.Done():

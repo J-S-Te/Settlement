@@ -184,6 +184,14 @@ func (s *Service) applyInvoiceIssueCallback(ctx context.Context, tx *sql.Tx, ten
 		}
 		return "IGNORED_TERMINAL", nil
 	}
+	// SET-06b：结算侧已作废（request=CANCELLED / attempt=ABANDONED、CANCELLED）后
+	// 仍可能收到税控迟到回执。作废不改变"税控可能已受理"的客观事实，因此这里
+	// 幂等受理而不是 ErrConflict 回滚（否则 inbox 与冲突事实一起消失，财务失去线索）：
+	// 成功/未知回执登记 PROVIDER_CONFLICT 结果行与高风险审计；失败回执按终态忽略。
+	// 两种处理都不重新生成发票、不重复核销预留、也不再次释放额度。
+	if attemptStatus == "ABANDONED" || attemptStatus == "CANCELLED" || requestStatus == "CANCELLED" {
+		return recordLateIssueCallbackAfterCancel(ctx, tx, tenant, requestID, attemptStatus, requestStatus, event)
+	}
 	if attemptStatus != "PENDING" && attemptStatus != "ACCEPTED" && attemptStatus != "PROCESSING" && attemptStatus != "UNKNOWN" {
 		return "", ErrConflict
 	}
@@ -237,11 +245,52 @@ func (s *Service) applyInvoiceIssueCallback(ctx context.Context, tx *sql.Tx, ten
 	return "APPLIED", nil
 }
 
+// recordLateIssueCallbackAfterCancel 用途：结算已作废后幂等受理税控迟到回执。
+// 参数：ctx为上下文，tx为回执事务，tenant为可信租户，requestID为开票申请，
+// attemptStatus/requestStatus为已落库终态，event为税控回执。
+// 返回值：inbox处理状态；成功/未知回执返回 PROVIDER_CONFLICT 并写高风险冲突审计，
+// 其余回执返回 IGNORED_TERMINAL。两种结果都在调用方事务内提交：既不回滚 inbox
+// 事实，也不生成发票、核销预留或再次释放额度。
+func recordLateIssueCallbackAfterCancel(ctx context.Context, tx *sql.Tx, tenant, requestID, attemptStatus, requestStatus string, event TaxCallbackEvent) (string, error) {
+	if event.EventType != TaxInvoiceIssuedEvent && event.EventType != TaxInvoiceIssueUnknownEvent {
+		// 税控明确失败与结算作废一致，不需要人工对账；保留 inbox 行并按终态忽略。
+		return "IGNORED_TERMINAL", nil
+	}
+	// 推进结果序号与最后事件：同一结果以新 event_id 重复投递时按陈旧回执忽略，
+	// 不会重复登记冲突审计；同 event_id 重投仍由 inbox 事件唯一键去重。
+	if _, err := tx.ExecContext(ctx, `UPDATE settlement_invoice_issue_attempt SET result_sequence=?,last_result_event_id=?,external_operation_id=COALESCE(external_operation_id,?),failure_code=?,failure_message=?,last_result_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=?`, event.ResultSequence, event.EventID, nullable(event.ExternalOperationID), "PROVIDER_CONFLICT_AFTER_CANCEL", "结算已作废后收到税控回执，税控可能已开票，需人工对账或红冲", event.AttemptID, tenant); err != nil {
+		return "", err
+	}
+	payload := map[string]any{
+		"actor_id":            "TAX_ADAPTER",
+		"invoice_request_id":  requestID,
+		"attempt_id":          event.AttemptID,
+		"attempt_status":      attemptStatus,
+		"request_status":      requestStatus,
+		"callback_event_id":   event.EventID,
+		"callback_event_type": event.EventType,
+		"external_request_id": event.ExternalRequestID,
+		"external_invoice_id": "",
+		"invoice_code":        "",
+		"invoice_no":          "",
+		"processing_status":   "PROVIDER_CONFLICT",
+		"reason":              "settlement invoice request was cancelled before the tax provider result arrived; provider state requires manual reconciliation",
+		"result":              "FAILURE",
+		"risk_level":          "HIGH",
+	}
+	if event.Invoice != nil {
+		payload["external_invoice_id"] = event.Invoice.ExternalInvoiceID
+		payload["invoice_code"] = event.Invoice.InvoiceCode
+		payload["invoice_no"] = event.Invoice.InvoiceNo
+	}
+	return "PROVIDER_CONFLICT", outbox(ctx, tx, tenant, "PLATFORM_AUDIT", "SETTLEMENT_TAX_PROVIDER_CONFLICT", "invoice_request", requestID, payload)
+}
+
 func (s *Service) applyRedFlushCallback(ctx context.Context, tx *sql.Tx, tenant string, event TaxCallbackEvent) (string, error) {
-	var originalInvoiceID, status, attemptStatus, reasonCode, reasonDetail, requestID, kind, currency, excl, tax, incl, providerCode, externalRequestID string
+	var originalInvoiceID, status, attemptStatus, reasonCode, reasonDetail, requestID, kind, currency, excl, tax, incl, providerCode, externalRequestID, originalInvoiceStatus string
 	var lastSequence uint64
 	var buyer, originalSeller []byte
-	err := tx.QueryRowContext(ctx, `SELECT ra.original_invoice_id,rf.status,ra.status,rf.reason_code,rf.reason_detail,ti.invoice_request_id,ti.invoice_type,ti.currency,ti.amount_excl_tax,ti.tax_amount,ti.amount_incl_tax,ti.buyer_profile_snapshot,ti.seller_profile_snapshot,ra.provider_code,ra.external_request_id,ra.result_sequence FROM settlement_invoice_red_flush_attempt ra JOIN settlement_invoice_red_flush_request rf ON rf.id=ra.red_flush_request_id AND rf.tenant_id=ra.tenant_id JOIN settlement_tax_invoice ti ON ti.id=ra.original_invoice_id AND ti.tenant_id=ra.tenant_id WHERE ra.id=? AND ra.tenant_id=? FOR UPDATE`, event.RedFlushAttemptID, tenant).Scan(&originalInvoiceID, &status, &attemptStatus, &reasonCode, &reasonDetail, &requestID, &kind, &currency, &excl, &tax, &incl, &buyer, &originalSeller, &providerCode, &externalRequestID, &lastSequence)
+	err := tx.QueryRowContext(ctx, `SELECT ra.original_invoice_id,rf.status,ra.status,rf.reason_code,rf.reason_detail,ti.invoice_request_id,ti.invoice_type,ti.currency,ti.amount_excl_tax,ti.tax_amount,ti.amount_incl_tax,ti.buyer_profile_snapshot,ti.seller_profile_snapshot,ra.provider_code,ra.external_request_id,ra.result_sequence,ti.status FROM settlement_invoice_red_flush_attempt ra JOIN settlement_invoice_red_flush_request rf ON rf.id=ra.red_flush_request_id AND rf.tenant_id=ra.tenant_id JOIN settlement_tax_invoice ti ON ti.id=ra.original_invoice_id AND ti.tenant_id=ra.tenant_id WHERE ra.id=? AND ra.tenant_id=? FOR UPDATE`, event.RedFlushAttemptID, tenant).Scan(&originalInvoiceID, &status, &attemptStatus, &reasonCode, &reasonDetail, &requestID, &kind, &currency, &excl, &tax, &incl, &buyer, &originalSeller, &providerCode, &externalRequestID, &lastSequence, &originalInvoiceStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -259,7 +308,9 @@ func (s *Service) applyRedFlushCallback(ctx context.Context, tx *sql.Tx, tenant 
 	if event.ResultSequence <= lastSequence {
 		return "IGNORED_STALE", nil
 	}
-	if status == "RED_FLUSHED" {
+	// 原票一旦不再是 ISSUED（已 RED_FLUSHED），迟到的成功回执不得再生成负票、
+	// 红冲关系或二次冲减；重复红冲的唯一正确结果是忽略。
+	if status == "RED_FLUSHED" || originalInvoiceStatus != "ISSUED" {
 		return "IGNORED_TERMINAL", nil
 	}
 	if status == "ISSUE_FAILED" {
@@ -430,6 +481,16 @@ func reverseInvoiceAllocations(ctx context.Context, tx *sql.Tx, tenant, redFlush
 	}
 	rows.Close()
 	for _, item := range items {
+		// 反冲销前的应用层幂等保护：同一原 allocation 只要已被任何红冲记录冲减过，
+		// 就不能再次 decrementInvoiced，否则已开票额会被重复冲减、可开额度虚增。
+		var reversedAllocation string
+		err = tx.QueryRowContext(ctx, `SELECT id FROM settlement_invoice_allocation_reversal WHERE tenant_id=? AND original_allocation_id=? AND red_flush_request_id<>? FOR UPDATE`, tenant, item.allocationID, redFlushRequestID).Scan(&reversedAllocation)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO settlement_invoice_allocation_reversal(id,tenant_id,red_flush_request_id,original_allocation_id,reversed_amount,created_at) VALUES(?,?,?,?,?,UTC_TIMESTAMP(3))`, newID(), tenant, redFlushRequestID, item.allocationID, item.amount); err != nil {
 			return err
 		}

@@ -134,6 +134,14 @@
       "risk_level": "HIGH"
     },
     {
+      "code": "settlement.finance.override",
+      "name": "财务负责人计划差额特批",
+      "action": "override",
+      "resource_code": "finance",
+      "resource_name": "财务计划覆盖",
+      "risk_level": "HIGH"
+    },
+    {
       "code": "settlement.receipt.read",
       "name": "查看财务回款",
       "action": "read",
@@ -244,6 +252,22 @@
       "resource_code": "contract_import",
       "resource_name": "历史合同导入",
       "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.revision.read",
+      "name": "查看合同修订复核工单",
+      "action": "read",
+      "resource_code": "contract_revision",
+      "resource_name": "合同修订",
+      "risk_level": "LOW"
+    },
+    {
+      "code": "settlement.revision.resolve",
+      "name": "处理合同修订复核工单",
+      "action": "resolve",
+      "resource_code": "contract_revision",
+      "resource_name": "合同修订",
+      "risk_level": "HIGH"
     }
   ],
   "roles": [
@@ -280,7 +304,9 @@
         "settlement.difference.approve",
         "settlement.voucher.manage",
         "settlement.import.reconcile",
-        "settlement.import.release"
+        "settlement.import.release",
+        "settlement.revision.read",
+        "settlement.revision.resolve"
       ]
     },
     {
@@ -302,7 +328,8 @@
         "settlement.difference.manage",
         "settlement.voucher.manage",
         "settlement.import.reconcile",
-        "settlement.import.release"
+        "settlement.import.release",
+        "settlement.revision.read"
       ]
     },
     {
@@ -316,7 +343,8 @@
         "settlement.invoice.issue",
         "settlement.report.read",
         "settlement.report.export",
-        "settlement.notification.read"
+        "settlement.notification.read",
+        "settlement.revision.read"
       ]
     },
     {
@@ -344,7 +372,8 @@
         "settlement.dunning.read",
         "settlement.dunning.feedback",
         "settlement.notification.read",
-        "settlement.collaboration.read"
+        "settlement.collaboration.read",
+        "settlement.revision.read"
       ]
     },
     {
@@ -356,7 +385,8 @@
         "settlement.invoice.request",
         "settlement.notification.read",
         "settlement.collaboration.read",
-        "settlement.mapping.manage"
+        "settlement.mapping.manage",
+        "settlement.revision.read"
       ]
     },
     {
@@ -386,7 +416,10 @@
         "settlement.difference.approve",
         "settlement.voucher.manage",
         "settlement.import.reconcile",
-        "settlement.import.release"
+        "settlement.import.release",
+        "settlement.finance.override",
+        "settlement.revision.read",
+        "settlement.revision.resolve"
       ]
     },
     {

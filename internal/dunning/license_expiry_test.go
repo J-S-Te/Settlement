@@ -24,7 +24,7 @@ func TestDunningLicenseExpiryAfterDirectoryPreventsInitialCreation(t *testing.T)
 		scriptdb.Step{Kind: "exec", SQL: "UPDATE settlement_dunning_action"},
 		scriptdb.Step{Kind: "exec", SQL: "SET dc.status='CLOSED'"},
 		scriptdb.Step{Kind: "exec", SQL: "SET dc.status='ACTIVE'"},
-		scriptdb.Step{Kind: "query", SQL: "WHERE r.open_amount>0", Rows: [][]driver.Value{{"tenant", "receivable", "R-1", "customer", "policy", int64(1), "REMIND", "USER:collector", "LOCAL", "NORMAL", int64(7), int64(5)}}},
+		scriptdb.Step{Kind: "query", SQL: "WHERE r.open_amount>0", Rows: [][]driver.Value{{"tenant", "receivable", "R-1", "customer", "policy", int64(1), "REMIND", "USER:collector", "LOCAL", "NORMAL", int64(7), int64(5), ""}}},
 		scriptdb.Step{Kind: "query", SQL: "settlement_handover_freeze", Rows: [][]driver.Value{{false}}},
 	)
 	s := &Scanner{DB: db, Directory: expiringDirectory{expire: func() { expired = true }}, CheckBusinessLicense: func(context.Context) error {

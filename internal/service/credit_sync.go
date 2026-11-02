@@ -12,6 +12,11 @@ import (
 const creditEventCompleted = "customer.credit.payment.completed.v1"
 const creditEventReversed = "customer.credit.payment.reversed.v1"
 
+// ErrCreditSyncAuthorization 表示 CRM 信用同步被凭据或用途授权拒绝（401/403、
+// invalid_client/invalid_scope）。它与 5xx/网络类失败语义不同：修复受控接入配置
+// 之前重试不会成功，HTTP 层必须让运营看到不可立即重试的明确错误，而不是 503。
+var ErrCreditSyncAuthorization = errors.New("CRM credit delivery is not authorized")
+
 func insertCreditSync(ctx context.Context, tx *sql.Tx, tenant, eventID, allocationID, receivableID string, payload []byte) error {
 	return insertCreditSyncEvent(ctx, tx, tenant, eventID, allocationID, receivableID, creditEventCompleted, "", payload)
 }
@@ -61,6 +66,11 @@ func (s *Service) RetryCreditSync(ctx context.Context, tenant, eventID string) e
 		_, updateErr := s.DB.ExecContext(context.WithoutCancel(ctx), `UPDATE settlement_credit_sync SET status='RETRY_WAIT',attempt_count=attempt_count+1,last_error_summary=?,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND status='PROCESSING'`, safeCreditError(err), id)
 		if updateErr != nil {
 			return fmt.Errorf("publish CRM credit event: %w; record failure: %v", err, updateErr)
+		}
+		if creditclient.AuthorizationDenied(err) {
+			// 授权/用途错误保留 RETRY_WAIT 供修复接入配置后显式重试，但返回可分类
+			// 错误，避免调用方把配置漂移当作瞬时 5xx 反复重试。
+			return fmt.Errorf("%w: %v", ErrCreditSyncAuthorization, err)
 		}
 		return err
 	}

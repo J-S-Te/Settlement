@@ -322,3 +322,36 @@ func TestImportedFinanceHoldNoNotifications(t *testing.T) {
 		}
 	}
 }
+
+// TestRoleReminderDoesNotCreateSecondActiveCase 验证同一计划关联应收已有
+// ACTIVE 催收案件时，负责人提醒不得创建第二个 ACTIVE 案件或重复派发动作。
+// 参数：t为测试上下文，只运行显式隔离MySQL。
+// 返回值：无，出现第二个案件或动作时失败。
+func TestRoleReminderDoesNotCreateSecondActiveCase(t *testing.T) {
+	db, _ := roleReminderMySQL(t)
+	ctx := context.Background()
+	tenant := "role-overlap"
+	for _, q := range []string{
+		`INSERT INTO settlement_contract_snapshot(id,tenant_id,source_application,source_event_id,source_contract_id,source_contract_no,source_contract_version,customer_id,customer_name_snapshot,currency,contract_amount,financial_status,effective_at,created_at,updated_at) VALUES('overlap-snapshot','role-overlap','test','overlap-event','overlap-contract','C-OV',1,'customer','重叠客户','CNY',100,'EFFECTIVE',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		`INSERT INTO settlement_contract_responsibility(tenant_id,source_contract_id,owner_user_id,version,active,updated_at) VALUES('role-overlap','overlap-contract','sales',1,TRUE,UTC_TIMESTAMP(3))`,
+		`INSERT INTO settlement_receivable_plan(id,tenant_id,contract_snapshot_id,installment_no,due_date,planned_amount,generation_source,confirmation_status,created_at,updated_at) VALUES('overlap-plan','role-overlap','overlap-snapshot',1,DATE_SUB(CURDATE(),INTERVAL 1 DAY),100,'CONTRACT','CONFIRMED',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		`INSERT INTO settlement_receivable(id,tenant_id,receivable_no,contract_snapshot_id,receivable_plan_id,due_date,original_amount,open_amount,currency,recognition_status,collection_status,invoice_status,created_at,updated_at) VALUES('overlap-receivable','role-overlap','AR-OV','overlap-snapshot','overlap-plan',DATE_SUB(CURDATE(),INTERVAL 1 DAY),100,100,'CNY','CONFIRMED','UNPAID','NOT_INVOICED',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		`INSERT INTO settlement_dunning_policy(id,tenant_id,name,version,aging_from_days,aging_to_days,action_type,recipient_rule,channel,repeat_interval_days,priority,enabled,created_at,updated_at) VALUES('overlap-policy','role-overlap','既有催收员策略',1,1,36500,'REMIND','USER:collector','LOCAL',7,'NORMAL',TRUE,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		`INSERT INTO settlement_dunning_case(id,tenant_id,receivable_id,dunning_policy_id,policy_version,current_escalation_level,status,next_action_at,created_at,updated_at) VALUES('overlap-case','role-overlap','overlap-receivable','overlap-policy',1,0,'ACTIVE',DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 7 DAY),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	worker := &RoleReminderWorker{DB: db, TenantID: tenant, Service: &service.Service{DB: db}, Directory: &roleDirectoryFixture{}}
+	if err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var cases, actions int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM settlement_dunning_case WHERE tenant_id=?`, tenant).Scan(&cases); err != nil || cases != 1 {
+		t.Fatalf("overlapping reminder created duplicate case: cases=%d err=%v", cases, err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM settlement_dunning_action WHERE tenant_id=?`, tenant).Scan(&actions); err != nil || actions != 0 {
+		t.Fatalf("overlapping reminder dispatched duplicate action: actions=%d err=%v", actions, err)
+	}
+}

@@ -35,7 +35,7 @@ func commercialOperation(method, path string) core.Operation {
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if method == http.MethodGet {
-		for _, known := range []string{"/api/v1/contract-references", "/api/v1/project-assignments", "/api/v1/settings", "/api/v1/receipt-differences", "/api/v1/accounting-vouchers"} {
+		for _, known := range []string{"/api/v1/contract-references", "/api/v1/project-assignments", "/api/v1/settings", "/api/v1/receipt-differences", "/api/v1/accounting-vouchers", "/api/v1/contract-revision-holds"} {
 			if path == known {
 				return core.READ_HISTORY
 			}

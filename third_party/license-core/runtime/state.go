@@ -32,6 +32,11 @@ type State struct {
 
 const stateFields = "protocol snapshotJWS controlRevision highestLicenseVersion enforcementStarted enforced clockHighWater clockBlocked consumedRecoveryIDs"
 
+// migrationSnapshotMaxAge 限定迁移兼容旁路可接受的快照签发年龄。
+// 迁移兼容只接受近期签发的快照；旧介质或长期未迁移的安装必须重新签发快照，
+// 不能回放旧迁移快照持续获得不受授权到期约束的放行。
+const migrationSnapshotMaxAge = 30 * 24 * time.Hour
+
 type FileRuntime struct {
 	path         string
 	binding      Binding
@@ -323,6 +328,11 @@ func (r *FileRuntime) Evaluate(ctx context.Context, operation core.Operation, no
 		// 一旦已观察到授权版本，
 		// 回退检查就必须阻止重新进入无授权兼容模式。
 		if snapshot.EnforcementState == Pending && snapshot.MigrationEligible && !state.EnforcementStarted && state.HighestLicenseVersion == 0 && snapshot.CurrentLicenseJWS == "" && snapshot.PendingLicenseJWS == "" {
+			// 删除状态文件后回放旧迁移快照不得获得无限期放行：
+			// 以不因时钟回拨而放宽的 effectiveNow 作为新鲜度基准。
+			if snapshot.SnapshotIssuedAt < effectiveNow.Add(-migrationSnapshotMaxAge).Unix() {
+				return core.ErrDenied
+			}
 			return nil
 		}
 		current, pending, err := licenses(snapshot, r.vendorKeys)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 
 	"github.com/j-s-te/settlement/authz"
@@ -123,7 +124,9 @@ func (s *Service) RequireContractAccessTx(ctx context.Context, tx *sql.Tx, p Pri
 	if !p.Allows(permission) {
 		return ErrForbidden
 	}
-	if strings.HasPrefix(permission, "settlement.invoice.") || permission == "settlement.receivable.create" || permission == "settlement.receivable.adjust" {
+	// settlement.revision.resolve 曾以 receivable.adjust 走同一门禁，改用专用动作
+	// 权限后必须继续拒绝导入对账未放行（HOLD）的合同，避免收敛动作权限时丢失该拦截。
+	if strings.HasPrefix(permission, "settlement.invoice.") || permission == "settlement.receivable.create" || permission == "settlement.receivable.adjust" || permission == "settlement.revision.resolve" {
 		var state string
 		if err := tx.QueryRowContext(ctx, `SELECT migration_state FROM settlement_contract_snapshot WHERE tenant_id=? AND id=?`, p.TenantID, snapshotID).Scan(&state); err != nil {
 			return err
@@ -187,6 +190,83 @@ func lockContractResponsibilities(ctx context.Context, tx *sql.Tx, p Principal, 
 		}
 	}
 	return allowed, nil
+}
+
+// scopedAuthorization 用途：判断主体是否携带可校验的角色与目录版本。
+// 参数：p 为可信主体。
+// 返回值：携带授权上下文时真；未版本化的内部组件/服务测试主体返回假。
+func scopedAuthorization(p Principal) bool {
+	return len(p.Roles) > 0 || p.CatalogVersion != ""
+}
+
+// requireWriteScopeTx 用途：为按ID直接写入的财务单据在业务事务内强制合同责任范围。
+// 参数：ctx为上下文，tx为业务事务，p为可信主体，permission为当前写操作能力，snapshotID为数据库中解析出的合同快照。
+// 返回值：可写时无错误；缺权限返回禁止，范围不可见返回不存在，快照缺失按不存在关闭。
+func (s *Service) requireWriteScopeTx(ctx context.Context, tx *sql.Tx, p Principal, permission, snapshotID string) error {
+	// 快照只能来自数据库中的单据关系；解析不到即失败关闭，绝不信任请求体。
+	if strings.TrimSpace(snapshotID) == "" {
+		return ErrNotFound
+	}
+	if !scopedAuthorization(p) {
+		// 与 Unrestricted 相同的既有兼容分支：仅未版本化的内部组件/服务测试主体
+		// 跳过范围解析；在线会话始终携带 catalog_version，不会进入此分支。
+		return nil
+	}
+	return s.RequireContractAccessTx(ctx, tx, p, permission, snapshotID)
+}
+
+// requireInvoiceRequestScopeTx 用途：按开票申请主键解析合同快照并校验写范围。
+// 参数：ctx为上下文，tx为业务事务，p为可信主体，permission为写能力，requestID为开票申请。
+// 返回值：可写时无错误；申请不存在或不可见返回不存在，其余返回实际错误。
+func (s *Service) requireInvoiceRequestScopeTx(ctx context.Context, tx *sql.Tx, p Principal, permission, requestID string) error {
+	if !scopedAuthorization(p) {
+		return nil
+	}
+	var snapshot string
+	err := tx.QueryRowContext(ctx, `SELECT contract_snapshot_id FROM settlement_invoice_request WHERE id=? AND tenant_id=?`, requestID, p.TenantID).Scan(&snapshot)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return s.requireWriteScopeTx(ctx, tx, p, permission, snapshot)
+}
+
+// requireTaxInvoiceScopeTx 用途：经税票→开票申请解析合同快照并校验写范围。
+// 参数：ctx为上下文，tx为业务事务，p为可信主体，permission为写能力，invoiceID为税票。
+// 返回值：可写时无错误；税票不存在或不可见返回不存在，其余返回实际错误。
+func (s *Service) requireTaxInvoiceScopeTx(ctx context.Context, tx *sql.Tx, p Principal, permission, invoiceID string) error {
+	if !scopedAuthorization(p) {
+		return nil
+	}
+	var snapshot string
+	err := tx.QueryRowContext(ctx, `SELECT ir.contract_snapshot_id FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id WHERE ti.id=? AND ti.tenant_id=?`, invoiceID, p.TenantID).Scan(&snapshot)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return s.requireWriteScopeTx(ctx, tx, p, permission, snapshot)
+}
+
+// requireReceiptAllocationScopeTx 用途：经核销→应收解析合同快照并校验写范围。
+// 参数：ctx为上下文，tx为业务事务，p为可信主体，permission为写能力，allocationID为核销记录。
+// 返回值：可写时无错误；核销不存在或不可见返回不存在，其余返回实际错误。
+func (s *Service) requireReceiptAllocationScopeTx(ctx context.Context, tx *sql.Tx, p Principal, permission, allocationID string) error {
+	if !scopedAuthorization(p) {
+		return nil
+	}
+	var snapshot string
+	err := tx.QueryRowContext(ctx, `SELECT rv.contract_snapshot_id FROM settlement_receipt_allocation a JOIN settlement_receivable rv ON rv.id=a.receivable_id AND rv.tenant_id=a.tenant_id WHERE a.id=? AND a.tenant_id=?`, allocationID, p.TenantID).Scan(&snapshot)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return s.requireWriteScopeTx(ctx, tx, p, permission, snapshot)
 }
 
 // RequireRecordAccess 用途：通过固定资源关系核验直接ID请求的合同范围。

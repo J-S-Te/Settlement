@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+
+	"github.com/j-s-te/settlement/internal/businessclock"
 )
 
 func (s *Service) DunningCoverage(ctx context.Context, p Principal) (DunningCoverage, error) {
@@ -33,11 +35,13 @@ func (s *Service) AgingSummary(ctx context.Context, p Principal) ([]AgingBucket,
 	if err != nil {
 		return nil, err
 	}
-	bucket, err := BuildAgingCase(days, "due_date")
+	bucket, bucketArgs, err := BuildAgingCase(days, "due_date")
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT currency,`+bucket+` AS bucket,COALESCE(SUM(open_amount),0),COUNT(*) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot cs WHERE cs.tenant_id=settlement_receivable.tenant_id AND cs.id=settlement_receivable.contract_snapshot_id AND cs.migration_state='RELEASED') AND open_amount>0 GROUP BY currency,bucket ORDER BY currency,MIN(DATEDIFF(UTC_DATE(),due_date))`, p.TenantID)
+	// 占位符顺序：CASE 内各分档（bucketArgs）→ WHERE tenant_id → ORDER BY 账龄基准。
+	queryArgs := append(append([]any{}, bucketArgs...), p.TenantID, businessclock.Today())
+	rows, err := s.DB.QueryContext(ctx, `SELECT currency,`+bucket+` AS bucket,COALESCE(SUM(open_amount),0),COUNT(*) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot cs WHERE cs.tenant_id=settlement_receivable.tenant_id AND cs.id=settlement_receivable.contract_snapshot_id AND cs.migration_state='RELEASED') AND open_amount>0 GROUP BY currency,bucket ORDER BY currency,MIN(DATEDIFF(?,due_date))`, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -72,21 +76,24 @@ type DunningOverview struct {
 // 返回值：逐币种金额及动作统计；数据库故障返回错误。
 func (s *Service) DunningOverview(ctx context.Context, p Principal) (DunningOverview, error) {
 	var out DunningOverview
+	// 占位符按 SQL 出现顺序绑定：两处逾期判定 → 四个案件/动作子查询的租户 →
+	// 未覆盖逾期子查询（租户、逾期判定、账龄判定）→ 外层租户。
+	today := businessclock.Today()
 	err := s.DB.QueryRowContext(ctx, `SELECT
-COALESCE(SUM(CASE WHEN r.open_amount>0 AND r.due_date<CURDATE() THEN 1 ELSE 0 END),0),
-COALESCE(SUM(CASE WHEN r.open_amount>0 AND r.due_date<CURDATE() THEN r.open_amount ELSE 0 END),0),
+COALESCE(SUM(CASE WHEN r.open_amount>0 AND r.due_date<? THEN 1 ELSE 0 END),0),
+COALESCE(SUM(CASE WHEN r.open_amount>0 AND r.due_date<? THEN r.open_amount ELSE 0 END),0),
 (SELECT COUNT(*) FROM settlement_dunning_case dc WHERE dc.tenant_id=? AND (EXISTS(SELECT 1 FROM settlement_receivable import_r JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_r.contract_snapshot_id AND import_cs.tenant_id=import_r.tenant_id WHERE import_r.id=dc.receivable_id AND import_r.tenant_id=dc.tenant_id AND import_cs.migration_state='RELEASED') OR EXISTS(SELECT 1 FROM settlement_receivable_plan import_p JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_p.contract_snapshot_id AND import_cs.tenant_id=import_p.tenant_id WHERE import_p.id=dc.plan_id AND import_p.tenant_id=dc.tenant_id AND import_cs.migration_state='RELEASED')) AND dc.status='ACTIVE'),
 (SELECT COUNT(*) FROM settlement_dunning_case dc WHERE dc.tenant_id=? AND (EXISTS(SELECT 1 FROM settlement_receivable import_r JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_r.contract_snapshot_id AND import_cs.tenant_id=import_r.tenant_id WHERE import_r.id=dc.receivable_id AND import_r.tenant_id=dc.tenant_id AND import_cs.migration_state='RELEASED') OR EXISTS(SELECT 1 FROM settlement_receivable_plan import_p JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_p.contract_snapshot_id AND import_cs.tenant_id=import_p.tenant_id WHERE import_p.id=dc.plan_id AND import_p.tenant_id=dc.tenant_id AND import_cs.migration_state='RELEASED')) AND dc.status='ACTIVE' AND dc.current_escalation_level>1),
 (SELECT COUNT(*) FROM settlement_dunning_action da JOIN settlement_dunning_case dc ON dc.id=da.dunning_case_id AND dc.tenant_id=da.tenant_id WHERE da.tenant_id=? AND (EXISTS(SELECT 1 FROM settlement_receivable import_r JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_r.contract_snapshot_id AND import_cs.tenant_id=import_r.tenant_id WHERE import_r.id=dc.receivable_id AND import_r.tenant_id=dc.tenant_id AND import_cs.migration_state='RELEASED') OR EXISTS(SELECT 1 FROM settlement_receivable_plan import_p JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_p.contract_snapshot_id AND import_cs.tenant_id=import_p.tenant_id WHERE import_p.id=dc.plan_id AND import_p.tenant_id=dc.tenant_id AND import_cs.migration_state='RELEASED'))),
 (SELECT COUNT(*) FROM settlement_dunning_action da JOIN settlement_dunning_case dc ON dc.id=da.dunning_case_id AND dc.tenant_id=da.tenant_id WHERE da.tenant_id=? AND (EXISTS(SELECT 1 FROM settlement_receivable import_r JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_r.contract_snapshot_id AND import_cs.tenant_id=import_r.tenant_id WHERE import_r.id=dc.receivable_id AND import_r.tenant_id=dc.tenant_id AND import_cs.migration_state='RELEASED') OR EXISTS(SELECT 1 FROM settlement_receivable_plan import_p JOIN settlement_contract_snapshot import_cs ON import_cs.id=import_p.contract_snapshot_id AND import_cs.tenant_id=import_p.tenant_id WHERE import_p.id=dc.plan_id AND import_p.tenant_id=dc.tenant_id AND import_cs.migration_state='RELEASED')) AND da.status='PENDING'),
-(SELECT COUNT(*) FROM settlement_receivable r2 WHERE r2.tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot cs WHERE cs.id=r2.contract_snapshot_id AND cs.tenant_id=r2.tenant_id AND cs.migration_state='RELEASED') AND r2.open_amount>0 AND r2.due_date<CURDATE() AND NOT EXISTS (
+(SELECT COUNT(*) FROM settlement_receivable r2 WHERE r2.tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot cs WHERE cs.id=r2.contract_snapshot_id AND cs.tenant_id=r2.tenant_id AND cs.migration_state='RELEASED') AND r2.open_amount>0 AND r2.due_date<? AND NOT EXISTS (
   SELECT 1 FROM settlement_dunning_policy p2 WHERE p2.tenant_id=r2.tenant_id AND p2.enabled=TRUE
-    AND DATEDIFF(CURDATE(),r2.due_date) BETWEEN p2.aging_from_days AND p2.aging_to_days))
-FROM settlement_receivable r WHERE r.tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot cs WHERE cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id AND cs.migration_state='RELEASED')`, p.TenantID, p.TenantID, p.TenantID, p.TenantID, p.TenantID, p.TenantID).Scan(&out.OverdueCount, &out.OverdueAmount, &out.ActiveCaseCount, &out.EscalatedCaseCount, &out.ActionCount, &out.PendingActionCount, &out.UncoveredOverdue)
+    AND DATEDIFF(?,r2.due_date) BETWEEN p2.aging_from_days AND p2.aging_to_days))
+FROM settlement_receivable r WHERE r.tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot cs WHERE cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id AND cs.migration_state='RELEASED')`, today, today, p.TenantID, p.TenantID, p.TenantID, p.TenantID, p.TenantID, today, today, p.TenantID).Scan(&out.OverdueCount, &out.OverdueAmount, &out.ActiveCaseCount, &out.EscalatedCaseCount, &out.ActionCount, &out.PendingActionCount, &out.UncoveredOverdue)
 	if err != nil {
 		return out, err
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot cs WHERE cs.tenant_id=settlement_receivable.tenant_id AND cs.id=settlement_receivable.contract_snapshot_id AND cs.migration_state='RELEASED') AND open_amount>0 AND due_date<CURDATE() GROUP BY currency ORDER BY currency`, p.TenantID)
+	rows, err := s.DB.QueryContext(ctx, `SELECT currency,COALESCE(SUM(open_amount),0) FROM settlement_receivable WHERE tenant_id=? AND EXISTS(SELECT 1 FROM settlement_contract_snapshot cs WHERE cs.tenant_id=settlement_receivable.tenant_id AND cs.id=settlement_receivable.contract_snapshot_id AND cs.migration_state='RELEASED') AND open_amount>0 AND due_date<? GROUP BY currency ORDER BY currency`, p.TenantID, today)
 	if err != nil {
 		return out, err
 	}

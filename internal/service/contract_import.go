@@ -144,7 +144,7 @@ func (s *Service) PrepareContractImport(ctx context.Context, tenant string, in C
 		return result, err
 	}
 	err = s.DB.QueryRowContext(ctx, `SELECT id,migration_state FROM settlement_contract_snapshot WHERE tenant_id=? AND source_application='contract_management' AND source_event_id=?`, tenant, in.EventID).Scan(&result.ContractSnapshotID, &result.MigrationState)
-	result.Duplicate = !created
+	result.Duplicate = !created.Created
 	return result, err
 }
 

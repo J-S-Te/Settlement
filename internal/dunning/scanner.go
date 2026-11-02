@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/j-s-te/settlement/internal/businessclock"
 )
 
 // PersonnelDirectory 是分配催收责任前使用的窄范围
@@ -28,8 +30,8 @@ type Scanner struct {
 }
 
 type candidate struct {
-	TenantID, ReceivableID, Number, Customer, PolicyID, ActionType, RecipientRule, Channel, Priority string
-	PolicyVersion, RepeatDays, AgingDays                                                             int
+	TenantID, ReceivableID, PlanID, Number, Customer, PolicyID, ActionType, RecipientRule, Channel, Priority string
+	PolicyVersion, RepeatDays, AgingDays                                                                     int
 }
 
 type dueCase struct {
@@ -90,14 +92,35 @@ func (s *Scanner) reopenSettled(ctx context.Context) error {
 		return err
 	}
 	// 部分付款或冲销更正后，应收可能再次逾期。
-	// 重新打开相同策略版本案件，不能被唯一键隐藏。
+	// 历史策略版本可能为同一应收留下多条已结清案件；数据库唯一键只允许一个 ACTIVE 案件，
+	// 因此这里按“当前策略优先级+最近更新”只重开每条应收的一个案件，且不重开已有其它
+	// ACTIVE 案件的应收，避免整批 UPDATE 因唯一键冲突回滚。
 	_, err := s.DB.ExecContext(ctx, `UPDATE settlement_dunning_case dc
 JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_id
 JOIN settlement_dunning_policy p ON p.id=dc.dunning_policy_id AND p.tenant_id=dc.tenant_id AND p.version=dc.policy_version
+JOIN (
+  SELECT reopen_id FROM (
+    SELECT dc2.id AS reopen_id,
+      ROW_NUMBER() OVER (PARTITION BY dc2.tenant_id,dc2.receivable_id
+        ORDER BY p2.aging_from_days DESC,p2.id,dc2.updated_at DESC,dc2.id DESC) AS row_no
+    FROM settlement_dunning_case dc2
+    JOIN settlement_dunning_policy p2 ON p2.id=dc2.dunning_policy_id AND p2.tenant_id=dc2.tenant_id
+      AND p2.version=dc2.policy_version AND p2.enabled=TRUE AND p2.recipient_rule<>'CONTRACT_OWNER'
+    WHERE dc2.status='CLOSED' AND dc2.closed_reason='RECEIVABLE_SETTLED' AND dc2.receivable_id IS NOT NULL
+  ) ranked WHERE ranked.row_no=1
+) reopenable ON reopenable.reopen_id=dc.id
+LEFT JOIN settlement_dunning_case active ON active.tenant_id=dc.tenant_id AND active.status='ACTIVE'
+  AND (active.receivable_id=dc.receivable_id OR (dc.plan_id IS NOT NULL AND active.plan_id=dc.plan_id))
 SET dc.status='ACTIVE',dc.closed_reason='',dc.closed_at=NULL,dc.current_escalation_level=0,dc.last_action_at=NULL,dc.next_action_at=UTC_TIMESTAMP(3),dc.updated_at=UTC_TIMESTAMP(3)
 WHERE dc.status='CLOSED' AND dc.closed_reason='RECEIVABLE_SETTLED' AND p.enabled=TRUE AND p.recipient_rule<>'CONTRACT_OWNER'
-  AND r.open_amount>0 AND r.due_date<CURDATE()
-  AND DATEDIFF(CURDATE(),r.due_date) BETWEEN p.aging_from_days AND p.aging_to_days`)
+  AND r.open_amount>0 AND r.due_date<?
+  AND DATEDIFF(?,r.due_date) BETWEEN p.aging_from_days AND p.aging_to_days
+  AND active.id IS NULL`, businessclock.Today(), businessclock.Today())
+	if duplicateKeyError(err) {
+		// 并发扫描或负责人提醒已为该催收义务建立 ACTIVE 案件：本轮让位，
+		// 下一轮在“单一 ACTIVE 案件”前提下重新评估，不重复开案。
+		return nil
+	}
 	return err
 }
 
@@ -105,19 +128,19 @@ WHERE dc.status='CLOSED' AND dc.closed_reason='RECEIVABLE_SETTLED' AND p.enabled
 // 参数：ctx 扫描上下文。
 // 返回值：扫描及持久化错误。
 func (s *Scanner) createInitialCases(ctx context.Context) error {
-	rows, err := s.DB.QueryContext(ctx, `SELECT r.tenant_id,r.id,r.receivable_no,cs.customer_name_snapshot,p.id,p.version,p.action_type,p.recipient_rule,p.channel,p.priority,p.repeat_interval_days,DATEDIFF(CURDATE(),r.due_date)
+	rows, err := s.DB.QueryContext(ctx, `SELECT r.tenant_id,r.id,r.receivable_no,cs.customer_name_snapshot,p.id,p.version,p.action_type,p.recipient_rule,p.channel,p.priority,p.repeat_interval_days,DATEDIFF(?,r.due_date),COALESCE(r.receivable_plan_id,'')
 FROM settlement_receivable r
 JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id
 JOIN settlement_dunning_policy p ON p.id=(
   SELECT p2.id FROM settlement_dunning_policy p2
   WHERE p2.tenant_id=r.tenant_id AND p2.enabled=TRUE AND p2.recipient_rule<>'CONTRACT_OWNER'
-    AND DATEDIFF(CURDATE(),r.due_date) BETWEEN p2.aging_from_days AND p2.aging_to_days
+    AND DATEDIFF(?,r.due_date) BETWEEN p2.aging_from_days AND p2.aging_to_days
   ORDER BY p2.aging_from_days DESC,p2.id LIMIT 1
 )
 LEFT JOIN settlement_dunning_case dc ON dc.receivable_id=r.id AND dc.tenant_id=r.tenant_id
   AND dc.dunning_policy_id=p.id AND dc.policy_version=p.version
-WHERE r.open_amount>0 AND cs.migration_state='RELEASED' AND r.due_date<CURDATE() AND dc.id IS NULL
-ORDER BY r.due_date,r.id LIMIT ?`, s.BatchSize)
+WHERE r.open_amount>0 AND cs.migration_state='RELEASED' AND r.due_date<? AND dc.id IS NULL
+ORDER BY r.due_date,r.id LIMIT ?`, businessclock.Today(), businessclock.Today(), businessclock.Today(), s.BatchSize)
 	if err != nil {
 		return err
 	}
@@ -125,7 +148,7 @@ ORDER BY r.due_date,r.id LIMIT ?`, s.BatchSize)
 	items := []candidate{}
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.TenantID, &c.ReceivableID, &c.Number, &c.Customer, &c.PolicyID, &c.PolicyVersion, &c.ActionType, &c.RecipientRule, &c.Channel, &c.Priority, &c.RepeatDays, &c.AgingDays); err != nil {
+		if err := rows.Scan(&c.TenantID, &c.ReceivableID, &c.Number, &c.Customer, &c.PolicyID, &c.PolicyVersion, &c.ActionType, &c.RecipientRule, &c.Channel, &c.Priority, &c.RepeatDays, &c.AgingDays, &c.PlanID); err != nil {
 			return err
 		}
 		items = append(items, c)
@@ -160,7 +183,7 @@ ORDER BY r.due_date,r.id LIMIT ?`, s.BatchSize)
 // 返回值：扫描及持久化错误。
 func (s *Scanner) runDueCases(ctx context.Context) error {
 	rows, err := s.DB.QueryContext(ctx, `SELECT dc.tenant_id,dc.id,dc.dunning_policy_id,dc.policy_version,dc.current_escalation_level,
-r.id,r.receivable_no,cs.customer_name_snapshot,DATEDIFF(CURDATE(),r.due_date),
+r.id,r.receivable_no,cs.customer_name_snapshot,DATEDIFF(?,r.due_date),
 p.action_type,p.channel,p.priority,p.repeat_interval_days,
 COALESCE((SELECT da.recipient_user_id FROM settlement_dunning_action da
   WHERE da.tenant_id=dc.tenant_id AND da.dunning_case_id=dc.id AND da.status IN ('PENDING','COMPLETED')
@@ -170,7 +193,7 @@ JOIN settlement_receivable r ON r.id=dc.receivable_id AND r.tenant_id=dc.tenant_
 JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id
 JOIN settlement_dunning_policy p ON p.id=dc.dunning_policy_id AND p.tenant_id=dc.tenant_id AND p.version=dc.policy_version AND p.enabled=TRUE AND p.recipient_rule<>'CONTRACT_OWNER'
 WHERE cs.migration_state='RELEASED' AND dc.status='ACTIVE' AND r.open_amount>0 AND dc.next_action_at<=UTC_TIMESTAMP(3)
-ORDER BY dc.next_action_at,dc.id LIMIT ?`, s.BatchSize)
+ORDER BY dc.next_action_at,dc.id LIMIT ?`, businessclock.Today(), s.BatchSize)
 	if err != nil {
 		return err
 	}
@@ -223,9 +246,18 @@ func (s *Scanner) createInitial(ctx context.Context, c candidate, recipient stri
 	if err := s.checkBusinessLicense(ctx); err != nil {
 		return err
 	}
+	// 同一应收或回款计划只允许一个 ACTIVE 案件。策略增删或版本变化后，
+	// 旧策略案件仍是该催收义务的权威案件；这里复用而不再创建第二个案件。
+	conflict, err := activeCaseConflict(ctx, tx, c.TenantID, c.ReceivableID, c.PlanID, c.PolicyID, c.PolicyVersion)
+	if err != nil {
+		return err
+	}
+	if conflict != "" {
+		return tx.Commit()
+	}
 	result, err := tx.ExecContext(ctx, `INSERT IGNORE INTO settlement_dunning_case(id,tenant_id,receivable_id,dunning_policy_id,policy_version,current_escalation_level,status,next_action_at,last_action_at,created_at,updated_at)
 SELECT ?,r.tenant_id,r.id,?,?,1,'ACTIVE',DATE_ADD(UTC_TIMESTAMP(3),INTERVAL ? DAY),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3)
-FROM settlement_receivable r WHERE r.id=? AND r.tenant_id=? AND r.open_amount>0 AND r.due_date<CURDATE()`, caseID, c.PolicyID, c.PolicyVersion, repeat, c.ReceivableID, c.TenantID)
+FROM settlement_receivable r WHERE r.id=? AND r.tenant_id=? AND r.open_amount>0 AND r.due_date<?`, caseID, c.PolicyID, c.PolicyVersion, repeat, c.ReceivableID, c.TenantID, businessclock.Today())
 	if err != nil {
 		return err
 	}
