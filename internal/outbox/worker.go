@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -65,6 +66,33 @@ func (s *Store) Acquire(ctx context.Context, destination string, limit int) ([]E
 	}
 	return events, tx.Commit()
 }
+
+// PendingByDestination 按目的地聚合尚未投递成功的事件数（BIZ-XAPI-10）。
+// 参数：ctx 为查询上下文。
+// 返回值：目的地→未完成事件数；查询失败返回错误，由调用方决定降级或失败。
+// 用途：/readyz、/metrics 与 worker 积压告警必须能看到“没有目的地认领”的行，
+// 否则凭据缺失只会表现为静默 PENDING。
+func (s *Store) PendingByDestination(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT destination,COUNT(*) FROM settlement_outbox_event WHERE status IN ('PENDING','RETRY_WAIT','PROCESSING') GROUP BY destination`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	pending := make(map[string]int64)
+	for rows.Next() {
+		var destination string
+		var count int64
+		if err := rows.Scan(&destination, &count); err != nil {
+			return nil, err
+		}
+		pending[destination] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return pending, nil
+}
+
 func (s *Store) Delivered(ctx context.Context, events []Event) error {
 	for _, e := range events {
 		tx, err := s.DB.BeginTx(ctx, nil)
@@ -161,8 +189,13 @@ type Worker struct {
 	TokenEndpoint        string
 	BatchSize            int
 	Destinations         []Destination
-	mu                   sync.Mutex
-	tokens               map[string]cachedToken
+	// DegradedDestinations 是启动期因凭据缺失未装配的集成目的地（BIZ-XAPI-10 告警放行）。
+	DegradedDestinations []DegradedDestination
+	// UnconfiguredPending 是最近一次扫描发现的“有积压但没有目的地认领”的事件数。
+	UnconfiguredPending map[string]int64
+	lastBacklogWarning  time.Time
+	mu                  sync.Mutex
+	tokens              map[string]cachedToken
 }
 type cachedToken struct {
 	Value   string
@@ -177,9 +210,17 @@ func (w *Worker) Run(ctx context.Context) error {
 		w.BatchSize = 50
 	}
 	w.tokens = map[string]cachedToken{}
+	// 降级目的地只在启动时告警一次，避免每 2 秒刷屏；积压计数随后按扫描刷新。
+	for _, degraded := range w.DegradedDestinations {
+		slog.Warn("settlement integration destination is not configured; its outbox events remain pending locally",
+			"destination", degraded.Name, "reason", degraded.Reason)
+	}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
+		if err := w.refreshBacklog(ctx); err != nil && ctx.Err() == nil {
+			slog.Warn("settlement outbox backlog scan failed; pending counts may be stale", "error", err)
+		}
 		if err := w.RunOnce(ctx); err != nil && ctx.Err() == nil {
 			return err
 		}
@@ -189,6 +230,30 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// refreshBacklog 统计未装配目的地的积压并在数量为正时限频告警（BIZ-XAPI-10）。
+// 参数：ctx 为查询上下文。
+// 返回值：查询/扫描失败返回错误；调用方保持投递循环继续，计数留在上一次快照。
+func (w *Worker) refreshBacklog(ctx context.Context) error {
+	if w.Store == nil || w.Store.DB == nil {
+		return nil
+	}
+	pending, err := w.Store.PendingByDestination(ctx)
+	if err != nil {
+		return err
+	}
+	w.UnconfiguredPending = UnconfiguredPending(pending, w.Destinations)
+	var total int64
+	for _, count := range w.UnconfiguredPending {
+		total += count
+	}
+	if total > 0 && (w.lastBacklogWarning.IsZero() || time.Since(w.lastBacklogWarning) >= time.Minute) {
+		w.lastBacklogWarning = time.Now()
+		slog.Warn("settlement outbox events have no configured destination and remain pending locally",
+			"pending", total, "destinations", w.UnconfiguredPending)
+	}
+	return nil
 }
 
 // RunOnce 认领并投递事件，在发送前执行许可和历史财务放行门禁。

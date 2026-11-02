@@ -41,18 +41,24 @@ func (s *Service) RequestInvoiceRedFlush(ctx context.Context, p Principal, key, 
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	var invoiceStatus string
-	if err = tx.QueryRowContext(ctx, `SELECT status FROM settlement_tax_invoice WHERE id=? AND tenant_id=? FOR UPDATE`, invoiceID, p.TenantID).Scan(&invoiceStatus); err != nil {
+	var invoiceStatus, snapshotID string
+	if err = tx.QueryRowContext(ctx, `SELECT ti.status,ir.contract_snapshot_id FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id WHERE ti.id=? AND ti.tenant_id=? FOR UPDATE`, invoiceID, p.TenantID).Scan(&invoiceStatus, &snapshotID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", ErrNotFound
 		}
 		return "", err
 	}
+	// 合同范围只取单据关系解析出的快照，范围外按不存在关闭，先拒绝后写。
+	if err = s.requireWriteScopeTx(ctx, tx, p, "settlement.invoice.issue", snapshotID); err != nil {
+		return "", err
+	}
 	if invoiceStatus != "ISSUED" {
 		return "", fmt.Errorf("%w: invoice is not eligible for red flush", ErrConflict)
 	}
+	// ISSUE_UNKNOWN 仍是未收敛的在途结果：原票尚未确定是否已被税控红冲，
+	// 必须计入在途白名单，否则同一原票可被创建第二笔红冲并重复冲减。
 	var active int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM settlement_invoice_red_flush_request WHERE tenant_id=? AND original_invoice_id=? AND status IN ('SUBMITTED','ISSUE_PENDING','PROCESSING')`, p.TenantID, invoiceID).Scan(&active); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM settlement_invoice_red_flush_request WHERE tenant_id=? AND original_invoice_id=? AND status IN ('SUBMITTED','ISSUE_PENDING','PROCESSING','ISSUE_UNKNOWN')`, p.TenantID, invoiceID).Scan(&active); err != nil {
 		return "", err
 	}
 	if active > 0 {

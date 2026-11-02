@@ -58,8 +58,19 @@ func (c *pageConn) QueryContext(_ context.Context, q string, args []driver.Named
 	if !strings.Contains(q, "LIMIT ? OFFSET ?") || !strings.Contains(q, "tenant_id=?") || !strings.Contains(q, "ORDER BY") || !strings.Contains(q, "id") {
 		c.c.t.Fatalf("unbounded/unstable query: %s", q)
 	}
-	if len(args) < 3 || args[0].Value != "dev" || args[len(args)-2].Value != int64(17) || args[len(args)-1].Value != int64(102) {
+	if len(args) < 3 || args[len(args)-2].Value != int64(17) || args[len(args)-1].Value != int64(102) {
 		c.c.t.Fatalf("args=%v", args)
+	}
+	// 部分列表把北京业务日（DATEDIFF 基准）放在 SELECT 列表最前，租户不再固定
+	// 是第 1 个参数；这里断言租户仍被绑定且分页参数仍在末尾。
+	tenantBound := false
+	for _, arg := range args[:len(args)-2] {
+		if arg.Value == "dev" {
+			tenantBound = true
+		}
+	}
+	if !tenantBound {
+		c.c.t.Fatalf("tenant not bound: %v", args)
 	}
 	if strings.Contains(q, "settlement_local_notification") && (len(args) != 4 || args[1].Value != "dev-finance") {
 		c.c.t.Fatalf("notification recipient scope=%v", args)

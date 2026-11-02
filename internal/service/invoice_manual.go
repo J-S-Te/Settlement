@@ -31,6 +31,10 @@ func (s *Service) RegisterManualInvoice(ctx context.Context, p Principal, reques
 	if err = tx.QueryRowContext(ctx, `SELECT ir.invoice_type,cs.currency,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.buyer_profile_snapshot FROM settlement_invoice_request ir JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id JOIN settlement_invoice_issue_attempt ia ON ia.invoice_request_id=ir.id AND ia.tenant_id=ir.tenant_id AND ia.channel='MANUAL' AND ia.status='PENDING' WHERE ir.id=? AND ir.tenant_id=? AND ir.status='ISSUE_PENDING' FOR UPDATE`, requestID, p.TenantID).Scan(&kind, &currency, &excl, &tax, &incl, &buyer); err != nil {
 		return "", ErrConflict
 	}
+	// 人工开票按ID直接写入：合同范围从申请行解析，范围外不得关单和占用可开额度。
+	if err = s.requireInvoiceRequestScopeTx(ctx, tx, p, "settlement.invoice.issue", requestID); err != nil {
+		return "", err
+	}
 	currency = strings.ToUpper(strings.TrimSpace(currency))
 	if len(currency) != 3 {
 		return "", fmt.Errorf("%w: invoice currency is missing", ErrInvalid)

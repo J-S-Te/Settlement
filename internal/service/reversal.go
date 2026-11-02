@@ -30,6 +30,10 @@ func (s *Service) ReverseAllocation(ctx context.Context, p Principal, key, alloc
 	if err != nil {
 		return "", ErrConflict
 	}
+	// 冲销按ID直接写入：经核销→应收解析合同快照后校验责任范围，范围外不得冲销。
+	if err = s.requireReceiptAllocationScopeTx(ctx, tx, p, "settlement.allocation.reverse", allocationID); err != nil {
+		return "", err
+	}
 	if err = rejectImportedReceiptMutation(ctx, tx, p.TenantID, receiptID); err != nil {
 		return "", err
 	}

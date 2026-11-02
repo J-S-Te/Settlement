@@ -164,7 +164,7 @@ func createReceivable(t *testing.T, ctx context.Context, svc *service.Service, p
 	event.Contract.Amount = "100.00"
 	event.Contract.PaymentTerms = []service.PaymentTerm{{InstallmentNo: 1, DueDate: "2099-12-31", Amount: "100.00"}}
 	accepted, err := svc.IngestContract(ctx, "e2e-payment-test", p.TenantID, event)
-	if err != nil || !accepted {
+	if err != nil || !accepted.Created {
 		t.Fatalf("ingest contract: accepted=%v err=%v", accepted, err)
 	}
 	var planID string

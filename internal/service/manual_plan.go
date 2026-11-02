@@ -49,7 +49,8 @@ func (s *Service) CreateManualPlan(ctx context.Context, p Principal, key string,
 	if replay {
 		return existing, nil
 	}
-	if err = checkPlanBudget(ctx, tx, p.TenantID, in.ContractSnapshotID, "", planned); err != nil {
+	coverage, err := s.requirePlanCoverage(ctx, tx, p, in.ContractSnapshotID, "", planned, "")
+	if err != nil {
 		return "", err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receivable_plan(id,tenant_id,contract_snapshot_id,installment_no,due_date,planned_amount,generation_source,confirmation_status,confirmation_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,'MANUAL','PENDING_CONFIRMATION',?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, in.ContractSnapshotID, in.InstallmentNo, in.DueDate, planned, in.Reason)
@@ -62,27 +63,10 @@ func (s *Service) CreateManualPlan(ctx context.Context, p Principal, key string,
 	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_MANUAL_PLAN_CREATED", "receivable_plan", id, map[string]any{"actor_id": p.UserID, "reason": in.Reason, "amount": planned, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
 		return "", err
 	}
+	if err = auditPlanCoverageDeviation(ctx, tx, p, coverage, in.Reason, "CREATE_MANUAL_PLAN"); err != nil {
+		return "", err
+	}
 	return id, tx.Commit()
-}
-
-// checkPlanBudget 用途：串行检查合同下计划合计不超过合同金额。
-// 参数：ctx为上下文，tx为事务，tenant为租户，snapshot为合同，excluded为被替换计划，planned为新金额。
-// 返回值：超额返回冲突，合同不存在或失效返回不存在，其余返回存储错误。
-func checkPlanBudget(ctx context.Context, tx *sql.Tx, tenant, snapshot, excluded, planned string) error {
-	var cap, total string
-	if err := tx.QueryRowContext(ctx, `SELECT contract_amount FROM settlement_contract_snapshot WHERE tenant_id=? AND id=? AND financial_status='EFFECTIVE' FOR UPDATE`, tenant, snapshot).Scan(&cap); err != nil {
-		if err == sql.ErrNoRows {
-			return ErrNotFound
-		}
-		return err
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(planned_amount),0) FROM settlement_receivable_plan WHERE tenant_id=? AND contract_snapshot_id=? AND id<>?`, tenant, snapshot, excluded).Scan(&total); err != nil {
-		return err
-	}
-	if decimalGreater(add(total, planned).FloatString(2), cap) {
-		return ErrConflict
-	}
-	return nil
 }
 
 // AdjustPlan 用途：调整已确认计划并同步应收，保留已开票及核销金额下限。
@@ -128,7 +112,8 @@ func (s *Service) AdjustPlan(ctx context.Context, p Principal, id string, in Pla
 	if decimalGreater(invoiced, planned) {
 		return ErrConflict
 	}
-	if err = checkPlanBudget(ctx, tx, p.TenantID, snapshot, id, planned); err != nil {
+	coverage, err := s.requirePlanCoverage(ctx, tx, p, snapshot, id, planned, oldAmount)
+	if err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE settlement_receivable_plan SET due_date=?,planned_amount=?,confirmation_reason=?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND id=? AND version=?`, in.DueDate, planned, in.Reason, p.TenantID, id, in.Version); err != nil {
@@ -138,6 +123,9 @@ func (s *Service) AdjustPlan(ctx context.Context, p Principal, id string, in Pla
 		return err
 	}
 	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_PLAN_ADJUSTED", "receivable_plan", id, map[string]any{"actor_id": p.UserID, "old_due_date": oldDate, "due_date": in.DueDate, "old_amount": oldAmount, "amount": planned, "reason": in.Reason, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
+		return err
+	}
+	if err = auditPlanCoverageDeviation(ctx, tx, p, coverage, in.Reason, "ADJUST_PLAN"); err != nil {
 		return err
 	}
 	return tx.Commit()

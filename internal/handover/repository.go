@@ -2,7 +2,9 @@ package handover
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"strings"
@@ -270,13 +272,25 @@ func scanReceipt(row rowScanner) (Receipt, error) {
 	return receipt, nil
 }
 
+// receiptIDPrefix 是结算仓回执主键的固定前缀，用于与其它 32 字符 ID 区分。
+const receiptIDPrefix = "01STL"
+
 // shortReceiptID 生成 32 字符回执主键（结算仓约定：ID 必须 32 字符）。
+//
+// 必须同时满足两个性质：
+//  1. 确定性：同一幂等键总是得到同一主键（重复提交命中主键唯一键，从而走幂等回执）；
+//  2. 抗碰撞：不同幂等键不应生成同一主键。旧实现把整个幂等键滚动哈希到 1e8 再补零，
+//     只有一亿种结果，且主键全局唯一（不区分租户），例如 handover:batch:item-920009
+//     与 handover:batch:item-1008670 的旧余数同为 45234789；撞键后 writeReceipt 按
+//     (tenant_id, idempotency_key) 查不到既有回执而报错，整个事务（含改派）回滚，
+//     该幂等键此后永久失败。改用 sha256 + base32 截取（27 字符 ≈ 135 bit）后碰撞概率可忽略。
 func shortReceiptID(idempotencyKey string) string {
-	sum := 0
-	for _, r := range idempotencyKey {
-		sum = (sum*31 + int(r)) % 100000000
+	digest := sha256.Sum256([]byte(idempotencyKey))
+	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(digest[:])
+	if len(encoded) > 27 {
+		encoded = encoded[:27]
 	}
-	return "01STL" + fmt.Sprintf("%027d", sum)
+	return receiptIDPrefix + encoded
 }
 
 func isDuplicate(err error) bool {

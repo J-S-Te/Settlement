@@ -67,6 +67,8 @@ func (c *Client) Upload(ctx context.Context, requestID, applicationID, classific
 		_ = writer.WriteField("purpose", "settlement.receipt.document")
 		classificationValue = "CONFIDENTIAL"
 	case "REPORT_EXPORT":
+		// 报表导出必须显式声明用途：平台侧按 text/csv 策略校验，空 purpose 会被 fail-closed 拒绝。
+		_ = writer.WriteField("purpose", "settlement.report.export")
 		classificationValue = "INTERNAL"
 	}
 	_ = writer.WriteField("classification", classificationValue)

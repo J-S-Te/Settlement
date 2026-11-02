@@ -45,14 +45,19 @@ func TestMySQLRolePlanAuthorizationAndBudget(t *testing.T) {
 	if err = svc.ConfirmPlan(ctx, owner, plan, PlanConfirmationInput{Version: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if err = svc.AdjustPlan(ctx, owner, plan, PlanConfirmationInput{Version: 2, DueDate: "2099-12-02", PlannedAmount: "80.00", Reason: "分期调整"}); err != nil {
+	// SET-04 之后，未持有 settlement.finance.override 的销售只能在阈值内调整：
+	// 100 → 96 的差额为 4%，低于默认 5% 差额阈值。
+	if err = svc.AdjustPlan(ctx, owner, plan, PlanConfirmationInput{Version: 2, DueDate: "2099-12-02", PlannedAmount: "96.00", Reason: "分期调整"}); err != nil {
 		t.Fatal(err)
 	}
-	id, err := svc.CreateManualPlan(ctx, owner, "new-part", ManualPlanInput{ContractSnapshotID: snapshot, InstallmentNo: 2, DueDate: "2099-12-03", PlannedAmount: "20.00", Reason: "新增分期"})
+	if err = svc.AdjustPlan(ctx, owner, plan, PlanConfirmationInput{Version: 3, DueDate: "2099-12-02", PlannedAmount: "80.00", Reason: "越权下调"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("缺少 override 的超阈值下调必须拒绝: %v", err)
+	}
+	id, err := svc.CreateManualPlan(ctx, owner, "new-part", ManualPlanInput{ContractSnapshotID: snapshot, InstallmentNo: 2, DueDate: "2099-12-03", PlannedAmount: "4.00", Reason: "新增分期"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replay, e := svc.CreateManualPlan(ctx, owner, "new-part", ManualPlanInput{ContractSnapshotID: snapshot, InstallmentNo: 2, DueDate: "2099-12-03", PlannedAmount: "20.00", Reason: "新增分期"}); e != nil || replay != id {
+	if replay, e := svc.CreateManualPlan(ctx, owner, "new-part", ManualPlanInput{ContractSnapshotID: snapshot, InstallmentNo: 2, DueDate: "2099-12-03", PlannedAmount: "4.00", Reason: "新增分期"}); e != nil || replay != id {
 		t.Fatalf("计划幂等: %s %v", replay, e)
 	}
 	if _, err = svc.CreateManualPlan(ctx, owner, "too-much", ManualPlanInput{ContractSnapshotID: snapshot, InstallmentNo: 3, DueDate: "2099-12-03", PlannedAmount: "1.00", Reason: "超额"}); !errors.Is(err, ErrConflict) {

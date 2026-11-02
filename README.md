@@ -21,6 +21,8 @@
 
 合同联调的事件类型固定为 `contract.financial_effective.v1`。结算不会从合同管理的查询接口自动拉取 completed contract；需受保护机器事件包含租户、客户、版本、稳定 event ID 和总额匹配的付款条款，再在结算侧确认计划生成正式应收。合同侧已实现人工付款计划、财务事件事务 Outbox、补建对账与投递消费者；只有合同满足生效资格、付款计划金额合计匹配合同金额，且合同出站 `SETTLEMENT_INTEGRATION_OUTBOUND_ENABLED`、结算入站开关及独立机器身份/网络均可用，才会送达。无计划时先查付款计划、Outbox 和投递状态，不能以合同 active/签署 completed 推断自动生成应收。`SETTLEMENT_INTEGRATION_ENABLED=false` 时合同事件入口关闭；税控结果有独立开关和机器身份，其他外部投递应分别核对配置。
 
+同一合同更高合同版本的财务事件按修订接收，不再返回 409：首版快照保留并置为 `SUPERSEDED`，新版本快照与计划生效；待确认计划直接按新条款重排，已确认但无回款/核销/开票/发票预占的计划允许改额或删建并写 `SETTLEMENT_PLAN_ADJUSTED` 审计；含已实现事实的差异不自动改账，登记 `settlement_contract_revision_hold` 人工复核工单。新条款合计必须等于新合同金额，否则整次修订 fail-closed，只登记工单、不写快照也不推进合同版本。机器入站统一返回 202（含 `revision_hold` 标识），版本回退仍返回 409。财务完成 `AdjustPlan`/`CreateManualPlan`/红冲组合后，通过服务层 `ResolveContractRevisionHold` 关闭工单并留高风险审计；工单差异明细可用 `ListContractRevisionHolds` 只读查看。
+
 报表导出采用“提交任务→后台 Worker 生成 CSV→查询任务状态→下载文件”的异步模式。前端不在请求线程内生成大文件，也不通过数据库直接插入模拟应收。
 
 导出 Worker 必须设置部署绑定的 `OIDC_TENANT_ID`（含 legacy 模式），缺失时拒绝启动；领取、执行和网关副作用补偿均限定该租户，不能用一套机器凭据处理其他租户。启用网关时应先应用迁移 `000014_report_export_effects.sql` 并提供上传请求持久退役和按资源幂等解除绑定接口；失败上传或绑定的补偿会持久重试，直接退役原请求 ID 后解除其文件绑定，不以文件可读性查询作前置，不重传已退役内容、不清理历史已完成导出或更改长期文件保留策略。

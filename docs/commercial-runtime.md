@@ -14,6 +14,12 @@
 固定持久状态目录不存在或为空的组件；已有状态或绑定残留时会拒绝启动，不会因环境
 文件丢失而静默放开。不可通过删状态卷或修改开关解除既有执行保护。
 
+兼容模式必须显式 opt-in：`COMMERCIAL_LICENSE_ENABLED` 为空或 `false` 时还必须
+`COMMERCIAL_LICENSE_COMPATIBILITY=true`（归一大小写和首尾空白后严格等于 `true`），
+否则启动即 `ErrConfiguration`；`1`、`yes` 等非法取值按未开启处理并同样拒绝启动。
+反过来，生产不得用 `false` 加兼容开关冒充已授权：受控交付一律 `ENABLED=true`，
+该路径不受兼容开关影响。
+
 目录权威为 `license-core/catalog/catalog.go`（工作区路径）；本仓库构建使用审核过的
 `third_party/license-core/catalog/catalog.go` 镜像。组件目录/发布批准与原业务授权均须满足。
 平台操作见[运行时协调与激活](../../sharedDocs/09_商业授权/03_运行时协调与激活说明.md)。
@@ -23,8 +29,11 @@ API and mixed Worker consumers bind to `settlement` in compiled code. Approved
 Compose components receive independent `runtime/license-<service>.env` files,
 read-only platform public keys and separate durable signed-state volumes.
 Credentials and signing private keys must not enter images, logs or shared
-application environment files. Disabled compatibility is allowed only for never-enrolled components without other
-binding fields or persisted runtime state; enabled incomplete configuration fails.
+application environment files. Disabled compatibility is allowed only for never-enrolled
+components without other binding fields or persisted runtime state, and only after
+explicit `COMMERCIAL_LICENSE_COMPATIBILITY=true` (normalized exact `true`; empty,
+`1` or `yes` fail startup). That switch is not authorization: enabled incomplete
+configuration fails.
 
 API historical query/download routes and historical report generation are
 explicitly classified, not inferred from HTTP method. Unknown entries and all

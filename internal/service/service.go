@@ -177,148 +177,178 @@ func textTooLong(value string, max int) bool {
 	return len([]rune(strings.TrimSpace(value))) > max
 }
 
-// IngestContract 用途：按普通v1语义接收财务事件。
+// ContractIngestResult 用途：区分首版基线、修订重放和转入人工复核的入站结果。
+// Created 为假表示同一 event_id 已成功处理（幂等重放）。
+type ContractIngestResult struct {
+	Created      bool
+	RevisionHeld bool
+	HoldID       string
+}
+
+// IngestContract 用途：按普通v1语义接收财务事件，并按合同版本接收财务修订。
 // 参数：ctx为上下文，source为来源，trustedTenant为验签租户，event为原事件。
-// 返回值：首次创建返回真，重复返回假；业务或存储错误保持失败。
-func (s *Service) IngestContract(ctx context.Context, source, trustedTenant string, event ContractEvent) (bool, error) {
+// 返回值：首次创建或修订接收成功返回真，重复返回假；需要人工复核时 RevisionHeld 为真；
+// 业务或存储错误保持失败。
+func (s *Service) IngestContract(ctx context.Context, source, trustedTenant string, event ContractEvent) (ContractIngestResult, error) {
 	return s.ingestContract(ctx, source, trustedTenant, event, nil)
 }
 
 // ingestContract 在原入站事务内可选建立导入暂存，保留普通合同首次生效语义。
+// 版本三态：version==0（首版）不变；version>current 走修订分支；version<=current 保持幂等/冲突语义。
 // 参数：ctx为上下文，source为来源，trustedTenant为可信租户，event为财务事件，imported为新协议命令。
-// 返回值：首次创建标识及协议、幂等或存储错误。
-func (s *Service) ingestContract(ctx context.Context, source, trustedTenant string, event ContractEvent, imported *ContractImportCommand) (bool, error) {
+// 返回值：入站结果及协议、幂等或存储错误。
+func (s *Service) ingestContract(ctx context.Context, source, trustedTenant string, event ContractEvent, imported *ContractImportCommand) (ContractIngestResult, error) {
 	if _, err := required(event.EventID, "event_id"); err != nil {
-		return false, err
+		return ContractIngestResult{}, err
 	}
 	trustedTenant = strings.TrimSpace(trustedTenant)
 	if trustedTenant == "" || event.TenantID != trustedTenant {
-		return false, fmt.Errorf("%w: tenant_id must equal the verified machine tenant", ErrInvalid)
+		return ContractIngestResult{}, fmt.Errorf("%w: tenant_id must equal the verified machine tenant", ErrInvalid)
 	}
 	if event.EventType != "contract.financial_effective.v1" {
-		return false, fmt.Errorf("%w: unsupported event_type", ErrInvalid)
+		return ContractIngestResult{}, fmt.Errorf("%w: unsupported event_type", ErrInvalid)
 	}
 	if event.Contract.Version < 1 || len(event.Contract.PaymentTerms) == 0 {
-		return false, fmt.Errorf("%w: contract version and payment_terms are required", ErrInvalid)
+		return ContractIngestResult{}, fmt.Errorf("%w: contract version and payment_terms are required", ErrInvalid)
 	}
 	for name, value := range map[string]string{"source": source, "contract.id": event.Contract.ID, "contract.no": event.Contract.No, "customer_id": event.Contract.CustomerID, "customer_name": event.Contract.CustomerName} {
 		if _, err := required(value, name); err != nil {
-			return false, err
+			return ContractIngestResult{}, err
 		}
 	}
 	if event.Aggregate.ID != "" && event.Aggregate.ID != event.Contract.ID {
-		return false, fmt.Errorf("%w: aggregate and contract IDs differ", ErrInvalid)
+		return ContractIngestResult{}, fmt.Errorf("%w: aggregate and contract IDs differ", ErrInvalid)
 	}
 	if event.Aggregate.Version != 0 && event.Aggregate.Version != event.Contract.Version {
-		return false, fmt.Errorf("%w: aggregate and contract versions differ", ErrInvalid)
+		return ContractIngestResult{}, fmt.Errorf("%w: aggregate and contract versions differ", ErrInvalid)
 	}
 	if len(event.Contract.Currency) != 3 {
-		return false, fmt.Errorf("%w: currency must be a three-letter code", ErrInvalid)
+		return ContractIngestResult{}, fmt.Errorf("%w: currency must be a three-letter code", ErrInvalid)
 	}
 	contractAmount, err := amount(event.Contract.Amount)
 	if err != nil {
-		return false, err
+		return ContractIngestResult{}, err
 	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return ContractIngestResult{}, err
 	}
 	defer tx.Rollback()
 	if imported != nil {
 		_, replay, e := claimIdempotency(ctx, tx, event.TenantID, "IMPORT_PREPARE", imported.EventID, event.Contract.ID, imported)
 		if e != nil {
-			return false, e
+			return ContractIngestResult{}, e
 		}
 		if replay {
-			return false, nil
+			return ContractIngestResult{}, nil
 		}
 	}
 	var duplicateID string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM settlement_inbox_event WHERE tenant_id=? AND source_application=? AND event_id=?`, event.TenantID, source, event.EventID).Scan(&duplicateID)
 	if err == nil {
 		if imported != nil {
-			return false, ErrConflict
+			return ContractIngestResult{}, ErrConflict
 		}
-		return false, nil
+		return ContractIngestResult{}, nil
 	}
 	if err != sql.ErrNoRows {
-		return false, err
+		return ContractIngestResult{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO settlement_contract_stream(tenant_id,source_application,source_contract_id,current_version,updated_at) VALUES(?,?,?,0,UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE updated_at=updated_at`, event.TenantID, source, event.Contract.ID); err != nil {
-		return false, err
+		return ContractIngestResult{}, err
 	}
 	var currentVersion int
 	if err = tx.QueryRowContext(ctx, `SELECT current_version FROM settlement_contract_stream WHERE tenant_id=? AND source_application=? AND source_contract_id=? FOR UPDATE`, event.TenantID, source, event.Contract.ID).Scan(&currentVersion); err != nil {
-		return false, err
+		return ContractIngestResult{}, err
 	}
-	// 首个财务生效事件固定合同财务
-	// 基线。任何后续事件 ID，即使合同版本更新，均为
-	// 修订，不得创建第二份全额应收。精确事件 ID
-	// 重放在上方作为成功重复处理。
+	// 版本三态：0 为首版基线；更高版本进入修订分支；不高于当前版本保持幂等/冲突语义，
+	// 版本回退绝不允许自动应用。精确 event_id 重放在上方已作为成功重复处理。
 	if currentVersion != 0 {
-		return false, ErrConflict
+		if imported != nil || event.Contract.Version <= currentVersion {
+			return ContractIngestResult{}, ErrConflict
+		}
+		inboxID := newID()
+		payload, _ := json.Marshal(event)
+		_, err = tx.ExecContext(ctx, `INSERT INTO settlement_inbox_event(id,tenant_id,source_application,event_id,event_type,aggregate_id,aggregate_version,payload_json,status,received_at) VALUES(?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3))`, inboxID, event.TenantID, source, event.EventID, event.EventType, event.Contract.ID, event.Contract.Version, payload, "ACCEPTED")
+		if err != nil {
+			if mysqlDuplicate(err) {
+				return ContractIngestResult{}, nil
+			}
+			return ContractIngestResult{}, err
+		}
+		held, holdID, err := s.applyContractRevision(ctx, tx, source, event, contractAmount, currentVersion, inboxID)
+		if err != nil {
+			return ContractIngestResult{}, err
+		}
+		if err = tx.Commit(); err != nil {
+			return ContractIngestResult{}, err
+		}
+		return ContractIngestResult{Created: true, RevisionHeld: held, HoldID: holdID}, nil
 	}
 	inboxID := newID()
 	payload, _ := json.Marshal(event)
 	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_inbox_event(id,tenant_id,source_application,event_id,event_type,aggregate_id,aggregate_version,payload_json,status,received_at) VALUES(?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3))`, inboxID, event.TenantID, source, event.EventID, event.EventType, event.Contract.ID, event.Contract.Version, payload, "ACCEPTED")
 	if err != nil {
 		if mysqlDuplicate(err) {
-			return false, nil
+			return ContractIngestResult{}, nil
 		}
-		return false, err
+		return ContractIngestResult{}, err
 	}
 	contractID := newID()
 	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_contract_snapshot(id,tenant_id,source_application,source_event_id,source_contract_id,source_contract_no,source_contract_version,customer_id,customer_name_snapshot,project_id,project_name_snapshot,currency,contract_amount,financial_status,effective_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, contractID, event.TenantID, source, event.EventID, event.Contract.ID, event.Contract.No, event.Contract.Version, event.Contract.CustomerID, event.Contract.CustomerName, event.Contract.ProjectID, event.Contract.ProjectName, strings.ToUpper(event.Contract.Currency), contractAmount, "EFFECTIVE", event.OccurredAt)
 	if err != nil {
 		if mysqlDuplicate(err) {
-			return false, ErrConflict
+			return ContractIngestResult{}, ErrConflict
 		}
-		return false, err
+		return ContractIngestResult{}, err
 	}
 	if imported != nil {
 		if _, err = tx.ExecContext(ctx, `UPDATE settlement_contract_snapshot SET migration_state='HOLD',import_snapshot_version=1 WHERE id=? AND tenant_id=?`, contractID, event.TenantID); err != nil {
-			return false, err
+			return ContractIngestResult{}, err
 		}
 		expectedFacts, _ := json.Marshal(imported.ExpectedFacts)
 		_, err = tx.ExecContext(ctx, `INSERT INTO settlement_contract_import(tenant_id,contract_snapshot_id,origin_import_item_id,source_revision,policy_digest,release_version,import_mode,owner_user_id,prepare_event_id,expected_facts_json) VALUES(?,?,?,?,?,?,?,?,?,?)`, event.TenantID, contractID, imported.OriginImportItemID, imported.SourceRevision, imported.PolicyDigest, imported.ReleaseVersion, imported.ImportMode, event.Contract.OwnerUserID, imported.EventID, expectedFacts)
 		if err != nil {
 			if mysqlDuplicate(err) {
-				return false, ErrConflict
+				return ContractIngestResult{}, ErrConflict
 			}
-			return false, err
+			return ContractIngestResult{}, err
 		}
 	}
 	termTotal := new(big.Rat)
 	for _, term := range event.Contract.PaymentTerms {
 		a, err := amount(term.Amount)
 		if err != nil {
-			return false, err
+			return ContractIngestResult{}, err
 		}
 		if term.InstallmentNo < 1 {
-			return false, fmt.Errorf("%w: installment_no must be positive", ErrInvalid)
+			return ContractIngestResult{}, fmt.Errorf("%w: installment_no must be positive", ErrInvalid)
 		}
 		part, _ := new(big.Rat).SetString(a)
 		termTotal.Add(termTotal, part)
 		if _, err := time.Parse("2006-01-02", term.DueDate); err != nil {
-			return false, fmt.Errorf("%w: due_date must be YYYY-MM-DD", ErrInvalid)
+			return ContractIngestResult{}, fmt.Errorf("%w: due_date must be YYYY-MM-DD", ErrInvalid)
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receivable_plan(id,tenant_id,contract_snapshot_id,installment_no,due_date,planned_amount,generation_source,confirmation_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, newID(), event.TenantID, contractID, term.InstallmentNo, term.DueDate, a, "CONTRACT_EVENT", "PENDING_CONFIRMATION")
 		if err != nil {
-			return false, err
+			return ContractIngestResult{}, err
 		}
 	}
 	expected, _ := new(big.Rat).SetString(contractAmount)
 	if termTotal.Cmp(expected) != 0 {
-		return false, fmt.Errorf("%w: payment term total must equal contract amount", ErrInvalid)
+		return ContractIngestResult{}, fmt.Errorf("%w: payment term total must equal contract amount", ErrInvalid)
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE settlement_inbox_event SET status='COMPLETED',processed_at=UTC_TIMESTAMP(3) WHERE id=?`, inboxID)
 	if err != nil {
-		return false, err
+		return ContractIngestResult{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE settlement_contract_stream SET current_version=?,updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND source_application=? AND source_contract_id=?`, event.Contract.Version, event.TenantID, source, event.Contract.ID); err != nil {
-		return false, err
+		return ContractIngestResult{}, err
 	}
-	return true, tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return ContractIngestResult{}, err
+	}
+	return ContractIngestResult{Created: true}, nil
 }
 
 type PlanConfirmationInput struct {
@@ -381,10 +411,11 @@ func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, in Pl
 	if migrationState == "HOLD" && (confirmedAmount != planned || confirmedDue != due) {
 		return ErrImportBlocked
 	}
-	if confirmedAmount != planned {
-		if err = checkPlanBudget(ctx, tx, p.TenantID, snapshot, id, confirmedAmount); err != nil {
-			return err
-		}
+	// 覆盖校验改为无条件执行：即使本次确认没有改金额，只要计划合计与合同金额
+	// 已脱钩超过阈值，也必须由 override 权限放行，不能靠"未改金额"绕过。
+	coverage, err := s.requirePlanCoverage(ctx, tx, p, snapshot, id, confirmedAmount, planned)
+	if err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE settlement_receivable_plan SET due_date=?,planned_amount=?,confirmation_status='CONFIRMED',confirmation_reason=?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=? AND version=?`, confirmedDue, confirmedAmount, reason, id, p.TenantID, in.Version); err != nil {
 		return err
@@ -399,6 +430,9 @@ func (s *Service) ConfirmPlan(ctx context.Context, p Principal, id string, in Pl
 		"old_planned_amount": planned, "new_planned_amount": confirmedAmount,
 		"reason": reason,
 	}); err != nil {
+		return err
+	}
+	if err = auditPlanCoverageDeviation(ctx, tx, p, coverage, reason, "CONFIRM_PLAN"); err != nil {
 		return err
 	}
 	return tx.Commit()

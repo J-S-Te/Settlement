@@ -127,8 +127,15 @@ func main() {
 	}
 	dependencies = append(dependencies, commercialGate)
 	if cfg.HandoverMachineEnabled {
-		handoverMachine, verifyErr := platform.NewStrictServiceTokenVerifier(context.Background(), cfg.OIDCIssuer,
-			cfg.HandoverMachineClientID, cfg.HandoverMachineAudience, cfg.OIDCTenantID, cfg.HandoverMachineApplicationCode, cfg.OIDCEnvironmentCode, cfg.HandoverMachineScope)
+		// 交接协议与合同/项目仓库使用同一平台 application JWT 信任域：
+		// 平台自身 ApplicationJWTManager 签发（caller=platform、env=prod、scope=handover.machine），
+		// 租户来自签名 claims；不再走 OIDC 严格验签器。
+		handoverMachine, verifyErr := platform.NewClientCredentialsTokenVerifier(context.Background(), platform.ClientCredentialsVerifierOptions{
+			Issuer: cfg.HandoverMachineIssuer, Audience: cfg.HandoverMachineAudience,
+			PublicKeyPath: cfg.HandoverMachinePublicKeyPath, ClientID: cfg.HandoverMachineClientID,
+			TenantID: cfg.OIDCTenantID, CallerApplicationCode: cfg.HandoverMachineApplicationCode,
+			CallerEnvironmentCode: cfg.HandoverMachineCallerEnvironmentCode, RequiredScope: cfg.HandoverMachineScope,
+		})
 		if verifyErr != nil {
 			slog.Error("initialize handover machine token verifier", "error", verifyErr)
 			os.Exit(1)

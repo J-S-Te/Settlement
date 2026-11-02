@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+// CRMCreditPaymentIngestScope 是结算→CRM 回款/冲销信用事实写入的唯一合法 scope。
+// 它必须同时匹配 CRM 机器入口的权限白名单（customer_and_opportunity crmauth）与
+// 平台受控用途 crm_credit_payment_ingest；历史上双方各用一个名字
+// （crm.credit.payment.ingest 对 customer.credit.payment.ingest）导致“启用即 401”，
+// 因此这里收敛为单一常量，并在启动期拒绝任何漂移。
+const CRMCreditPaymentIngestScope = "customer.credit.payment.ingest"
+
 // Config 有意将部署密钥置于源码控制之外。
 // API 为独立子系统，不得复用其他应用的数据库、
 // 浏览器 Cookie 或机器客户端凭据。
@@ -53,34 +60,77 @@ type Config struct {
 	TaxResultAudience                 string
 	TaxResultApplicationCode          string
 	// HandoverMachine 是基础平台人员交接机器协议的入站配置。
-	HandoverMachineEnabled         bool
-	HandoverMachineClientID        string
-	HandoverMachineAudience        string
-	HandoverMachineApplicationCode string
-	HandoverMachineScope           string
-	TaxProviderCode                string
-	PersonnelDirectoryURL          string
-	PersonnelDirectoryClientID     string
-	PersonnelDirectoryClientSecret string
-	CRMCreditSyncEnabled           bool
-	ContractImportEnabled          bool
-	CRMCreditEndpoint              string
-	CRMCreditTokenEndpoint         string
-	CRMCreditClientID              string
-	CRMCreditClientSecret          string
-	CRMCreditScope                 string
-	FileGatewayMode                string
-	FileGatewayURL                 string
-	FileGatewayTokenURL            string
-	FileGatewayClientID            string
-	FileGatewayClientSecret        string
-	FileGatewayScope               string
-	FileGatewayApplicationID       string
-	InvoiceIssuanceMode            string
-	PublicOrigin                   string
-	AllowInsecureHTTPOrigin        bool
-	OIDCSessionIdleTTL             time.Duration
-	OIDCSessionAbsoluteTTL         time.Duration
+	// 信任域与平台 application JWT 对齐：issuer/audience/client_id/caller 应用与环境/
+	// 唯一 scope 完整绑定，租户来自签名 claims，不再使用 OIDC 严格验签器。
+	HandoverMachineEnabled               bool
+	HandoverMachineClientID              string
+	HandoverMachineAudience              string
+	HandoverMachineApplicationCode       string
+	HandoverMachineScope                 string
+	HandoverMachineIssuer                string
+	HandoverMachinePublicKeyPath         string
+	HandoverMachineCallerEnvironmentCode string
+	TaxProviderCode                      string
+	PersonnelDirectoryURL                string
+	PersonnelDirectoryClientID           string
+	PersonnelDirectoryClientSecret       string
+	CRMCreditSyncEnabled                 bool
+	ContractImportEnabled                bool
+	CRMCreditEndpoint                    string
+	CRMCreditTokenEndpoint               string
+	CRMCreditClientID                    string
+	CRMCreditClientSecret                string
+	CRMCreditScope                       string
+	FileGatewayMode                      string
+	FileGatewayURL                       string
+	FileGatewayTokenURL                  string
+	FileGatewayClientID                  string
+	FileGatewayClientSecret              string
+	FileGatewayScope                     string
+	FileGatewayApplicationID             string
+	InvoiceIssuanceMode                  string
+	PublicOrigin                         string
+	AllowInsecureHTTPOrigin              bool
+	OIDCSessionIdleTTL                   time.Duration
+	OIDCSessionAbsoluteTTL               time.Duration
+	// AuditDestinationRequired 是 BIZ-XAPI-10 的审计目的地必开判定：
+	// 显式 SETTLEMENT_AUDIT_REQUIRED 优先，否则 APP_ENV=production /
+	// PLATFORM_ENVIRONMENT_CODE=prod 视为生产必开。必开但凭据不全时 worker 失败关闭。
+	AuditDestinationRequired bool
+	// AuditDestinationConfigured / NotificationDestinationConfigured 只表示机器凭据是否齐全，
+	// 不输出凭据值；供 /readyz、/metrics 暴露“目的地缺失”而不是静默积压。
+	AuditDestinationConfigured        bool
+	NotificationDestinationConfigured bool
+}
+
+// AuditDestinationRequired 解析审计目的地是否必开（BIZ-XAPI-10）。
+// 参数：explicit 为显式 SETTLEMENT_AUDIT_REQUIRED，appEnv 为 APP_ENV，
+// environmentCode 为 PLATFORM_ENVIRONMENT_CODE。
+// 返回值：生效判定；显式值非法时返回错误（失败关闭，不静默降级）。
+// 判定顺序与平台 platformAuditRequired 同构：显式开关 > APP_ENV=production；
+// 子系统生产清单只设置 PLATFORM_ENVIRONMENT_CODE=prod，因此最后回退到该口径。
+func AuditDestinationRequired(explicit, appEnv, environmentCode string) (bool, error) {
+	if raw := strings.TrimSpace(explicit); raw != "" {
+		required, err := strconv.ParseBool(raw)
+		if err != nil {
+			return false, fmt.Errorf("SETTLEMENT_AUDIT_REQUIRED: %w", err)
+		}
+		return required, nil
+	}
+	if env := strings.TrimSpace(appEnv); env != "" {
+		return strings.EqualFold(env, "production"), nil
+	}
+	return isProductionEnvironmentCode(environmentCode), nil
+}
+
+// isProductionEnvironmentCode 按平台环境编码判断生产：兼容 prod 与 production。
+func isProductionEnvironmentCode(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "prod", "production":
+		return true
+	default:
+		return false
+	}
 }
 
 // Load 用途：读取并校验结算启动配置，拒绝不完整的项目引用机器身份。
@@ -107,27 +157,30 @@ func Load() (Config, error) {
 		OIDCTenantID: strings.TrimSpace(os.Getenv("OIDC_TENANT_ID")), OIDCEnvironmentCode: env("PLATFORM_ENVIRONMENT_CODE", "dev"),
 		TrustedProxies: trustedProxies, OIDCSessionCookieName: env("OIDC_SESSION_COOKIE_NAME", "settlement_session"),
 		ContractClientID: strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_CLIENT_ID")), ContractAudience: strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_AUDIENCE")),
-		PlatformMachineTokenPublicKeyPath: strings.TrimSpace(os.Getenv("PLATFORM_MACHINE_TOKEN_PUBLIC_KEY_PATH")),
-		PlatformMachineTokenIssuer:        strings.TrimSpace(os.Getenv("PLATFORM_MACHINE_TOKEN_ISSUER")),
-		ContractOAuthClientID:             strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_OAUTH_CLIENT_ID")),
-		ContractApplicationID:             strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_APPLICATION_ID")),
-		ContractEnvironmentID:             strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_ENVIRONMENT_ID")),
-		TaxResultBearerToken:              strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_BEARER_TOKEN")),
-		TaxResultClientID:                 strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_CLIENT_ID")),
-		TaxResultAudience:                 strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_AUDIENCE")),
-		TaxResultApplicationCode:          env("SETTLEMENT_TAX_RESULT_APPLICATION_CODE", "tax_adapter"),
-		HandoverMachineClientID:           strings.TrimSpace(os.Getenv("SETTLEMENT_HANDOVER_CLIENT_ID")),
-		HandoverMachineAudience:           strings.TrimSpace(os.Getenv("SETTLEMENT_HANDOVER_AUDIENCE")),
-		HandoverMachineApplicationCode:    env("SETTLEMENT_HANDOVER_APPLICATION_CODE", "basic-platform"),
-		HandoverMachineScope:              env("SETTLEMENT_HANDOVER_SCOPE", "handover.machine"),
-		TaxProviderCode:                   env("SETTLEMENT_TAX_PROVIDER_CODE", "default"),
-		PersonnelDirectoryURL:             strings.TrimRight(strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_URL")), "/"),
-		PersonnelDirectoryClientID:        strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_ID")), PersonnelDirectoryClientSecret: os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_SECRET"),
+		PlatformMachineTokenPublicKeyPath:    strings.TrimSpace(os.Getenv("PLATFORM_MACHINE_TOKEN_PUBLIC_KEY_PATH")),
+		PlatformMachineTokenIssuer:           strings.TrimSpace(os.Getenv("PLATFORM_MACHINE_TOKEN_ISSUER")),
+		ContractOAuthClientID:                strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_OAUTH_CLIENT_ID")),
+		ContractApplicationID:                strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_APPLICATION_ID")),
+		ContractEnvironmentID:                strings.TrimSpace(os.Getenv("CONTRACT_INTEGRATION_ENVIRONMENT_ID")),
+		TaxResultBearerToken:                 strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_BEARER_TOKEN")),
+		TaxResultClientID:                    strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_CLIENT_ID")),
+		TaxResultAudience:                    strings.TrimSpace(os.Getenv("SETTLEMENT_TAX_RESULT_AUDIENCE")),
+		TaxResultApplicationCode:             env("SETTLEMENT_TAX_RESULT_APPLICATION_CODE", "tax_adapter"),
+		HandoverMachineClientID:              strings.TrimSpace(os.Getenv("SETTLEMENT_HANDOVER_CLIENT_ID")),
+		HandoverMachineAudience:              strings.TrimSpace(os.Getenv("SETTLEMENT_HANDOVER_AUDIENCE")),
+		HandoverMachineApplicationCode:       env("SETTLEMENT_HANDOVER_APPLICATION_CODE", "platform"),
+		HandoverMachineScope:                 env("SETTLEMENT_HANDOVER_SCOPE", "handover.machine"),
+		HandoverMachineIssuer:                strings.TrimSpace(os.Getenv("SETTLEMENT_HANDOVER_ISSUER")),
+		HandoverMachinePublicKeyPath:         strings.TrimSpace(os.Getenv("SETTLEMENT_HANDOVER_PUBLIC_KEY_PATH")),
+		HandoverMachineCallerEnvironmentCode: env("SETTLEMENT_HANDOVER_CALLER_ENVIRONMENT_CODE", strings.TrimSpace(os.Getenv("PLATFORM_ENVIRONMENT_CODE"))),
+		TaxProviderCode:                      env("SETTLEMENT_TAX_PROVIDER_CODE", "default"),
+		PersonnelDirectoryURL:                strings.TrimRight(strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_URL")), "/"),
+		PersonnelDirectoryClientID:           strings.TrimSpace(os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_ID")), PersonnelDirectoryClientSecret: os.Getenv("PLATFORM_PERSONNEL_DIRECTORY_CLIENT_SECRET"),
 		CRMCreditEndpoint:        strings.TrimSpace(os.Getenv("CRM_CREDIT_SYNC_ENDPOINT")),
 		CRMCreditTokenEndpoint:   strings.TrimSpace(os.Getenv("CRM_CREDIT_TOKEN_URL")),
 		CRMCreditClientID:        strings.TrimSpace(os.Getenv("CRM_CREDIT_CLIENT_ID")),
 		CRMCreditClientSecret:    os.Getenv("CRM_CREDIT_CLIENT_SECRET"),
-		CRMCreditScope:           env("CRM_CREDIT_SCOPE", "crm.credit.payment.ingest"),
+		CRMCreditScope:           env("CRM_CREDIT_SCOPE", CRMCreditPaymentIngestScope),
 		FileGatewayMode:          strings.ToLower(env("SETTLEMENT_FILE_GATEWAY_MODE", "disabled")),
 		FileGatewayURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("FILE_GATEWAY_URL")), "/"),
 		FileGatewayTokenURL:      strings.TrimSpace(os.Getenv("FILE_GATEWAY_TOKEN_URL")),
@@ -143,6 +196,22 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("project reference OAuth configuration is incomplete")
 		}
 	}
+	// BIZ-XAPI-10：审计目的地是否必开按显式开关优先、生产环境兜底；
+	// 目的地的凭据完整性只做布尔登记，供 /readyz 与 /metrics 暴露，不在此处退出
+	// 进程（API 需要保持可探测；worker 负责生产 fail-closed）。
+	auditDestinationRequired, auditRequiredErr := AuditDestinationRequired(
+		os.Getenv("SETTLEMENT_AUDIT_REQUIRED"),
+		os.Getenv("APP_ENV"),
+		c.OIDCEnvironmentCode,
+	)
+	if auditRequiredErr != nil {
+		return c, auditRequiredErr
+	}
+	c.AuditDestinationRequired = auditDestinationRequired
+	c.AuditDestinationConfigured = strings.TrimSpace(os.Getenv("SETTLEMENT_AUDIT_CLIENT_ID")) != "" &&
+		strings.TrimSpace(os.Getenv("SETTLEMENT_AUDIT_CLIENT_SECRET")) != ""
+	c.NotificationDestinationConfigured = strings.TrimSpace(os.Getenv("SETTLEMENT_NOTIFICATION_CLIENT_ID")) != "" &&
+		strings.TrimSpace(os.Getenv("SETTLEMENT_NOTIFICATION_CLIENT_SECRET")) != ""
 	var err error
 	if c.DevelopmentAuth, err = boolEnv("SETTLEMENT_DEVELOPMENT_AUTH", false); err != nil {
 		return c, err
@@ -222,8 +291,25 @@ func Load() (Config, error) {
 	if c.TaxResultIngestEnabled && !c.DevelopmentAuth && (c.TaxResultClientID == "" || c.TaxResultAudience == "" || c.TaxResultApplicationCode == "" || c.TaxProviderCode == "") {
 		return c, fmt.Errorf("tax result client, audience, application and provider are required when tax result ingest is enabled")
 	}
-	if c.HandoverMachineEnabled && (c.HandoverMachineClientID == "" || c.HandoverMachineAudience == "" || c.HandoverMachineApplicationCode == "") {
-		return c, fmt.Errorf("SETTLEMENT_HANDOVER_CLIENT_ID/AUDIENCE/APPLICATION_CODE are required when SETTLEMENT_HANDOVER_ENABLED=true")
+	// 交接协议只服务平台编排器：启用后必须能用平台 Ed25519 公钥完成完整信任域验签，
+	// 任一绑定缺项都在启动期失败关闭，不能退化为“只校验签名不校验调用方”。
+	if c.HandoverMachineEnabled {
+		for _, item := range []struct {
+			name, value string
+		}{
+			{"SETTLEMENT_HANDOVER_CLIENT_ID", c.HandoverMachineClientID},
+			{"SETTLEMENT_HANDOVER_AUDIENCE", c.HandoverMachineAudience},
+			{"SETTLEMENT_HANDOVER_ISSUER", c.HandoverMachineIssuer},
+			{"SETTLEMENT_HANDOVER_PUBLIC_KEY_PATH", c.HandoverMachinePublicKeyPath},
+			{"SETTLEMENT_HANDOVER_APPLICATION_CODE", c.HandoverMachineApplicationCode},
+			{"SETTLEMENT_HANDOVER_CALLER_ENVIRONMENT_CODE", c.HandoverMachineCallerEnvironmentCode},
+			{"SETTLEMENT_HANDOVER_SCOPE", c.HandoverMachineScope},
+			{"OIDC_TENANT_ID", c.OIDCTenantID},
+		} {
+			if strings.TrimSpace(item.value) == "" {
+				return c, fmt.Errorf("%s is required when SETTLEMENT_HANDOVER_ENABLED=true", item.name)
+			}
+		}
 	}
 	if c.TaxResultIngestEnabled && c.DevelopmentAuth && c.TaxResultBearerToken == "" {
 		return c, fmt.Errorf("development tax result token is required when tax result ingest is enabled")
@@ -231,8 +317,13 @@ func Load() (Config, error) {
 	if c.InvoiceIssuanceMode == "tax_adapter" && !c.TaxResultIngestEnabled {
 		return c, fmt.Errorf("SETTLEMENT_TAX_RESULT_INGEST_ENABLED must be true in tax_adapter mode")
 	}
+	// scope 漂移必须在启动期失败关闭，而不是等到首次投递才 401：无论同步开关是否
+	// 打开都校验，避免旧环境文件把已经被平台/CRM 拒绝的名字继续带进新版本。
+	if c.CRMCreditScope != CRMCreditPaymentIngestScope {
+		return c, fmt.Errorf("CRM_CREDIT_SCOPE must be %q to match the CRM machine permission and the platform crm_credit_payment_ingest purpose binding", CRMCreditPaymentIngestScope)
+	}
 	if c.CRMCreditSyncEnabled {
-		for name, value := range map[string]string{"CRM_CREDIT_SYNC_ENDPOINT": c.CRMCreditEndpoint, "CRM_CREDIT_CLIENT_ID": c.CRMCreditClientID, "CRM_CREDIT_CLIENT_SECRET": c.CRMCreditClientSecret, "CRM_CREDIT_SCOPE": c.CRMCreditScope} {
+		for name, value := range map[string]string{"CRM_CREDIT_SYNC_ENDPOINT": c.CRMCreditEndpoint, "CRM_CREDIT_CLIENT_ID": c.CRMCreditClientID, "CRM_CREDIT_CLIENT_SECRET": c.CRMCreditClientSecret} {
 			if value == "" {
 				return c, fmt.Errorf("%s is required when SETTLEMENT_CRM_CREDIT_SYNC_ENABLED=true", name)
 			}

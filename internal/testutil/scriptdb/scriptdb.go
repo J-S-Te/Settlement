@@ -19,6 +19,10 @@ type Step struct {
 	Columns   int
 	Err       error
 	After     func()
+	// Args 非空时收集该步骤实际绑定的参数，用于断言业务日历等绑定值。
+	Args *[]driver.NamedValue
+	// SQLOut 非空时记录该步骤匹配到的完整 SQL，用于断言占位符与参数数量一致。
+	SQLOut *string
 }
 
 type connector struct {
@@ -39,7 +43,7 @@ func Open(t *testing.T, steps ...Step) *sql.DB {
 	return db
 }
 
-func (c *connector) take(kind, query string) (Step, error) {
+func (c *connector) take(kind, query string, args []driver.NamedValue) (Step, error) {
 	if len(c.steps) == 0 {
 		err := fmt.Errorf("unexpected %s: %s", kind, query)
 		c.t.Error(err)
@@ -52,6 +56,12 @@ func (c *connector) take(kind, query string) (Step, error) {
 		return Step{}, err
 	}
 	c.steps = c.steps[1:]
+	if s.Args != nil {
+		*s.Args = append(*s.Args, args...)
+	}
+	if s.SQLOut != nil {
+		*s.SQLOut = query
+	}
 	if s.After != nil {
 		s.After()
 	}
@@ -70,7 +80,7 @@ type conn struct{ c *connector }
 func (c *conn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unexpected prepare") }
 func (c *conn) Close() error                        { return nil }
 func (c *conn) Begin() (driver.Tx, error) {
-	_, err := c.c.take("begin", "")
+	_, err := c.c.take("begin", "", nil)
 	return c, err
 }
 
@@ -78,14 +88,17 @@ func (c *conn) Begin() (driver.Tx, error) {
 // records the transaction only; it must not silently exercise a different path
 // merely because production requests an explicit isolation level.
 func (c *conn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) { return c.Begin() }
-func (c *conn) Commit() error                                                { _, err := c.c.take("commit", ""); return err }
-func (c *conn) Rollback() error                                              { _, err := c.c.take("rollback", ""); return err }
-func (c *conn) ExecContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Result, error) {
-	_, err := c.c.take("exec", q)
+func (c *conn) Commit() error                                                { _, err := c.c.take("commit", "", nil); return err }
+func (c *conn) Rollback() error {
+	_, err := c.c.take("rollback", "", nil)
+	return err
+}
+func (c *conn) ExecContext(_ context.Context, q string, args []driver.NamedValue) (driver.Result, error) {
+	_, err := c.c.take("exec", q, args)
 	return driver.RowsAffected(1), err
 }
-func (c *conn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
-	s, err := c.c.take("query", q)
+func (c *conn) QueryContext(_ context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
+	s, err := c.c.take("query", q, args)
 	return &rows{values: s.Rows, columns: s.Columns}, err
 }
 

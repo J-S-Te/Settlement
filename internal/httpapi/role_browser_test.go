@@ -309,6 +309,12 @@ func roleBrowserHTTPAssertions(t *testing.T, base string, sessions map[string]an
 // 返回值：无；金额、版本、审批或幂等结果不符即失败。
 func roleBrowserDatabaseAssertions(t *testing.T, db *sql.DB, data map[string]string) {
 	t.Helper()
+	// SET-04 计划覆盖守卫生效后，本浏览器用例（100→80 下调、随后新建 10 元）
+	// 的差额 20% 已超过默认 5% 阈值，而 settlement_sales 不再持有
+	// settlement.finance.override，销售会话会在写库前被拒绝（计划保持 100:2）。
+	// 因此这些断言只对持有 override 的财务负责人（manager）会话成立；
+	// 运行本 opt-in 用例必须使用 manager 会话，或把前端脚本金额改到阈值内。
+	// 这里只标注既有断言的生效前提，不新增放行路径，也不放宽服务端门禁。
 	checks := []struct {
 		query string
 		args  []any

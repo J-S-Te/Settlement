@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/j-s-te/settlement/internal/businessclock"
 	"github.com/j-s-te/settlement/internal/platform"
 	"github.com/j-s-te/settlement/internal/service"
 	"time"
@@ -72,16 +73,20 @@ func (w *RoleReminderWorker) RunOnce(ctx context.Context) error {
 	if err = w.closeRoleActions(ctx); err != nil {
 		return err
 	}
-	query := `SELECT rp.id,cs.id,COALESCE(r.id,''),cr.owner_user_id,COALESCE(r.receivable_no,CONCAT('PLAN-',rp.installment_no)),cs.customer_name_snapshot,DATEDIFF(CURDATE(),rp.due_date),rp.confirmation_status<>'CONFIRMED'
+	query := `SELECT rp.id,cs.id,COALESCE(r.id,''),cr.owner_user_id,COALESCE(r.receivable_no,CONCAT('PLAN-',rp.installment_no)),cs.customer_name_snapshot,DATEDIFF(?,rp.due_date),rp.confirmation_status<>'CONFIRMED'
  FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id
  JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE
  LEFT JOIN settlement_receivable r ON r.receivable_plan_id=rp.id AND r.tenant_id=rp.tenant_id
- LEFT JOIN settlement_role_reminder_cursor rc ON rc.tenant_id=rp.tenant_id AND rc.plan_id=rp.id AND rc.phase=CASE WHEN DATEDIFF(CURDATE(),rp.due_date)>=? THEN 'ESCALATED' WHEN rp.due_date<CURDATE() THEN 'OVERDUE' WHEN rp.confirmation_status<>'CONFIRMED' THEN 'PLAN_CONFIRMATION' ELSE 'DUE_SOON' END
- WHERE rp.tenant_id=? AND cs.financial_status='EFFECTIVE' AND cs.migration_state='RELEASED' AND rp.due_date<=DATE_ADD(CURDATE(),INTERVAL ? DAY)
+ LEFT JOIN settlement_role_reminder_cursor rc ON rc.tenant_id=rp.tenant_id AND rc.plan_id=rp.id AND rc.phase=CASE WHEN DATEDIFF(?,rp.due_date)>=? THEN 'ESCALATED' WHEN rp.due_date<? THEN 'OVERDUE' WHEN rp.confirmation_status<>'CONFIRMED' THEN 'PLAN_CONFIRMATION' ELSE 'DUE_SOON' END
+ WHERE rp.tenant_id=? AND cs.financial_status='EFFECTIVE' AND cs.migration_state='RELEASED' AND rp.due_date<=DATE_ADD(?,INTERVAL ? DAY)
  AND rp.planned_amount>0 AND (r.id IS NULL OR r.open_amount>0) AND (rc.next_at IS NULL OR rc.next_at<=UTC_TIMESTAMP(3) OR rc.owner_user_id<>cr.owner_user_id)
  AND NOT EXISTS(SELECT 1 FROM settlement_handover_freeze hf WHERE hf.tenant_id=rp.tenant_id AND hf.user_id=cr.owner_user_id AND hf.status='FROZEN')
  ORDER BY COALESCE(rc.next_at,'1000-01-01 00:00:00'),rp.due_date,rp.id LIMIT ?`
-	rows, err := w.DB.QueryContext(ctx, query, rules.EscalationDays, w.TenantID, rules.LeadDays, batch)
+	// 占位符按 SQL 出现顺序绑定：逾期天数、阶段 CASE（升级阈值/逾期判定）、
+	// 租户、提醒窗口业务日、提前天数、批量上限。
+	today := businessclock.Today()
+	rows, err := w.DB.QueryContext(ctx, query, today, today, rules.EscalationDays,
+		today, w.TenantID, today, rules.LeadDays, batch)
 	if err != nil {
 		return err
 	}
@@ -128,7 +133,7 @@ func (w *RoleReminderWorker) deferCandidate(ctx context.Context, c roleReminderC
 	var owner string
 	var aging int
 	var pending bool
-	err = tx.QueryRowContext(ctx, `SELECT cr.owner_user_id,DATEDIFF(CURDATE(),rp.due_date),rp.confirmation_status<>'CONFIRMED' FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE WHERE rp.tenant_id=? AND rp.id=? FOR UPDATE`, w.TenantID, c.PlanID).Scan(&owner, &aging, &pending)
+	err = tx.QueryRowContext(ctx, `SELECT cr.owner_user_id,DATEDIFF(?,rp.due_date),rp.confirmation_status<>'CONFIRMED' FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE WHERE rp.tenant_id=? AND rp.id=? FOR UPDATE`, businessclock.Today(), w.TenantID, c.PlanID).Scan(&owner, &aging, &pending)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -223,7 +228,7 @@ func (w *RoleReminderWorker) dispatch(ctx context.Context, c roleReminderCandida
 	var owner string
 	var aging int
 	var pending, settled bool
-	err = tx.QueryRowContext(ctx, `SELECT cr.owner_user_id,DATEDIFF(CURDATE(),rp.due_date),rp.confirmation_status<>'CONFIRMED',COALESCE(r.open_amount=0,FALSE) FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE LEFT JOIN settlement_receivable r ON r.receivable_plan_id=rp.id AND r.tenant_id=rp.tenant_id WHERE rp.tenant_id=? AND rp.id=? AND cs.financial_status='EFFECTIVE' AND cs.migration_state='RELEASED' FOR UPDATE`, w.TenantID, c.PlanID).Scan(&owner, &aging, &pending, &settled)
+	err = tx.QueryRowContext(ctx, `SELECT cr.owner_user_id,DATEDIFF(?,rp.due_date),rp.confirmation_status<>'CONFIRMED',COALESCE(r.open_amount=0,FALSE) FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE LEFT JOIN settlement_receivable r ON r.receivable_plan_id=rp.id AND r.tenant_id=rp.tenant_id WHERE rp.tenant_id=? AND rp.id=? AND cs.financial_status='EFFECTIVE' AND cs.migration_state='RELEASED' FOR UPDATE`, businessclock.Today(), w.TenantID, c.PlanID).Scan(&owner, &aging, &pending, &settled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -256,17 +261,44 @@ func (w *RoleReminderWorker) dispatch(ctx context.Context, c roleReminderCandida
 		}
 	}
 	policyID := fmt.Sprintf("%x", sha256.Sum256([]byte(w.TenantID+":CONTRACT_OWNER")))[:32]
+	// 同一计划或应收只允许一个 ACTIVE 案件。已有其他策略的案件时不得再建
+	// 第二个案件或重复派发动作；本阶段只推迟一天，待既有案件结案后再评估。
+	conflict, err := activeCaseConflict(ctx, tx, w.TenantID, c.ReceivableID, c.PlanID, policyID, 1)
+	if err != nil {
+		return err
+	}
+	if conflict != "" {
+		return w.deferOverlap(ctx, tx, c, phase, owner)
+	}
 	_, err = tx.ExecContext(ctx, `INSERT IGNORE INTO settlement_dunning_policy(id,tenant_id,name,version,aging_from_days,aging_to_days,action_type,recipient_rule,channel,repeat_interval_days,priority,enabled,created_at,updated_at) VALUES(?,?,'系统合同负责人提醒',1,-36500,36500,'REMIND','CONTRACT_OWNER','LOCAL',?,'NORMAL',TRUE,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, policyID, w.TenantID, rules.RepeatDays)
 	if err != nil {
 		return err
 	}
 	caseID := id()
-	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_dunning_case(id,tenant_id,receivable_id,plan_id,dunning_policy_id,policy_version,status,next_action_at,current_escalation_level,created_at,updated_at) VALUES(?,?,NULLIF(?,''),?,?,1,'ACTIVE',UTC_TIMESTAMP(3),0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE status='ACTIVE',receivable_id=VALUES(receivable_id),closed_reason='',closed_at=NULL`, caseID, w.TenantID, c.ReceivableID, c.PlanID, policyID)
-	if err != nil {
+	// 数据库唯一键 uq_settlement_dunning_active_receivable/_plan 是并发窗口的最终防线：
+	// 先读同一策略案件再决定插入或重开，唯一键冲突时让位一天，绝不改写其它策略的 ACTIVE 案件。
+	var existingID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM settlement_dunning_case WHERE tenant_id=? AND plan_id=? AND dunning_policy_id=? AND policy_version=1 FOR UPDATE`, w.TenantID, c.PlanID, policyID).Scan(&existingID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		_, err = tx.ExecContext(ctx, `INSERT INTO settlement_dunning_case(id,tenant_id,receivable_id,plan_id,dunning_policy_id,policy_version,status,next_action_at,current_escalation_level,created_at,updated_at) VALUES(?,?,NULLIF(?,''),?,?,1,'ACTIVE',UTC_TIMESTAMP(3),0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, caseID, w.TenantID, c.ReceivableID, c.PlanID, policyID)
+		if duplicateKeyError(err) {
+			return w.deferOverlap(ctx, tx, c, phase, owner)
+		}
+		if err != nil {
+			return err
+		}
+	case err != nil:
 		return err
-	}
-	if err = tx.QueryRowContext(ctx, `SELECT id FROM settlement_dunning_case WHERE tenant_id=? AND plan_id=? AND dunning_policy_id=? AND policy_version=1`, w.TenantID, c.PlanID, policyID).Scan(&caseID); err != nil {
-		return err
+	default:
+		caseID = existingID
+		_, err = tx.ExecContext(ctx, `UPDATE settlement_dunning_case SET status='ACTIVE',receivable_id=NULLIF(?,''),closed_reason='',closed_at=NULL WHERE tenant_id=? AND id=?`, c.ReceivableID, w.TenantID, caseID)
+		if duplicateKeyError(err) {
+			return w.deferOverlap(ctx, tx, c, phase, owner)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	for _, recipient := range recipients {
 		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM settlement_handover_freeze WHERE tenant_id=? AND user_id=? AND status='FROZEN')`, w.TenantID, recipient).Scan(&frozen); err != nil {
@@ -293,6 +325,23 @@ func (w *RoleReminderWorker) dispatch(ctx context.Context, c roleReminderCandida
 	}
 	if w.CheckBusinessLicense != nil {
 		if err = w.CheckBusinessLicense(ctx); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// deferOverlap 把同一催收义务上的并发或跨策略立案冲突推迟一天。
+// 参数：ctx 上下文，tx 当前事务，c 候选计划，phase 阶段，owner 负责人。
+// 返回值：游标存储、商业许可或提交错误。
+// 作用：既有 ACTIVE 案件仍是该义务的唯一权威案件，本轮不新建第二个案件、
+// 不重复派发动作或通知；下一轮在案件结案或阶段变化后重新评估。
+func (w *RoleReminderWorker) deferOverlap(ctx context.Context, tx *sql.Tx, c roleReminderCandidate, phase, owner string) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO settlement_role_reminder_cursor(tenant_id,plan_id,phase,owner_user_id,next_at,updated_at) VALUES(?,?,?,?,DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 1 DAY),UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE owner_user_id=VALUES(owner_user_id),next_at=GREATEST(next_at,VALUES(next_at)),updated_at=UTC_TIMESTAMP(3)`, w.TenantID, c.PlanID, phase, owner); err != nil {
+		return err
+	}
+	if w.CheckBusinessLicense != nil {
+		if err := w.CheckBusinessLicense(ctx); err != nil {
 			return err
 		}
 	}

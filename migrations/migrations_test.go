@@ -70,3 +70,28 @@ func TestInvoiceDocumentAndRedFlushMigrationKeepsControlledWorkflow(t *testing.T
 		}
 	}
 }
+
+// TestContractRevisionHoldMigrationIsIdempotentAndAuditable 验证合同财务修订工单表
+// 有幂等建表守卫、事件级唯一键和人工复核状态列，且不使用浮点金额。
+// 参数：t 为测试上下文。
+// 返回值：无；缺少守卫、唯一键或出现浮点列时失败。
+func TestContractRevisionHoldMigrationIsIdempotentAndAuditable(t *testing.T) {
+	body, err := Files.ReadFile("000024_contract_revision_hold.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS settlement_contract_revision_hold",
+		"uq_settlement_contract_revision_event", "revision_event_id", "hold_reason",
+		"diff_json", "status", "resolution_reason", "resolved_by", "resolved_at",
+		"idx_settlement_contract_revision_status",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("contract revision migration missing %s", required)
+		}
+	}
+	if strings.Contains(text, "FLOAT") || strings.Contains(text, "DOUBLE") {
+		t.Fatal("contract revision migration must not use floating point columns")
+	}
+}
