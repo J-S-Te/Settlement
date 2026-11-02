@@ -11,6 +11,7 @@ import (
 // oidcClaims 是浏览器 OIDC ID 令牌 的最小身份投影。
 // 权限不从这些 Claims 推导，必须由 authorizationContext 提供。
 type oidcClaims struct {
+	SessionID         string `json:"sid"`
 	Subject           string `json:"sub"`
 	IdentityID        string `json:"identity_id"`
 	TenantID          string `json:"tenant_id"`

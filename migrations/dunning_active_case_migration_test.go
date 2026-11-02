@@ -5,13 +5,11 @@ import (
 	"testing"
 )
 
-// TestDunningActiveCaseUniqueMigrationIsAdditiveAndFailClosed 验证唯一 ACTIVE
-// 案件约束由新增迁移交付：生成列只对 ACTIVE 行写入业务键，历史案件不被清理，
-// 存量重复只通过预检暴露并让迁移失败关闭。
-// 参数：t 测试上下文。
-// 返回值：无。
+// TestDunningActiveCaseUniqueMigrationIsAdditiveAndFailClosed 验证ACTIVE唯一约束保持增量与失败关闭。
+// 参数：t为测试上下文，生成列只约束ACTIVE案件且存量重复应阻断迁移。
+// 返回值：无；缺少生成列、唯一键、预检或出现破坏性语句时失败。
 func TestDunningActiveCaseUniqueMigrationIsAdditiveAndFailClosed(t *testing.T) {
-	body, err := Files.ReadFile("000023_dunning_active_case_unique.sql")
+	body, err := Files.ReadFile("000024_dunning_active_case_unique.sql")
 	if err != nil {
 		t.Fatalf("new dunning active case migration is missing: %v", err)
 	}

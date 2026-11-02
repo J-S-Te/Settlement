@@ -22,6 +22,8 @@ const CRMCreditPaymentIngestScope = "customer.credit.payment.ingest"
 // API 为独立子系统，不得复用其他应用的数据库、
 // 浏览器 Cookie 或机器客户端凭据。
 type Config struct {
+	CentralSessionEnabled        bool
+	CentralSessionPublicBaseURL  string
 	ProjectReferenceURL          string
 	ProjectReferenceTokenURL     string
 	ProjectReferenceClientID     string
@@ -254,6 +256,11 @@ func Load() (Config, error) {
 	if c.AllowInsecureHTTPOrigin, err = boolEnv("SETTLEMENT_ALLOW_INSECURE_HTTP_ORIGIN", false); err != nil {
 		return c, err
 	}
+	c.CentralSessionEnabled, err = boolEnv("CENTRAL_SESSION_ENABLED", false)
+	if err != nil {
+		return c, err
+	}
+	c.CentralSessionPublicBaseURL = strings.TrimSpace(os.Getenv("CENTRAL_SESSION_PUBLIC_BASE_URL"))
 	if c.OIDCSessionIdleTTL, err = durationEnv("OIDC_SESSION_IDLE_TTL", 30*time.Minute); err != nil {
 		return c, err
 	}

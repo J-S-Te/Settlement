@@ -79,8 +79,16 @@ func settlementCatalogValuePresent(values []string, expected string) bool {
 	return found
 }
 
-// resolveAuthorization 调用基础平台授权上下文接口，验证令牌对应的应用、环境和权限。
-// 非 200 响应、响应体过大或字段不符合契约时均返回错误，不使用请求头权限信息兜底。
+// resolveAuthorization 从基础平台读取并校验当前应用的授权快照。
+//
+//	resolveAuthorization 调用基础平台授权上下文接口，验证令牌对应的应用、环境和权限。
+//	非 200 响应、响应体过大或字段不符合契约时均返回错误，不使用请求头权限信息兜底。
+//
+// 参数：ctx为调用上下文与取消边界。
+//
+//	token为待验证的服务器端令牌。
+//
+// 返回值：与该调用匹配的核验或持久化结果；失败保留原有错误语义。
 func (a *Authenticator) resolveAuthorization(ctx context.Context, token string) (authorizationContext, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.cfg.PlatformBaseURL, "/")+"/oauth2/authorization-context", nil)
 	if err != nil {
@@ -93,6 +101,9 @@ func (a *Authenticator) resolveAuthorization(ctx context.Context, token string) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return authorizationContext{}, ErrUnauthenticated
+		}
 		return authorizationContext{}, fmt.Errorf("authorization HTTP %d", resp.StatusCode)
 	}
 	var value authorizationContext

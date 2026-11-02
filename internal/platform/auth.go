@@ -20,12 +20,14 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/j-s-te/settlement/internal/config"
 	"github.com/j-s-te/settlement/internal/service"
+	central "github.com/j-s-te/settlement/internal/sessiongovernance"
 	"golang.org/x/oauth2"
 )
 
 var ErrUnauthenticated = errors.New("unauthenticated")
 
 type Authenticator struct {
+	central    central.Client
 	db         *sql.DB
 	cfg        config.Config
 	provider   *oidc.Provider
@@ -36,6 +38,13 @@ type Authenticator struct {
 	endSession string
 }
 
+// NewAuthenticator 装配令牌校验与中央生命周期依赖。
+// 参数：ctx为调用上下文与取消边界。
+//
+//	db为本应用数据库连接。
+//	cfg为已校验的运行配置。
+//
+// 返回值：装配后的应用或认证实例；配置与依赖装配失败时返回错误。
 func NewAuthenticator(ctx context.Context, db *sql.DB, cfg config.Config) (*Authenticator, error) {
 	block, err := aes.NewCipher(cfg.OIDCSessionKey)
 	if err != nil {
@@ -66,15 +75,34 @@ func NewAuthenticator(ctx context.Context, db *sql.DB, cfg config.Config) (*Auth
 		EndSession string `json:"end_session_endpoint"`
 	}
 	_ = provider.Claims(&discovery)
-	return &Authenticator{db: db, cfg: cfg, provider: provider, verifier: provider.Verifier(&oidc.Config{ClientID: cfg.OIDCClientID}), client: client, codec: codec, endSession: discovery.EndSession, oauth: oauth2.Config{ClientID: cfg.OIDCClientID, ClientSecret: cfg.OIDCClientSecret, RedirectURL: cfg.OIDCRedirectURI, Endpoint: provider.Endpoint(), Scopes: []string{"openid", "profile"}}}, nil
+	var centralClient central.Client
+	if cfg.CentralSessionEnabled {
+		public := cfg.CentralSessionPublicBaseURL
+		if public == "" {
+			target, err := url.Parse(cfg.OIDCRedirectURI)
+			if err != nil {
+				return nil, err
+			}
+			public = target.Scheme + "://" + target.Host
+		}
+		centralClient, err = central.NewHTTPClient(cfg.PlatformBaseURL, public, cfg.OIDCClientID, cfg.OIDCRedirectURI)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &Authenticator{central: centralClient, db: db, cfg: cfg, provider: provider, verifier: provider.Verifier(&oidc.Config{ClientID: cfg.OIDCClientID}), client: client, codec: codec, endSession: discovery.EndSession, oauth: oauth2.Config{ClientID: cfg.OIDCClientID, ClientSecret: cfg.OIDCClientSecret, RedirectURL: cfg.OIDCRedirectURI, Endpoint: provider.Endpoint(), Scopes: []string{"openid", "profile"}}}, nil
 }
 
 // Login 用途：创建UTC登录事务并跳转统一身份提供方，避免连接时区改变有效期。
 // 参数：w 为响应，r 为浏览器登录请求。
 // 返回值：无；数据库失败返回503，成功返回登录跳转。
 func (a *Authenticator) Login(w http.ResponseWriter, r *http.Request) {
-	state, _ := random(32)
-	nonce, _ := random(32)
+	state, stateErr := random(32)
+	nonce, nonceErr := random(32)
+	if stateErr != nil || nonceErr != nil {
+		http.Error(w, "cannot start login", 503)
+		return
+	}
 	verifier := oauth2.GenerateVerifier()
 	now := time.Now().UTC()
 	_, err := a.db.ExecContext(r.Context(), `
@@ -90,13 +118,32 @@ func (a *Authenticator) Login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "login service unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	http.Redirect(w, r, a.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
+	target := a.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier))
+	if a.central != nil {
+		http.SetCookie(w, a.stateCookie(state, 600))
+		target = a.central.BeginURL(state, nonce)
+	}
+	http.Redirect(w, r, target, http.StatusFound)
 }
 
 // Callback 用途：核验OIDC回调并按UTC保存独立会话和令牌有效期。
 // 参数：w 为响应，r 为携带一次性状态与授权码的回调。
 // 返回值：无；校验失败不建立会话，成功设置Cookie并返回业务入口。
 func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
+	if a.central != nil {
+		cookie, err := r.Cookie(a.cfg.OIDCSessionCookieName + "_oidc_state")
+		if err != nil || cookie.Value == "" || cookie.Value != r.URL.Query().Get("state") {
+			http.Error(w, "invalid browser state", 401)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		if ticket := r.URL.Query().Get("session_link_ticket"); ticket != "" {
+			a.attachSessionLink(w, r, cookie.Value, ticket)
+			return
+		}
+		http.SetCookie(w, a.stateCookie("", -1))
+	}
 	state, code := strings.TrimSpace(r.URL.Query().Get("state")), strings.TrimSpace(r.URL.Query().Get("code"))
 	if state == "" || code == "" {
 		http.Error(w, "invalid callback", http.StatusBadRequest)
@@ -155,6 +202,31 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "identity claims invalid", 401)
 		return
 	}
+	var binding central.Binding
+	if a.central != nil {
+		var ticketCipher []byte
+		if err = tx.QueryRowContext(ctx, "SELECT central_ticket_ciphertext FROM settlement_oidc_login_transaction WHERE state_hash=?", digest(state)).Scan(&ticketCipher); err != nil {
+			http.Error(w, "session storage unavailable", 503)
+			return
+		}
+		ticket, unwrapErr := a.decrypt(ticketCipher)
+		if unwrapErr != nil || len(ticket) == 0 || claims.SessionID == "" || token.RefreshToken == "" {
+			http.Error(w, "central proof missing", 401)
+			return
+		}
+		binding, err = a.central.Complete(ctx, string(ticket), token.AccessToken, raw)
+		if err == nil {
+			err = central.Validate(binding.Context, a.centralExpectation(), claims.IdentityID)
+		}
+		if err != nil {
+			status := 503
+			if errors.Is(err, central.ErrInactive) || errors.Is(err, central.ErrBindingConflict) {
+				status = 401
+			}
+			http.Error(w, "central session unavailable", status)
+			return
+		}
+	}
 
 	if strings.TrimSpace(claims.PreferredUsername) == "" {
 		info, profileErr := a.provider.UserInfo(ctx, oauth2.StaticTokenSource(token))
@@ -189,6 +261,9 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 	if token.Expiry.Before(expires) {
 		expires = token.Expiry
 	}
+	if a.central != nil {
+		expires = binding.Context.AbsoluteExpiresAt
+	}
 	_, err = tx.ExecContext(r.Context(), `
  INSERT INTO settlement_oidc_session(
   session_id_hash,tenant_id,identity_id,principal_json,oauth_token_ciphertext,
@@ -203,6 +278,14 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "create session failed", 503)
 		return
 	}
+	if a.central != nil {
+		_, err = tx.ExecContext(r.Context(), `UPDATE settlement_oidc_session SET central_binding_ciphertext=?,central_session_id=?,oidc_subject=?,oidc_sid=? WHERE session_id_hash=? AND tenant_id=?`,
+			a.encrypt([]byte(binding.Token)), binding.Context.SessionID, claims.Subject, claims.SessionID, digest(rawSession), a.cfg.OIDCTenantID)
+		if err != nil {
+			http.Error(w, "central session storage failed", 503)
+			return
+		}
+	}
 	if err = tx.Commit(); err != nil {
 		http.Error(w, "create session failed", 503)
 		return
@@ -215,6 +298,9 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 // 参数：ctx 为请求上下文，r 为携带不透明会话Cookie的请求。
 // 返回值：返回可信业务主体；失效或校验失败返回认证错误。
 func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (service.Principal, error) {
+	if a.central != nil {
+		return a.authenticateCentral(ctx, r)
+	}
 	cookie, err := r.Cookie(a.cfg.OIDCSessionCookieName)
 	if err != nil || cookie.Value == "" {
 		return service.Principal{}, ErrUnauthenticated

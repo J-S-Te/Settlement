@@ -9,7 +9,7 @@ import (
 // 参数：t 测试上下文。
 // 返回值：无。
 func TestRedFlushReversalUniqueMigrationIsAdditiveAndFailClosed(t *testing.T) {
-	body, err := Files.ReadFile("000022_red_flush_allocation_reversal_unique.sql")
+	body, err := Files.ReadFile("000023_red_flush_allocation_reversal_unique.sql")
 	if err != nil {
 		t.Fatalf("new red flush reversal migration is missing: %v", err)
 	}

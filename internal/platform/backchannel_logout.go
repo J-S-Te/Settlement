@@ -13,13 +13,14 @@ import (
 const backchannelLogoutEvent = "http://schemas.openid.net/event/backchannel-logout"
 
 type backchannelLogoutClaims struct {
-	Subject  string                     `json:"sub"`
-	JTI      string                     `json:"jti"`
-	Issued   int64                      `json:"iat"`
-	Expires  int64                      `json:"exp"`
-	Nonce    string                     `json:"nonce"`
-	Audience interface{}                `json:"aud"`
-	Events   map[string]json.RawMessage `json:"events"`
+	SessionID string                     `json:"sid"`
+	Subject   string                     `json:"sub"`
+	JTI       string                     `json:"jti"`
+	Issued    int64                      `json:"iat"`
+	Expires   int64                      `json:"exp"`
+	Nonce     string                     `json:"nonce"`
+	Audience  interface{}                `json:"aud"`
+	Events    map[string]json.RawMessage `json:"events"`
 }
 
 // BackchannelLogout 接收并验证标准 OIDC logout_token，在同一事务中完成重放保护和会话撤销。
@@ -56,6 +57,13 @@ func (a *Authenticator) BackchannelLogout(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusOK)
 }
 
+// processBackchannelLogout 验证后台注销消息并撤销匹配的本地会话。
+// 参数：ctx为调用上下文与取消边界。
+//
+//	claims为已经完成签名及用途校验的声明。
+//	now为本次服务端校验时间。
+//
+// 返回值：与该调用匹配的核验或持久化结果；失败保留原有错误语义。
 func (a *Authenticator) processBackchannelLogout(ctx context.Context, claims backchannelLogoutClaims, now time.Time) (bool, error) {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -69,7 +77,16 @@ func (a *Authenticator) processBackchannelLogout(ctx context.Context, claims bac
 		}
 		return false, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE settlement_oidc_session SET revoked_at=? WHERE tenant_id=? AND revoked_at IS NULL AND JSON_UNQUOTE(JSON_EXTRACT(principal_json,'$.user_id'))=?`, now, a.cfg.OIDCTenantID, claims.Subject); err != nil {
+	if a.central != nil {
+		if claims.SessionID != "" {
+			_, err = tx.ExecContext(ctx, `UPDATE settlement_oidc_session SET revoked_at=? WHERE tenant_id=? AND oidc_sid=? AND revoked_at IS NULL`, now, a.cfg.OIDCTenantID, claims.SessionID)
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE settlement_oidc_session SET revoked_at=? WHERE tenant_id=? AND oidc_subject=? AND revoked_at IS NULL`, now, a.cfg.OIDCTenantID, claims.Subject)
+		}
+	} else {
+		_, err = tx.ExecContext(ctx, `UPDATE settlement_oidc_session SET revoked_at=? WHERE tenant_id=? AND revoked_at IS NULL AND JSON_UNQUOTE(JSON_EXTRACT(principal_json,'$.user_id'))=?`, now, a.cfg.OIDCTenantID, claims.Subject)
+	}
+	if err != nil {
 		return false, err
 	}
 	if err = tx.Commit(); err != nil {

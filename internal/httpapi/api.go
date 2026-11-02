@@ -237,6 +237,20 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/auth/me" || r.URL.Path == "/api/v1/auth/me":
 		a.me(w, r)
 		return
+	case r.URL.Path == "/auth/session" && r.Method == http.MethodGet:
+		if a.auth == nil {
+			fail(w, 503, "SETTLEMENT_OIDC_UNCONFIGURED", "身份服务尚未配置")
+		} else {
+			a.auth.SessionState(w, r)
+		}
+		return
+	case r.URL.Path == "/auth/activity" && r.Method == http.MethodPost:
+		if a.auth == nil {
+			fail(w, 503, "SETTLEMENT_OIDC_UNCONFIGURED", "身份服务尚未配置")
+		} else {
+			a.auth.Activity(w, r)
+		}
+		return
 	case r.URL.Path == "/logged-out":
 		write(w, http.StatusOK, map[string]string{"status": "logged_out"})
 		return
