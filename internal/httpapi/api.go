@@ -892,6 +892,10 @@ func (a *API) createInvoicedReceivablesExport(w http.ResponseWriter, r *http.Req
 func (a *API) createAgingReceivablesExport(w http.ResponseWriter, r *http.Request) {
 	a.createReportExport(w, r, "AGING_RECEIVABLES_CSV")
 }
+
+// createReportExport 创建带申请人授权范围快照的幂等报表导出任务。
+// 参数：w 为响应输出，r 为已鉴权请求，reportType 为服务端指定的报表类型。
+// 返回值：无；任务状态或业务错误写入 HTTP 响应。
 func (a *API) createReportExport(w http.ResponseWriter, r *http.Request, reportType string) {
 	p, ok := a.user(w, r, "settlement.report.export")
 	if !ok {
@@ -909,8 +913,15 @@ func (a *API) createReportExport(w http.ResponseWriter, r *http.Request, reportT
 		return
 	}
 	if errors.Is(err, sql.ErrNoRows) {
+		// M-5：把申请人创建任务时的授权范围固化到任务行，worker 只认这份快照，
+		// 防止缺失快照的旧任务或受限范围任务按租户全量生成。
+		requesterScope, scopeErr := service.NewRequesterScope(p).Encode()
+		if scopeErr != nil {
+			respondError(w, scopeErr)
+			return
+		}
 		id = newRequestID()
-		_, err = a.service.DB.ExecContext(r.Context(), `INSERT INTO settlement_report_export_job(id,tenant_id,requested_by,report_type,idempotency_key,status,created_at,updated_at) VALUES(?,?,?,?,?,'PENDING',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, p.UserID, reportType, key)
+		_, err = a.service.DB.ExecContext(r.Context(), `INSERT INTO settlement_report_export_job(id,tenant_id,requested_by,requester_scope,report_type,idempotency_key,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'PENDING',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, p.UserID, requesterScope, reportType, key)
 	}
 	if err != nil {
 		respondError(w, err)
@@ -2234,7 +2245,10 @@ func (a *API) user(w http.ResponseWriter, r *http.Request, permission string) (s
 		return p, false
 	}
 	switch permission {
-	case "settlement.receipt.record", "settlement.receipt.read", "settlement.allocation.read", "settlement.allocation.confirm", "settlement.allocation.reverse", "settlement.invoice.approve", "settlement.invoice.issue", "settlement.invoice.special_approve", "settlement.settings.manage", "settlement.collaboration.manage":
+	// M-5：报表读取与导出按整个租户聚合/落盘，无法用合同责任谓词裁剪
+	// （报表角色不在 ContractPredicate 的按责任角色目录内，硬套谓词会把报表整片清空）。
+	// 因此与回款、核销、开票等财务操作同等要求全范围授权，限制性范围角色直接 403。
+	case "settlement.receipt.record", "settlement.receipt.read", "settlement.allocation.read", "settlement.allocation.confirm", "settlement.allocation.reverse", "settlement.invoice.approve", "settlement.invoice.issue", "settlement.invoice.special_approve", "settlement.settings.manage", "settlement.collaboration.manage", "settlement.report.read", "settlement.report.export":
 		if !p.Unrestricted(permission) {
 			fail(w, http.StatusForbidden, "SETTLEMENT_FORBIDDEN", "当前角色的数据范围不允许执行此财务操作")
 			return p, false

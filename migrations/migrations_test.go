@@ -94,3 +94,32 @@ func TestContractRevisionHoldMigrationIsIdempotentAndAuditable(t *testing.T) {
 		t.Fatal("contract revision migration must not use floating point columns")
 	}
 }
+
+// TestReportExportRequesterScopeMigrationFailsClosed 验证报表任务的范围快照迁移。
+// 参数：t 为测试上下文，核对 JSON NULL 列、不回填及历史任务失败关闭。
+// 返回值：无；列定义、位置或回填语义不符时失败。
+func TestReportExportRequesterScopeMigrationFailsClosed(t *testing.T) {
+	const name = "000026_report_export_requester_scope.sql"
+	if !strings.HasPrefix(name, "000026") {
+		t.Fatal("M-5 迁移必须接在现有最大编号 000025 之后")
+	}
+	body, err := Files.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, required := range []string{
+		"ALTER TABLE settlement_report_export_job",
+		"ADD COLUMN requester_scope JSON NULL AFTER requested_by",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("report export requester scope migration missing %s", required)
+		}
+	}
+	if strings.Contains(text, "UPDATE settlement_report_export_job") || strings.Contains(text, "DEFAULT") {
+		t.Fatal("requester scope migration must not backfill historical export jobs")
+	}
+	if strings.Contains(text, "FLOAT") || strings.Contains(text, "DOUBLE") {
+		t.Fatal("report export requester scope migration must not use floating point columns")
+	}
+}

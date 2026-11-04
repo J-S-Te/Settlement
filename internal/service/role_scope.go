@@ -1,10 +1,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 
 	"github.com/j-s-te/settlement/authz"
@@ -61,6 +63,73 @@ func (p Principal) Unrestricted(permission string) bool {
 		}
 	}
 	return false
+}
+
+// RequesterScope 用途：固化报表导出申请人创建任务时的授权范围快照，
+// 使异步任务重试时仍可核验创建时的授权；不代替执行时在线权限重查。
+// 参数：无；只能由 NewRequesterScope 从可信主体生成，或由数据库 JSON 回构。
+// 返回值：仅含判定范围必需的授权字段；不保存身份证明细、显示名、用户名和登录IP。
+type RequesterScope struct {
+	UserID         string      `json:"user_id"`
+	Roles          []string    `json:"roles"`
+	Permissions    []string    `json:"permissions"`
+	DataScopes     []DataScope `json:"data_scopes"`
+	CatalogVersion string      `json:"catalog_version"`
+}
+
+// NewRequesterScope 用途：从可信在线主体生成可持久化的导出申请人范围快照。
+// 参数：p 为已通过入口鉴权的主体。
+// 返回值：角色和权限按字典序稳定排列的授权快照，避免同一主体两次快照产生无意义差异。
+func NewRequesterScope(p Principal) RequesterScope {
+	scope := RequesterScope{UserID: p.UserID, CatalogVersion: p.CatalogVersion}
+	scope.Roles = append(scope.Roles, p.Roles...)
+	sort.Strings(scope.Roles)
+	for permission, allowed := range p.Permissions {
+		if allowed {
+			scope.Permissions = append(scope.Permissions, permission)
+		}
+	}
+	sort.Strings(scope.Permissions)
+	scope.DataScopes = append(scope.DataScopes, p.DataScopes...)
+	return scope
+}
+
+// Encode 用途：把范围快照编码为导出任务表 requester_scope 列的值。
+// 参数：无。
+// 返回值：JSON 字节；编码失败时返回错误，调用方不得创建无快照的任务。
+func (s RequesterScope) Encode() ([]byte, error) {
+	return json.Marshal(s)
+}
+
+// DecodeRequesterScope 用途：解码数据库中保存的导出申请人范围快照。
+// 参数：raw 为 requester_scope 列原始值，历史任务可能为 NULL。
+// 返回值：快照；空值或非法 JSON 返回错误，调用方必须失败关闭而不是按全租户生成。
+func DecodeRequesterScope(raw []byte) (RequesterScope, error) {
+	var scope RequesterScope
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return scope, errors.New("requester scope snapshot is missing")
+	}
+	if err := json.Unmarshal(raw, &scope); err != nil {
+		return RequesterScope{}, err
+	}
+	return scope, nil
+}
+
+// Principal 用途：由范围快照回构仅用于范围判定的主体。
+// 参数：无。
+// 返回值：不含租户、身份证明细与IP的主体；切片为副本，修改结果不回写快照。
+func (s RequesterScope) Principal() Principal {
+	permissions := make(map[string]bool, len(s.Permissions))
+	for _, permission := range s.Permissions {
+		permissions[permission] = true
+	}
+	return Principal{
+		UserID:         s.UserID,
+		Roles:          append([]string(nil), s.Roles...),
+		Permissions:    permissions,
+		DataScopes:     append([]DataScope(nil), s.DataScopes...),
+		CatalogVersion: s.CatalogVersion,
+	}
 }
 
 // ContractPredicate 用途：生成指定能力的合同访问谓词，在排序分页前执行。
