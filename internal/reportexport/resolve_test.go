@@ -66,6 +66,9 @@ func TestCompensationRetiresTerminalAndPendingUploadStatesWithoutReupload(t *tes
 	}
 }
 
+// TestGenerateCommitsSentBoundaryBeforeUpload 验证上传前先持久化发送边界。
+// 参数：t 为测试上下文。
+// 返回值：无；实际行为偏离断言时用例失败。
 func TestGenerateCommitsSentBoundaryBeforeUpload(t *testing.T) {
 	prepared, intent := false, false
 	d := &exportDB{exec: func(q string, _ []driver.NamedValue) (driver.Result, error) {
@@ -88,7 +91,7 @@ func TestGenerateCommitsSentBoundaryBeforeUpload(t *testing.T) {
 		}
 	}}
 	w := &Worker{DB: db, TenantID: "tenant", WorkerID: "worker", Gateway: g, GatewayMode: "required", GatewayApplicationID: "settlement"}
-	if err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", generation: 7}); err != nil {
+	if err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", generation: 7, requestedBy: "user", requesterScope: unrestrictedRequesterScope(t, "user")}); err != nil {
 		t.Fatal(err)
 	}
 	if !prepared || !intent || g.uploads != 1 {

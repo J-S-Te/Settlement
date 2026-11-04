@@ -16,8 +16,9 @@ import (
 	"github.com/j-s-te/settlement/migrations"
 )
 
-// 仅允许显式配置的隔离测试服务器。创建密码学随机命名的全新
-// 数据库，并由本轮运行独占所有。
+// exportMySQL 为显式配置的隔离测试服务器创建本轮独占数据库。
+// 参数：t 为测试上下文，仅从 SETTLEMENT_TEST_DSN 获取隔离测试连接。
+// 返回值：本轮独占数据库连接；未配置时跳过，非法配置或建库失败时终止测试。
 func exportMySQL(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("SETTLEMENT_TEST_DSN"))
@@ -61,7 +62,7 @@ func exportMySQL(t *testing.T) *sql.DB {
 		t.Fatal("open owned export test database failed")
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	for _, file := range []string{"000005_report_exports.sql", "000007_file_gateway_report_exports.sql", "000014_report_export_effects.sql"} {
+	for _, file := range []string{"000005_report_exports.sql", "000007_file_gateway_report_exports.sql", "000014_report_export_effects.sql", "000026_report_export_requester_scope.sql"} {
 		body, err := migrations.Files.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)

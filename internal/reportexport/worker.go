@@ -40,6 +40,8 @@ type FileGateway interface {
 }
 
 // NormalizeGatewayMode 规范化文件网关模式；空值和未知值均回退到 legacy。
+// 参数：value 为配置中的网关模式。
+// 返回值：合法模式，空值或未知值回退 legacy。
 func NormalizeGatewayMode(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "dual", "required":
@@ -52,6 +54,10 @@ func NormalizeGatewayMode(value string) string {
 type job struct {
 	id, tenantID, reportType string
 	generation               uint64
+	// requestedBy 与 requesterScope 是任务行上的申请人及其创建任务时的授权范围快照。
+	// requesterScope 为 requester_scope JSON 列的原始值，历史任务为 nil（失败关闭）。
+	requestedBy    string
+	requesterScope []byte
 }
 
 // RunOnce 在生成文件前为待处理任务取得租约，防止多个工作器
