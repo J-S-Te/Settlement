@@ -106,7 +106,8 @@ type Config struct {
 }
 
 // AuditDestinationRequired 解析审计目的地是否必开（BIZ-XAPI-10）。
-// 参数：explicit 为显式 SETTLEMENT_AUDIT_REQUIRED，appEnv 为 APP_ENV，
+// 参数：explicit 为显式审计开关（生产调用点经 AuditRequiredSwitch 读取，兼容
+// SETTLEMENT_AUDIT_REQUIRED 与平台统一键 PLATFORM_AUDIT_REQUIRED），appEnv 为 APP_ENV，
 // environmentCode 为 PLATFORM_ENVIRONMENT_CODE。
 // 返回值：生效判定；显式值非法时返回错误（失败关闭，不静默降级）。
 // 判定顺序与平台 platformAuditRequired 同构：显式开关 > APP_ENV=production；
@@ -115,7 +116,8 @@ func AuditDestinationRequired(explicit, appEnv, environmentCode string) (bool, e
 	if raw := strings.TrimSpace(explicit); raw != "" {
 		required, err := strconv.ParseBool(raw)
 		if err != nil {
-			return false, fmt.Errorf("SETTLEMENT_AUDIT_REQUIRED: %w", err)
+			// 非法值可能来自子系统键或平台统一键，两个键名都列出，避免调用点误导排障。
+			return false, fmt.Errorf("SETTLEMENT_AUDIT_REQUIRED/PLATFORM_AUDIT_REQUIRED: %w", err)
 		}
 		return required, nil
 	}
@@ -123,6 +125,16 @@ func AuditDestinationRequired(explicit, appEnv, environmentCode string) (bool, e
 		return strings.EqualFold(env, "production"), nil
 	}
 	return isProductionEnvironmentCode(environmentCode), nil
+}
+
+// AuditRequiredSwitch 返回审计必开的显式开关值：SETTLEMENT_AUDIT_REQUIRED 优先，
+// 缺失时兼容平台统一键 PLATFORM_AUDIT_REQUIRED（生产 descriptor 统一声明该键）。
+// 返回原始字符串，由 AuditDestinationRequired 负责解析与失败关闭。
+func AuditRequiredSwitch() string {
+	if raw := strings.TrimSpace(os.Getenv("SETTLEMENT_AUDIT_REQUIRED")); raw != "" {
+		return raw
+	}
+	return strings.TrimSpace(os.Getenv("PLATFORM_AUDIT_REQUIRED"))
 }
 
 // isProductionEnvironmentCode 按平台环境编码判断生产：兼容 prod 与 production。
@@ -202,7 +214,7 @@ func Load() (Config, error) {
 	// 目的地的凭据完整性只做布尔登记，供 /readyz 与 /metrics 暴露，不在此处退出
 	// 进程（API 需要保持可探测；worker 负责生产 fail-closed）。
 	auditDestinationRequired, auditRequiredErr := AuditDestinationRequired(
-		os.Getenv("SETTLEMENT_AUDIT_REQUIRED"),
+		AuditRequiredSwitch(),
 		os.Getenv("APP_ENV"),
 		c.OIDCEnvironmentCode,
 	)
