@@ -60,8 +60,11 @@ func TestPublishOAuthRemainsCompatibleWithNilOrValidGate(t *testing.T) {
 					fmt.Fprint(w, `{"access_token":"credit-test-token","token_type":"Bearer","expires_in":300}`)
 					return
 				}
-				if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer credit-test-token" || r.Header.Get("X-Tenant-ID") != "tenant" || r.Header.Get("X-Integration-Nonce") == "" {
+				if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer credit-test-token" || r.Header.Get("X-Integration-Nonce") == "" {
 					t.Error("business request lost OAuth or integration metadata")
+				}
+				if got := r.Header.Get("X-Tenant-ID"); got != "" {
+					t.Errorf("business request must not carry X-Tenant-ID, got %q", got)
 				}
 				posts.Add(1)
 				w.WriteHeader(http.StatusNoContent)

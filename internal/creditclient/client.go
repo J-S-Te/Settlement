@@ -126,7 +126,9 @@ func (c *Client) Publish(ctx context.Context, tenant, eventID string, payload []
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Request-ID", eventID)
-	req.Header.Set("X-Tenant-ID", tenant)
+	// tenant 仅用于日志与调用方语义，不出站传递：接收方的租户一律从已验签的机器令牌推导，
+	// 请求头中的租户标识不会被任何接收方读取，携带反而会诱导信任未验签输入。
+	_ = tenant
 	// CRM 的机器入口要求时间戳 + 一次性 nonce；只带 Bearer 令牌会在验签后被拒绝。
 	req.Header.Set("X-Integration-Timestamp", time.Now().UTC().Format(time.RFC3339Nano))
 	req.Header.Set("X-Integration-Nonce", base64.RawURLEncoding.EncodeToString(nonce))
