@@ -66,7 +66,8 @@ func (p Principal) Unrestricted(permission string) bool {
 }
 
 // RequesterScope 用途：固化报表导出申请人创建任务时的授权范围快照，
-// 使异步任务在被他人接管、缩权后重试时仍按创建时的范围判定，而不是按租户全量生成。
+// 使异步任务在被他人接管、缩权后重试时仍按创建时的范围判定，而不是按租户全量生成；
+// 不代替执行时在线权限重查。
 // 参数：无；只能由 NewRequesterScope 从可信主体生成，或由数据库 JSON 回构。
 // 返回值：仅含判定范围必需的授权字段；不保存身份证明细、显示名、用户名和登录IP。
 type RequesterScope struct {

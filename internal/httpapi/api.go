@@ -903,6 +903,10 @@ func (a *API) createInvoicedReceivablesExport(w http.ResponseWriter, r *http.Req
 func (a *API) createAgingReceivablesExport(w http.ResponseWriter, r *http.Request) {
 	a.createReportExport(w, r, "AGING_RECEIVABLES_CSV")
 }
+
+// createReportExport 创建带申请人授权范围快照的幂等报表导出任务。
+// 参数：w 为响应输出，r 为已鉴权请求，reportType 为服务端指定的报表类型。
+// 返回值：无；任务状态或业务错误写入 HTTP 响应。
 func (a *API) createReportExport(w http.ResponseWriter, r *http.Request, reportType string) {
 	p, ok := a.user(w, r, "settlement.report.export")
 	if !ok {
@@ -921,7 +925,7 @@ func (a *API) createReportExport(w http.ResponseWriter, r *http.Request, reportT
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		// M-5：把申请人创建任务时的授权范围固化到任务行，worker 只认这份快照，
-		// 防止旧任务、在飞任务或申请人后续被缩权后仍按租户全量生成。
+		// 防止缺失快照的旧任务、在飞任务、受限范围任务或申请人后续被缩权后仍按租户全量生成。
 		requesterScope, scopeErr := service.NewRequesterScope(p).Encode()
 		if scopeErr != nil {
 			respondError(w, scopeErr)

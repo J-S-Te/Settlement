@@ -46,6 +46,9 @@ func (w *Worker) leaseDuration() time.Duration {
 	return w.LeaseDuration
 }
 
+// claim 以租约栅栏认领当前租户的一项报表导出任务。
+// 参数：ctx 为认领上下文。
+// 返回值：含申请人快照的任务；无候选返回 sql.ErrNoRows，事务失败返回错误。
 func (w *Worker) claim(ctx context.Context) (job, error) {
 	if err := w.checkTenant(w.TenantID); err != nil {
 		return job{}, err
@@ -146,6 +149,9 @@ func (w *Worker) heartbeat(ctx context.Context, item job, cancel context.CancelF
 	return func() { cancel(); close(stop); <-done }
 }
 
+// generate 核验申请人范围快照并在有效租约内生成发布报表。
+// 参数：parent 为任务上下文，item 为已认领任务及其租约代次。
+// 返回值：生成、网关、授权快照或租约失败时返回错误。
 func (w *Worker) generate(parent context.Context, item job) error {
 	if err := w.checkTenant(item.tenantID); err != nil {
 		return err
@@ -244,6 +250,9 @@ func (w *Worker) generate(parent context.Context, item job) error {
 	return err
 }
 
+// fail 在有效租约内将报表任务记录为失败。
+// 参数：ctx 为上下文，item 为任务，stage 为失败阶段，cause 为内部原因。
+// 返回值：状态写入错误或带阶段信息的原始原因。
 func (w *Worker) fail(ctx context.Context, item job, stage string, cause error) error {
 	return w.failWithMessage(ctx, item, stage, "报表生成失败，请重新发起导出", cause)
 }

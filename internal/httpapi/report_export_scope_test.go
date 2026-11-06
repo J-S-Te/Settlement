@@ -29,7 +29,7 @@ func reportScopeGrant(scopeType string) revisionHoldPrincipal {
 }
 
 // TestReportEndpointsRejectRestrictedDataScope 验证 M-5：数据范围受限的主体即使持有
-// 报表读取/导出权限，也被 6 个报表入口统一 403，且拒绝发生在任何业务查询之前。
+// 报表读取/导出权限，也被 7 个报表入口统一 403，且拒绝发生在任何业务查询之前。
 // 参数：t 为测试上下文。
 // 返回值：无；任一入口非 403、错误码不符或触达业务SQL时失败。
 func TestReportEndpointsRejectRestrictedDataScope(t *testing.T) {

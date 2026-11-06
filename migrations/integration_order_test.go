@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// TestMergedMigrationOrderPreservesPublishedHistory 验证新迁移在中央会话之后连续且无新增编号碰撞。
+// TestMergedMigrationOrderPreservesPublishedHistory 验证迁移顺序连续且无新增编号冲突。
 // 参数：t为测试上下文，历史两份000005按已发布完整文件名保留。
 // 返回值：无；历史顺序改变、新编号重复、跳号或上传顺序错误时失败。
 func TestMergedMigrationOrderPreservesPublishedHistory(t *testing.T) {

@@ -40,6 +40,8 @@ type FileGateway interface {
 }
 
 // NormalizeGatewayMode 规范化文件网关模式；空值和未知值均回退到 legacy。
+// 参数：value 为配置中的网关模式。
+// 返回值：合法模式，空值或未知值回退 legacy。
 func NormalizeGatewayMode(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "dual", "required":

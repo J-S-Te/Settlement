@@ -48,7 +48,7 @@ func restrictedRequesterScope(t *testing.T, userID string) []byte {
 	return scope
 }
 
-// failingExec 返回记录 FAILED 更新绑定参数的断言辅助：返回 error_message 与任务ID。
+// failedMessages 返回记录 FAILED 更新绑定参数的断言辅助：返回 error_message 与任务ID。
 // 参数：t 为测试上下文，d 为脚本驱动。
 // 返回值：error_message 与任务ID 列表；FAILED 更新必须使用租约栅栏条件。
 func failedMessages(t *testing.T, d *exportDB) ([]string, []string) {

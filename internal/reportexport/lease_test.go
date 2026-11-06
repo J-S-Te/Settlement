@@ -102,6 +102,10 @@ func (g *recordingGateway) Release(_ context.Context, _ string, fileID string, _
 	return g.releaseErr
 }
 
+// TestCompensationOfOldGenerationCannotReleaseNewGenerationFile 验证旧代次补偿不会释放新代次文件
+// 。
+// 参数：t 为测试上下文。
+// 返回值：无；实际行为偏离断言时用例失败。
 func TestCompensationOfOldGenerationCannotReleaseNewGenerationFile(t *testing.T) {
 	d := &exportDB{query: func(q string, _ []driver.NamedValue) (driver.Rows, error) {
 		if strings.Contains(q, "SELECT status,lease_generation") {
@@ -136,6 +140,9 @@ func TestCompensationOfOldGenerationCannotReleaseNewGenerationFile(t *testing.T)
 	}
 }
 
+// TestExpiredLeaseDoesNotUploadOrBind 验证过期租约不能上传或绑定文件。
+// 参数：t 为测试上下文。
+// 返回值：无；实际行为偏离断言时用例失败。
 func TestExpiredLeaseDoesNotUploadOrBind(t *testing.T) {
 	d := &exportDB{exec: func(string, []driver.NamedValue) (driver.Result, error) { return driver.RowsAffected(0), nil }}
 	db := sql.OpenDB(d)
@@ -214,6 +221,9 @@ func (r *exportRows) Next(dst []driver.Value) error {
 	return nil
 }
 
+// TestGenerateFilenameIsStableForIdenticalRetry 验证相同重试使用稳定文件名。
+// 参数：t 为测试上下文。
+// 返回值：无；实际行为偏离断言时用例失败。
 func TestGenerateFilenameIsStableForIdenticalRetry(t *testing.T) {
 	d := &exportDB{}
 	db := sql.OpenDB(d)
@@ -231,6 +241,9 @@ func TestGenerateFilenameIsStableForIdenticalRetry(t *testing.T) {
 	}
 }
 
+// TestZeroRowPublicationLeavesRecoverableIntent 验证发布零行更新保留可恢复意图。
+// 参数：t 为测试上下文。
+// 返回值：无；实际行为偏离断言时用例失败。
 func TestZeroRowPublicationLeavesRecoverableIntent(t *testing.T) {
 	d := &exportDB{exec: func(q string, _ []driver.NamedValue) (driver.Result, error) {
 		if strings.Contains(q, "SET status='READY'") {
@@ -321,6 +334,9 @@ func TestReconciliationRecoversUnknownUploadAndPersistsFailedReleaseForRetry(t *
 	}
 }
 
+// TestCompensationFailureDoesNotStarveNewExports 验证补偿失败不阻塞新的导出任务。
+// 参数：t 为测试上下文。
+// 返回值：无；实际行为偏离断言时用例失败。
 func TestCompensationFailureDoesNotStarveNewExports(t *testing.T) {
 	claims := 0
 	d := &exportDB{query: func(q string, _ []driver.NamedValue) (driver.Rows, error) {
@@ -353,6 +369,9 @@ func TestCompensationFailureDoesNotStarveNewExports(t *testing.T) {
 	}
 }
 
+// TestLeaseLostAfterUploadDoesNotBindOrPublish 验证上传后丢失租约不继续绑定发布。
+// 参数：t 为测试上下文。
+// 返回值：无；实际行为偏离断言时用例失败。
 func TestLeaseLostAfterUploadDoesNotBindOrPublish(t *testing.T) {
 	renewals := 0
 	d := &exportDB{exec: func(q string, _ []driver.NamedValue) (driver.Result, error) {
@@ -379,6 +398,9 @@ func TestLeaseLostAfterUploadDoesNotBindOrPublish(t *testing.T) {
 	}
 }
 
+// TestGatewayFailureRetainsIntentAndRequiredOrDualBehavior 验证网关失败保留意图并遵循网关模式。
+// 参数：t 为测试上下文。
+// 返回值：无；实际行为偏离断言时用例失败。
 func TestGatewayFailureRetainsIntentAndRequiredOrDualBehavior(t *testing.T) {
 	for _, mode := range []string{"required", "dual"} {
 		t.Run(mode, func(t *testing.T) {

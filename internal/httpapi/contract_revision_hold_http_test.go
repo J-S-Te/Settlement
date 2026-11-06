@@ -40,7 +40,7 @@ type revisionHoldPrincipal struct {
 
 // revisionHoldAuthHandler 构造绑定真实 OIDC 发现与授权上下文接口的结算入口。
 // 参数：t 为测试上下文，db 为脚本数据库，grant 为平台返回的在线授权。
-// 返回值：handler 与携带会话的 Cookie；会话查询的脚本步骤由调用方先准备好。
+// 返回值：HTTP handler；会话查询的脚本步骤及 Cookie 由调用方准备。
 func revisionHoldAuthHandler(t *testing.T, db *sql.DB, grant revisionHoldPrincipal) http.Handler {
 	t.Helper()
 	key := bytes.Repeat([]byte{7}, 32)
