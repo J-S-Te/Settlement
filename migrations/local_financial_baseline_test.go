@@ -9,7 +9,7 @@ import (
 // 参数：t为测试上下文，只读取内嵌SQL，不连接数据库。
 // 返回值：无；本地依据、可空合同身份或租户约束缺失时失败。
 func TestLocalFinancialBaselineMigrationKeepsSourceIdentity(t *testing.T) {
-	body, err := Files.ReadFile("000026_local_financial_baseline.sql")
+	body, err := Files.ReadFile("000027_local_financial_baseline.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

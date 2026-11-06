@@ -101,9 +101,9 @@ func TestContractRevisionHoldMigrationIsIdempotentAndAuditable(t *testing.T) {
 // 参数：t 为测试上下文。
 // 返回值：无；列定义、位置或回填语义不符时失败。
 func TestReportExportRequesterScopeMigrationFailsClosed(t *testing.T) {
-	const name = "000027_report_export_requester_scope.sql"
-	if !strings.HasPrefix(name, "000027") {
-		t.Fatal("M-5 迁移须保留已发布025及新增026，顺延为000027")
+	const name = "000026_report_export_requester_scope.sql"
+	if !strings.HasPrefix(name, "000026") {
+		t.Fatal("M-5 迁移为已发布 026（mainline），本地 baseline 顺延为 027")
 	}
 	body, err := Files.ReadFile(name)
 	if err != nil {
