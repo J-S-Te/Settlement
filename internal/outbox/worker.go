@@ -19,6 +19,20 @@ import (
 var ErrLeaseLost = errors.New("outbox lease lost")
 var ErrLicensePaused = errors.New("commercial license paused business delivery")
 
+// drainBatchTimeout 是停止信号到达后为“已在途批次”预留的收尾预算：
+// 领取后的读取、投递回执校验与状态落库必须在该预算内完成，避免停机打断落库
+// 后把已投递事件留成 PROCESSING 等待租约过期（worker.go 领取租约 30s）。
+const drainBatchTimeout = 5 * time.Second
+
+// eventStore 是 Worker 依赖的最小出站存储契约。
+// 生产装配始终是 *Store；单独抽出接口只为让排空语义测试注入可断言的实现。
+type eventStore interface {
+	Acquire(ctx context.Context, destination string, limit int) ([]Event, error)
+	Delivered(ctx context.Context, events []Event) error
+	Failed(ctx context.Context, events []Event, code, summary string, permanent bool) error
+	filterImportNotifications(ctx context.Context, events []Event) ([]Event, error)
+}
+
 type Event struct {
 	ID, TenantID, EventID, Destination, EventType, AggregateType, AggregateID string
 	Payload                                                                   json.RawMessage
@@ -196,7 +210,21 @@ type Worker struct {
 	lastBacklogWarning  time.Time
 	mu                  sync.Mutex
 	tokens              map[string]cachedToken
+	// testStore 仅用于测试注入存储实现；为 nil 时走生产 Store 字段。
+	testStore eventStore
 }
+
+// eventStoreHandle 返回本次投递使用的存储实现；生产路径始终是 Worker.Store。
+func (w *Worker) eventStoreHandle() eventStore {
+	if w.testStore != nil {
+		return w.testStore
+	}
+	if w.Store == nil {
+		return nil
+	}
+	return w.Store
+}
+
 type cachedToken struct {
 	Value   string
 	Expires time.Time
@@ -259,44 +287,76 @@ func (w *Worker) refreshBacklog(ctx context.Context) error {
 // RunOnce 认领并投递事件，在发送前执行许可和历史财务放行门禁。
 // 参数：ctx为工作器上下文。
 // 返回值：存储或投递状态记录错误；已阻止的旧提醒不发送。
+// 排空契约：ctx 取消后不再领取新批次，已在途批次改用脱离取消的独立预算上下文
+// 完成投递与落库（日志标记 "draining outbox batch"），避免停机打断状态写回。
 func (w *Worker) RunOnce(ctx context.Context) error {
+	store := w.eventStoreHandle()
+	if store == nil {
+		return nil
+	}
 	for _, destination := range w.Destinations {
+		if ctx.Err() != nil {
+			slog.Info("settlement outbox drain: stop acquiring new batches after shutdown signal",
+				"destination", destination.Name)
+			return nil
+		}
 		if destination.Name != "PLATFORM_AUDIT" && destination.Name != "PLATFORM_NOTIFICATION" && w.CheckBusinessLicense != nil {
 			if w.CheckBusinessLicense(ctx) != nil {
 				continue
 			}
 		}
-		events, err := w.Store.Acquire(ctx, destination.Name, w.BatchSize)
+		events, err := store.Acquire(ctx, destination.Name, w.BatchSize)
 		if err != nil {
 			return err
 		}
 		if len(events) == 0 {
 			continue
 		}
-		events, err = w.Store.filterImportNotifications(ctx, events)
+		// 已领取的批次视为在途：此时若收到停止信号，仍要完成发送与落库
+		// （租约 30s 内必须写回），因此读取、投递和状态写回一律使用
+		// 脱离取消的独立预算上下文。
+		batchCtx, cancelBatch := context.WithTimeout(context.WithoutCancel(ctx), drainBatchTimeout)
+		draining := ctx.Err() != nil
+		if draining {
+			slog.Info("draining outbox batch", "destination", destination.Name, "events", len(events))
+		}
+		err = w.deliverBatch(batchCtx, destination, events, store)
+		cancelBatch()
+		if !draining && ctx.Err() != nil && err == nil {
+			slog.Info("draining outbox batch", "destination", destination.Name, "events", len(events), "completed_after_signal", true)
+		}
 		if err != nil {
-			return err
-		}
-		if len(events) == 0 {
-			continue
-		}
-		if err = w.deliver(ctx, destination, events); err != nil {
-			if errors.Is(err, ErrLicensePaused) {
-				continue
-			}
-			permanent := false
-			var status *httpStatusError
-			if errors.As(err, &status) {
-				permanent = status.Status == 400 || status.Status == 413 || status.Status == 422
-			}
-			_ = w.Store.Failed(context.WithoutCancel(ctx), events, "DELIVERY_FAILED", err.Error(), permanent)
-			continue
-		}
-		if err = w.Store.Delivered(ctx, events); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// deliverBatch 在给定上下文内完成单个已领取批次的投递与状态落库。
+// 参数：ctx 为排空预算上下文（不随停机取消），destination/events 为在途批次，
+// store 为存储实现。
+// 返回值：需要中止本次扫描的存储错误；投递失败已按原语义记录为可重试/死信。
+func (w *Worker) deliverBatch(ctx context.Context, destination Destination, events []Event, store eventStore) error {
+	filtered, err := store.filterImportNotifications(ctx, events)
+	if err != nil {
+		return err
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	if err = w.deliver(ctx, destination, filtered); err != nil {
+		if errors.Is(err, ErrLicensePaused) {
+			return nil
+		}
+		permanent := false
+		var status *httpStatusError
+		if errors.As(err, &status) {
+			permanent = status.Status == 400 || status.Status == 413 || status.Status == 422
+		}
+		_ = store.Failed(ctx, filtered, "DELIVERY_FAILED", err.Error(), permanent)
+		return nil
+	}
+	return store.Delivered(ctx, filtered)
 }
 func (w *Worker) deliver(ctx context.Context, d Destination, events []Event) error {
 	if d.Name != "PLATFORM_AUDIT" && d.Name != "PLATFORM_NOTIFICATION" && w.CheckBusinessLicense != nil {

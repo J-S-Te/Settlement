@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"github.com/J-S-Te/license-core/consumer"
 	"log/slog"
@@ -144,16 +145,19 @@ func main() {
 	worker := &outbox.Worker{Store: &outbox.Store{DB: db, WorkerID: workerID, Lease: 30 * time.Second}, HTTP: httpClient, TokenEndpoint: platform + "/oauth2/token", BatchSize: 50, Destinations: destinations, DegradedDestinations: degradedDestinations}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	// 所有后台循环都收拢到 loops，停机时先取消再按预算 join，
+	// 避免主流程返回后截断未完成的一次性任务（导出、归档、提醒、对账）。
+	loops := newLoopGroup()
 	commercialGate, licenseErr := consumer.FromEnvironment("settlement")
 	if licenseErr != nil {
 		slog.Error("commercial license configuration failed")
 		os.Exit(1)
 	}
-	go func() {
+	loops.Go("commercial_license", func() {
 		_ = commercialGate.Run(ctx, func(error) {
 			slog.Warn("commercial license synchronization unavailable; local expiry remains authoritative")
 		})
-	}()
+	})
 	checkBusiness := func(ctx context.Context) error { return commercialGate.Check(ctx, "MUTATE_BUSINESS") }
 	worker.CheckBusinessLicense = checkBusiness
 	if creditWorker != nil {
@@ -238,7 +242,7 @@ func main() {
 	}
 	receiptRecovery := &service.ReceiptArchiveWorker{DB: db, Identity: archiveRecovery.Identity, Gateway: archiveRecovery.Gateway, CheckBusinessLicense: checkBusiness}
 	if exporter.GatewayMode == "dual" || exporter.GatewayMode == "required" {
-		go func() {
+		loops.Go("receipt_archive_recovery", func() {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -254,9 +258,9 @@ func main() {
 				case <-ticker.C:
 				}
 			}
-		}()
+		})
 	}
-	go func() {
+	loops.Go("role_reminder_and_dunning", func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for {
@@ -272,9 +276,9 @@ func main() {
 			case <-ticker.C:
 			}
 		}
-	}()
+	})
 	if taxReconciler != nil {
-		go func() {
+		loops.Go("tax_reconciliation", func() {
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -287,9 +291,9 @@ func main() {
 				case <-ticker.C:
 				}
 			}
-		}()
+		})
 	}
-	go func() {
+	loops.Go("report_export", func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -302,9 +306,9 @@ func main() {
 			case <-ticker.C:
 			}
 		}
-	}()
+	})
 	if creditWorker != nil {
-		go func() {
+		loops.Go("crm_credit_retry", func() {
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -317,10 +321,10 @@ func main() {
 				case <-ticker.C:
 				}
 			}
-		}()
+		})
 	}
 	if projectReferenceSync != nil {
-		go func() {
+		loops.Go("project_reference_sync", func() {
 			ticker := time.NewTicker(projectReferenceSyncInterval)
 			defer ticker.Stop()
 			for {
@@ -333,10 +337,36 @@ func main() {
 				case <-ticker.C:
 				}
 			}
-		}()
+		})
 	}
-	if err = worker.Run(ctx); err != nil && err != context.Canceled {
-		slog.Error("settlement worker stopped", "error", err)
+	// 主投递循环同样纳入 join：停机时它先排空在途批次，再随取消返回。
+	var workerErr error
+	loops.Go("outbox_worker", func() {
+		if err := worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			workerErr = err
+			// 主循环异常退出时收拢其余组件，按同一预算 join 后以失败码退出。
+			cancel()
+		}
+	})
+	loopsDone := make(chan struct{})
+	go func() {
+		loops.Wait()
+		close(loopsDone)
+	}()
+	select {
+	case <-ctx.Done():
+	case <-loopsDone:
+	}
+	// ① 取消（join 前先确认所有循环已收到停止信号）→ ② 按预算 join → ③ 超预算列未完成组件退出。
+	cancel()
+	budget := shutdownDrainBudget()
+	if !drainWait(budget, loops.Wait) {
+		slog.Error("settlement worker shutdown exceeded drain budget; background components still running",
+			"budget", budget, "unfinished", loops.Unfinished())
+		os.Exit(1)
+	}
+	if workerErr != nil {
+		slog.Error("settlement worker stopped", "error", workerErr)
 		os.Exit(1)
 	}
 }
