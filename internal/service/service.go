@@ -28,14 +28,16 @@ type CreditEventPublisher interface {
 }
 
 type Service struct {
-	ProjectReferences     ProjectReferenceResolver
-	RoleDirectory         RoleDirectory
-	ERPProvider           ERPProvider
-	DB                    *sql.DB
-	ContractImportEnabled bool
-	CreditPublisher       CreditEventPublisher
-	InvoiceIssuanceMode   string
-	TaxProviderCode       string
+	NativeFinancialEnabled bool
+	CreditSyncSubscribed   *bool
+	ProjectReferences      ProjectReferenceResolver
+	RoleDirectory          RoleDirectory
+	ERPProvider            ERPProvider
+	DB                     *sql.DB
+	ContractImportEnabled  bool
+	CreditPublisher        CreditEventPublisher
+	InvoiceIssuanceMode    string
+	TaxProviderCode        string
 	// Optional only for directly constructed component tests. The HTTP API
 	// installs its live commercial gate for every invoice archive operation.
 	CheckInvoiceArchiveLicense func(context.Context) error
@@ -481,8 +483,8 @@ func (s *Service) CreateReceipt(ctx context.Context, p Principal, key string, in
 	if !map[string]bool{"TRANSFER": true, "BANK_ACCEPTANCE": true, "CHEQUE": true, "CASH": true}[in.PaymentMethod] {
 		return "", fmt.Errorf("%w: invalid payment_method", ErrInvalid)
 	}
-	if _, err = time.Parse("2006-01-02", in.ReceiptDate); err != nil {
-		return "", fmt.Errorf("%w: receipt_date must be YYYY-MM-DD", ErrInvalid)
+	if in.ReceiptDate, err = validateBusinessDate(in.ReceiptDate, "receipt_date"); err != nil {
+		return "", err
 	}
 	id := newID()
 	no := "RC-" + id[:12]
@@ -491,6 +493,9 @@ func (s *Service) CreateReceipt(ctx context.Context, p Principal, key string, in
 		return "", err
 	}
 	defer tx.Rollback()
+	if err = s.validateNativeReceiptCustomer(ctx, tx, p, &in); err != nil {
+		return "", err
+	}
 	if in.ImportFact != nil && !p.Allows("settlement.receipt.record") {
 		return "", ErrForbidden
 	}
@@ -511,6 +516,23 @@ func (s *Service) CreateReceipt(ctx context.Context, p Principal, key string, in
 		}
 		if customer != in.CustomerID || currency != in.Currency {
 			return "", ErrInvalid
+		}
+	} else {
+		// 人工回款的幂等键必须同时绑定请求内容：同 key 改金额/客户/日期等不得
+		// 回放旧成功。来源事实路径由 claimImportFact 的 request_hash 负责。
+		// customer_name 是服务端可刷新的展示快照，不纳入内容摘要。
+		idempotencyRequest := struct {
+			CustomerID    string `json:"customer_id"`
+			Amount        string `json:"amount"`
+			Currency      string `json:"currency"`
+			ReceiptDate   string `json:"receipt_date"`
+			PaymentMethod string `json:"payment_method"`
+			BankReference string `json:"bank_transaction_reference"`
+		}{in.CustomerID, a, in.Currency, in.ReceiptDate, in.PaymentMethod, in.BankReference}
+		if existing, replay, claimErr := claimIdempotency(ctx, tx, p.TenantID, "CREATE_RECEIPT", key, id, idempotencyRequest); claimErr != nil {
+			return "", claimErr
+		} else if replay {
+			return existing, nil
 		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receipt(id,tenant_id,receipt_no,customer_id,customer_name_snapshot,amount,unallocated_amount,currency,receipt_date,payment_method,bank_transaction_reference,source_type,status,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, no, in.CustomerID, in.CustomerName, a, a, in.Currency, in.ReceiptDate, in.PaymentMethod, in.BankReference, "MANUAL", "AVAILABLE", key)
@@ -540,9 +562,9 @@ type AllocationInput struct {
 	MatchConfidence int         `json:"match_confidence"`
 }
 
-// ConfirmAllocation 核验客户币种和余额后核销，并原子映射历史分配关系。
-// 参数：ctx为上下文，p为主体，key为幂等键，in为核销内容。
-// 返回值：核销ID或参数、授权、幂等及存储错误。
+// ConfirmAllocation 在范围、余额与客户一致时确认核销并按真实订阅产生信用事实。
+// 参数：ctx/p 为授权上下文，key 为幂等键，in 为回款与应收关联。
+// 返回值：核销ID；任何财务校验或持久化失败返回错误。
 func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string, in AllocationInput) (string, error) {
 	key = importFactKey(in.ImportFact, key)
 	a, err := amount(in.Amount)
@@ -665,23 +687,29 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 	}
 	var creditEventID string
 	if receivableOpen == a {
-		// CRM 信用使用数字客户 ID、字符串 period_no 及
-		// RFC3339 日期。非 CRM 客户 ID 不创建信用同步
-		// 事件，避免无效载荷污染重试队列。
-		if customerID, parseErr := strconv.ParseUint(strings.TrimSpace(receivableCustomer), 10, 64); parseErr == nil {
-			creditEventID = newID()
-			payload, marshalErr := json.Marshal(map[string]any{
-				"event_id": creditEventID, "event_type": creditEventCompleted,
-				"tenant_id": p.TenantID, "payment_id": id, "receipt_id": in.ReceiptID,
-				"allocation_id": id, "customer_id": customerID, "contract_no": contractNo,
-				"period_no": strconv.Itoa(installment), "due_date": creditDate(dueDate), "paid_date": creditDate(receiptDate),
-				"due_amount": receivableOriginal, "paid_amount": receivableOriginal, "source_system": "settlement",
-			})
-			if marshalErr != nil {
-				return "", marshalErr
-			}
-			if err = insertCreditSync(ctx, tx, p.TenantID, creditEventID, id, in.ReceivableID, payload); err != nil {
-				return "", err
+		eligible, creditErr := s.creditEligibleSnapshot(ctx, tx, p.TenantID, snapshot, receivableCustomer)
+		if creditErr != nil {
+			return "", creditErr
+		}
+		if eligible {
+			// CRM 信用使用数字客户 ID、字符串 period_no 及
+			// RFC3339 日期。非 CRM 客户 ID 不创建信用同步
+			// 事件，避免无效载荷污染重试队列。
+			if customerID, parseErr := strconv.ParseUint(strings.TrimSpace(receivableCustomer), 10, 64); parseErr == nil {
+				creditEventID = newID()
+				payload, marshalErr := json.Marshal(map[string]any{
+					"event_id": creditEventID, "event_type": creditEventCompleted,
+					"tenant_id": p.TenantID, "payment_id": id, "receipt_id": in.ReceiptID,
+					"allocation_id": id, "customer_id": customerID, "contract_no": contractNo,
+					"period_no": strconv.Itoa(installment), "due_date": creditDate(dueDate), "paid_date": creditDate(receiptDate),
+					"due_amount": receivableOriginal, "paid_amount": receivableOriginal, "source_system": "settlement",
+				})
+				if marshalErr != nil {
+					return "", marshalErr
+				}
+				if err = insertCreditSync(ctx, tx, p.TenantID, creditEventID, id, in.ReceivableID, payload); err != nil {
+					return "", err
+				}
 			}
 		}
 	}

@@ -32,6 +32,7 @@ type Config struct {
 	MySQLDSN                     string
 	DevelopmentAuth              bool
 	IntegrationEnabled           bool
+	NativeFinancialEnabled       bool
 	IntegrationBearerToken       string
 	OutboxWorkerEnabled          bool
 	OutboxWorkerBatchSize        int
@@ -106,7 +107,8 @@ type Config struct {
 }
 
 // AuditDestinationRequired 解析审计目的地是否必开（BIZ-XAPI-10）。
-// 参数：explicit 为显式 SETTLEMENT_AUDIT_REQUIRED，appEnv 为 APP_ENV，
+// 参数：explicit 为显式审计开关（生产调用点经 AuditRequiredSwitch 读取，兼容
+// SETTLEMENT_AUDIT_REQUIRED 与平台统一键 PLATFORM_AUDIT_REQUIRED），appEnv 为 APP_ENV，
 // environmentCode 为 PLATFORM_ENVIRONMENT_CODE。
 // 返回值：生效判定；显式值非法时返回错误（失败关闭，不静默降级）。
 // 判定顺序与平台 platformAuditRequired 同构：显式开关 > APP_ENV=production；
@@ -115,7 +117,8 @@ func AuditDestinationRequired(explicit, appEnv, environmentCode string) (bool, e
 	if raw := strings.TrimSpace(explicit); raw != "" {
 		required, err := strconv.ParseBool(raw)
 		if err != nil {
-			return false, fmt.Errorf("SETTLEMENT_AUDIT_REQUIRED: %w", err)
+			// 非法值可能来自子系统键或平台统一键，两个键名都列出，避免调用点误导排障。
+			return false, fmt.Errorf("SETTLEMENT_AUDIT_REQUIRED/PLATFORM_AUDIT_REQUIRED: %w", err)
 		}
 		return required, nil
 	}
@@ -123,6 +126,16 @@ func AuditDestinationRequired(explicit, appEnv, environmentCode string) (bool, e
 		return strings.EqualFold(env, "production"), nil
 	}
 	return isProductionEnvironmentCode(environmentCode), nil
+}
+
+// AuditRequiredSwitch 返回审计必开的显式开关值：SETTLEMENT_AUDIT_REQUIRED 优先，
+// 缺失时兼容平台统一键 PLATFORM_AUDIT_REQUIRED（生产 descriptor 统一声明该键）。
+// 返回原始字符串，由 AuditDestinationRequired 负责解析与失败关闭。
+func AuditRequiredSwitch() string {
+	if raw := strings.TrimSpace(os.Getenv("SETTLEMENT_AUDIT_REQUIRED")); raw != "" {
+		return raw
+	}
+	return strings.TrimSpace(os.Getenv("PLATFORM_AUDIT_REQUIRED"))
 }
 
 // isProductionEnvironmentCode 按平台环境编码判断生产：兼容 prod 与 production。
@@ -138,9 +151,9 @@ func isProductionEnvironmentCode(value string) bool {
 // Load 用途：读取并校验结算启动配置，拒绝不完整的项目引用机器身份。
 // 参数：无，从进程环境读取配置。
 // 返回值：返回经校验配置及配置错误，不输出凭据。
-// Load 从实际环境加载结算配置，新历史导入入口严格布尔且默认关闭。
-// 参数：无。
-// 返回值：校验后的配置，环境值或依赖配置错误返回错误。
+// Load 读取结算配置，按显式能力验证独立机器身份与本地财务开关。
+// 参数：无；从进程环境读取。
+// 返回值：有效配置；缺失身份或非法设置时返回错误。
 func Load() (Config, error) {
 	trustedProxies, trustedErr := parseTrustedProxies(env("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128"))
 	if trustedErr != nil {
@@ -202,7 +215,7 @@ func Load() (Config, error) {
 	// 目的地的凭据完整性只做布尔登记，供 /readyz 与 /metrics 暴露，不在此处退出
 	// 进程（API 需要保持可探测；worker 负责生产 fail-closed）。
 	auditDestinationRequired, auditRequiredErr := AuditDestinationRequired(
-		os.Getenv("SETTLEMENT_AUDIT_REQUIRED"),
+		AuditRequiredSwitch(),
 		os.Getenv("APP_ENV"),
 		c.OIDCEnvironmentCode,
 	)
@@ -231,6 +244,9 @@ func Load() (Config, error) {
 		if origin := strings.ToLower(strings.TrimSpace(c.PublicOrigin)); (strings.HasPrefix(origin, "https://") || strings.HasPrefix(origin, "http://")) && !isLoopbackHTTPOrigin(origin) {
 			return c, fmt.Errorf("SETTLEMENT_DEVELOPMENT_AUTH=true is forbidden when SETTLEMENT_PUBLIC_ORIGIN is a public non-loopback origin: development auth bypasses every settlement authentication check")
 		}
+	}
+	if c.NativeFinancialEnabled, err = boolEnv("SETTLEMENT_NATIVE_FINANCIAL_ENABLED", false); err != nil {
+		return c, err
 	}
 	if c.IntegrationEnabled, err = boolEnv("SETTLEMENT_INTEGRATION_ENABLED", false); err != nil {
 		return c, err
@@ -279,7 +295,18 @@ func Load() (Config, error) {
 	if c.HTTPAddress == "" || c.MySQLDSN == "" {
 		return c, fmt.Errorf("SETTLEMENT_HTTP_ADDR and SETTLEMENT_MYSQL_DSN are required")
 	}
-	if c.PlatformMachineTokenPublicKeyPath != "" || c.PlatformMachineTokenIssuer != "" || c.ContractOAuthClientID != "" || c.ContractApplicationID != "" || c.ContractEnvironmentID != "" {
+	// 原生财务模式（SETTLEMENT_NATIVE_FINANCIAL_ENABLED=true 且合同集成关闭）下
+	// 不允许残留合同集成身份：半套残留会让后续集成启用难以核对，也要把明确的
+	// 模式冲突与"缺机器验签材料"区分开。原生+集成同开的共存模式仍合法，本地
+	// 基线与合同事实按 basis_type 并存，不受本检查影响。
+	if c.NativeFinancialEnabled && !c.IntegrationEnabled {
+		for name, value := range map[string]string{"CONTRACT_INTEGRATION_CLIENT_ID": c.ContractClientID, "CONTRACT_INTEGRATION_AUDIENCE": c.ContractAudience, "CONTRACT_INTEGRATION_OAUTH_CLIENT_ID": c.ContractOAuthClientID, "CONTRACT_INTEGRATION_APPLICATION_ID": c.ContractApplicationID, "CONTRACT_INTEGRATION_ENVIRONMENT_ID": c.ContractEnvironmentID} {
+			if value != "" {
+				return c, fmt.Errorf("%s must be empty in native financial mode (SETTLEMENT_NATIVE_FINANCIAL_ENABLED=true with SETTLEMENT_INTEGRATION_ENABLED=false); clear the leftover contract identity or re-enable settlement integration", name)
+			}
+		}
+	}
+	if (c.IntegrationEnabled && !c.DevelopmentAuth) || c.ContractClientID != "" || c.ContractAudience != "" || c.ContractOAuthClientID != "" || c.ContractApplicationID != "" || c.ContractEnvironmentID != "" {
 		if c.DevelopmentAuth {
 			return c, fmt.Errorf("platform machine tokens require production authentication")
 		}

@@ -61,7 +61,7 @@ func exportMySQL(t *testing.T) *sql.DB {
 		t.Fatal("open owned export test database failed")
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	for _, file := range []string{"000005_report_exports.sql", "000007_file_gateway_report_exports.sql", "000014_report_export_effects.sql"} {
+	for _, file := range []string{"000005_report_exports.sql", "000007_file_gateway_report_exports.sql", "000014_report_export_effects.sql", "000027_report_export_requester_scope.sql"} {
 		body, err := migrations.Files.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)

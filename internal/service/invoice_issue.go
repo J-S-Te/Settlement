@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 )
 
 func invoiceIssueCommand(ctx context.Context, tx *sql.Tx, tenant, requestID, attemptID, provider string) (map[string]any, error) {
@@ -32,6 +33,23 @@ func invoiceIssueCommand(ctx context.Context, tx *sql.Tx, tenant, requestID, att
 	}
 	var buyerProfile any
 	if err = json.Unmarshal(buyer, &buyerProfile); err != nil {
+		return nil, err
+	}
+	// 出站前再次受控：历史或库内被改写的 JSON 不能把任意键透传给税控。
+	switch value := buyerProfile.(type) {
+	case nil:
+		// 旧数据可能是 JSON null：归一化为空档案，而不是把 null 透传出去。
+		buyerProfile = map[string]any{}
+	case map[string]any:
+		normalizedProfile, profileErr := normalizeInvoiceProfile(value, buyerProfileFields, "buyer_profile")
+		if profileErr != nil {
+			return nil, profileErr
+		}
+		buyerProfile = normalizedProfile
+	default:
+		return nil, fmt.Errorf("%w: buyer profile snapshot is not an object", ErrInvalid)
+	}
+	if invoiceType, err = validateStoredInvoiceType(invoiceType); err != nil {
 		return nil, err
 	}
 	return map[string]any{"operation_type": "INVOICE_ISSUE", "provider_code": provider, "external_request_id": attemptID, "attempt_id": attemptID, "invoice_request_id": requestID, "request_no": requestNo, "invoice_type": invoiceType, "currency": currency, "buyer_profile": buyerProfile, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "items": items}, nil

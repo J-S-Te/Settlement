@@ -144,6 +144,8 @@ func TestRejectInvoiceRequestRejectsOutOfScopeManager(t *testing.T) {
 func TestReverseAllocationRejectsOutOfScopeManager(t *testing.T) {
 	db := scriptdb.Open(t,
 		scriptdb.Step{Kind: "begin"},
+		// 幂等键先绑定请求内容，再读取原核销与合同范围。
+		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_idempotency_record"},
 		scriptdb.Step{Kind: "query", SQL: "FROM settlement_receipt_allocation a WHERE a.id", Rows: [][]driver.Value{{"receipt-1", "receivable-1", "CNY", "confirmer", "100.00", "0.00"}}},
 		scriptdb.Step{Kind: "query", SQL: "SELECT rv.contract_snapshot_id FROM settlement_receipt_allocation", Rows: [][]driver.Value{{"snapshot-out-of-scope"}}},
 		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state FROM settlement_contract_snapshot", Rows: [][]driver.Value{{"RELEASED"}}},
@@ -197,7 +199,8 @@ func TestReviewInvoiceRedFlushRejectsOutOfScopeManager(t *testing.T) {
 func TestRequestInvoiceRedFlushRejectsOutOfScopeManager(t *testing.T) {
 	steps := []scriptdb.Step{
 		{Kind: "begin"},
-		{Kind: "query", SQL: "SELECT id,original_invoice_id FROM settlement_invoice_red_flush_request"},
+		// 幂等键先绑定请求内容，再读取发票与合同范围。
+		{Kind: "exec", SQL: "INSERT INTO settlement_idempotency_record"},
 		{Kind: "query", SQL: "SELECT ti.status,ir.contract_snapshot_id", Rows: [][]driver.Value{{"ISSUED", "snapshot-out-of-scope"}}},
 	}
 	steps = append(steps, scopeSteps("RELEASED")...)

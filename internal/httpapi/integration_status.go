@@ -19,6 +19,13 @@ type integrationSnapshot struct {
 	TaxConfigured          bool
 	Pending                map[string]int64
 	PendingError           string
+	// C14：能力维度。可选未启用（disabled=未购买/被停用）与核心降级（degraded）
+	// 分开表达，不把"未购买"渲染成健康故障；enabled 恒为配置校验通过后的运行态
+	// （Load 对"开启但配置不全"失败关闭）。
+	ContractIntegrationEnabled bool
+	NativeFinancialEnabled     bool
+	CreditSyncEnabled          bool
+	ProjectReferenceConfigured bool
 }
 
 // destinationConfigured 判定某目的地本次是否有可投递配置。
@@ -69,6 +76,12 @@ func evaluateReadiness(snapshot integrationSnapshot) (int, map[string]any) {
 			"audit":        map[string]any{"required": snapshot.AuditRequired, "configured": snapshot.AuditConfigured},
 			"notification": map[string]any{"required": false, "configured": snapshot.NotificationConfigured},
 		},
+		"capabilities": map[string]any{
+			"contract_integration": map[string]any{"enabled": snapshot.ContractIntegrationEnabled, "state": capabilityState(snapshot.ContractIntegrationEnabled)},
+			"native_financial":     map[string]any{"enabled": snapshot.NativeFinancialEnabled, "state": capabilityState(snapshot.NativeFinancialEnabled)},
+			"crm_credit_sync":      map[string]any{"enabled": snapshot.CreditSyncEnabled, "state": capabilityState(snapshot.CreditSyncEnabled)},
+			"project_reference":    map[string]any{"enabled": snapshot.ProjectReferenceConfigured, "state": capabilityState(snapshot.ProjectReferenceConfigured)},
+		},
 		"outbox_pending":              snapshot.Pending,
 		"unconfigured_destinations":   unconfiguredNames,
 		"unconfigured_outbox_pending": unconfiguredTotal,
@@ -86,6 +99,17 @@ func evaluateReadiness(snapshot integrationSnapshot) (int, map[string]any) {
 		body["degraded_destinations"] = uniqueStrings(degraded)
 	}
 	return 200, body
+}
+
+// capabilityState 按 C14 口径渲染能力状态：disabled 属可选未购买/被停用，
+// 不计入 degraded；enabled 表示配置校验通过后的运行态。
+// 参数：enabled 为该能力开关的运行事实。
+// 返回值：ready 或 disabled。
+func capabilityState(enabled bool) string {
+	if enabled {
+		return "ready"
+	}
+	return "disabled"
 }
 
 // renderMetrics 把目的地配置与积压渲染为 Prometheus 文本格式。
@@ -137,11 +161,15 @@ func renderMetrics(snapshot integrationSnapshot) string {
 // 返回值：快照；数据库不可用时 PendingError 非空，不阻塞其它状态输出。
 func (a *API) integrationSnapshot(ctx context.Context) integrationSnapshot {
 	snapshot := integrationSnapshot{
-		AuditRequired:          a.cfg.AuditDestinationRequired,
-		AuditConfigured:        a.cfg.AuditDestinationConfigured,
-		NotificationConfigured: a.cfg.NotificationDestinationConfigured,
-		TaxConfigured:          a.cfg.InvoiceIssuanceMode == "tax_adapter",
-		Pending:                map[string]int64{},
+		AuditRequired:              a.cfg.AuditDestinationRequired,
+		AuditConfigured:            a.cfg.AuditDestinationConfigured,
+		NotificationConfigured:     a.cfg.NotificationDestinationConfigured,
+		TaxConfigured:              a.cfg.InvoiceIssuanceMode == "tax_adapter",
+		ContractIntegrationEnabled: a.cfg.IntegrationEnabled,
+		NativeFinancialEnabled:     a.cfg.NativeFinancialEnabled,
+		CreditSyncEnabled:          a.cfg.CRMCreditSyncEnabled,
+		ProjectReferenceConfigured: strings.TrimSpace(a.cfg.ProjectReferenceURL) != "",
+		Pending:                    map[string]int64{},
 	}
 	if a.service == nil || a.service.DB == nil {
 		snapshot.PendingError = "database unavailable"

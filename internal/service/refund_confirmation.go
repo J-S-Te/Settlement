@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/j-s-te/settlement/internal/businessclock"
 )
 
 // ConfirmRefundRequest 记录银行等外部渠道已完成退款的事实。
@@ -100,7 +102,21 @@ func lockApprovedRefund(ctx context.Context, tx *sql.Tx, tenant, id string, vers
 	if err != nil {
 		return err
 	}
-	if completed.Before(receiptDate) {
+	if err = validateRefundReceiptBusinessDayOn(completed, receiptDate); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateRefundReceiptBusinessDayOn 按北京业务日比较退款完成日与回款日。
+// 参数：completed 为外部退款完成时刻（UTC 瞬时）；receiptDate 为回款日
+// （DATE_FORMAT 输出的北京业务日文本，按 YYYY-MM-DD 解析的日历日）。
+// 返回值：完成日早于回款日返回 ErrInvalid，否则 nil。
+// 不能把 UTC 时间戳直接与 YYYY-MM-DD 解析值比较：北京 00:00-08:00 时
+// UTC 仍是前一日，会被误判成“早于回款日”。两端都归一到北京业务日文本，
+// YYYY-MM-DD 的字典序等价于自然日先后。
+func validateRefundReceiptBusinessDayOn(completed time.Time, receiptDate time.Time) error {
+	if businessclock.DateString(completed) < receiptDate.Format(businessDateLayout) {
 		return ErrInvalid
 	}
 	return nil

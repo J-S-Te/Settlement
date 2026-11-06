@@ -88,7 +88,7 @@ func TestGenerateCommitsSentBoundaryBeforeUpload(t *testing.T) {
 		}
 	}}
 	w := &Worker{DB: db, TenantID: "tenant", WorkerID: "worker", Gateway: g, GatewayMode: "required", GatewayApplicationID: "settlement"}
-	if err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", generation: 7}); err != nil {
+	if err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", generation: 7, requestedBy: "user", requesterScope: unrestrictedRequesterScope(t, "user")}); err != nil {
 		t.Fatal(err)
 	}
 	if !prepared || !intent || g.uploads != 1 {

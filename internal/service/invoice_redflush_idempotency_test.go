@@ -50,7 +50,8 @@ func redFlushAttemptRow(requestStatus, attemptStatus, originalStatus string, seq
 func TestRedFlushRequestCountsUnknownAsInFlight(t *testing.T) {
 	db := scriptdb.Open(t,
 		scriptdb.Step{Kind: "begin"},
-		scriptdb.Step{Kind: "query", SQL: "SELECT id,original_invoice_id FROM settlement_invoice_red_flush_request"},
+		// 幂等键先绑定请求内容，再读取原票状态。
+		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_idempotency_record"},
 		scriptdb.Step{Kind: "query", SQL: "SELECT ti.status,ir.contract_snapshot_id", Rows: [][]driver.Value{{"ISSUED", "snapshot-1"}}},
 		// 白名单必须同时包含未收敛的 ISSUE_UNKNOWN，否则未知结果会放行第二笔红冲。
 		scriptdb.Step{Kind: "query", SQL: "status IN ('SUBMITTED','ISSUE_PENDING','PROCESSING','ISSUE_UNKNOWN')", Rows: [][]driver.Value{{int64(1)}}},
@@ -68,7 +69,8 @@ func TestRedFlushRequestCountsUnknownAsInFlight(t *testing.T) {
 func TestRedFlushRequestCreatesFirstRequest(t *testing.T) {
 	db := scriptdb.Open(t,
 		scriptdb.Step{Kind: "begin"},
-		scriptdb.Step{Kind: "query", SQL: "SELECT id,original_invoice_id FROM settlement_invoice_red_flush_request"},
+		// 幂等键先绑定请求内容，再读取原票状态。
+		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_idempotency_record"},
 		scriptdb.Step{Kind: "query", SQL: "SELECT ti.status,ir.contract_snapshot_id", Rows: [][]driver.Value{{"ISSUED", "snapshot-1"}}},
 		scriptdb.Step{Kind: "query", SQL: "status IN ('SUBMITTED','ISSUE_PENDING','PROCESSING','ISSUE_UNKNOWN')", Rows: [][]driver.Value{{int64(0)}}},
 		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_invoice_red_flush_request"},

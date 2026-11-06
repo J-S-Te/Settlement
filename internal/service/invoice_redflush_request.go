@@ -30,16 +30,17 @@ func (s *Service) RequestInvoiceRedFlush(ctx context.Context, p Principal, key, 
 		return "", err
 	}
 	defer tx.Rollback()
-	var existing, existingInvoiceID string
-	err = tx.QueryRowContext(ctx, `SELECT id,original_invoice_id FROM settlement_invoice_red_flush_request WHERE tenant_id=? AND idempotency_key=?`, p.TenantID, key).Scan(&existing, &existingInvoiceID)
-	if err == nil {
-		if existingInvoiceID != invoiceID {
-			return "", fmt.Errorf("%w: idempotency key belongs to another invoice", ErrConflict)
-		}
-		return existing, tx.Commit()
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
+	id := newID()
+	// 红冲申请的幂等键绑定原票与原因：同 key 改原因不得回放旧成功。
+	idempotencyRequest := struct {
+		InvoiceID    string `json:"invoice_id"`
+		ReasonCode   string `json:"reason_code"`
+		ReasonDetail string `json:"reason_detail"`
+	}{invoiceID, reasonCode, reason}
+	if existing, replay, claimErr := claimIdempotency(ctx, tx, p.TenantID, "REQUEST_INVOICE_RED_FLUSH", key, id, idempotencyRequest); claimErr != nil {
+		return "", claimErr
+	} else if replay {
+		return existing, nil
 	}
 	var invoiceStatus, snapshotID string
 	if err = tx.QueryRowContext(ctx, `SELECT ti.status,ir.contract_snapshot_id FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id WHERE ti.id=? AND ti.tenant_id=? FOR UPDATE`, invoiceID, p.TenantID).Scan(&invoiceStatus, &snapshotID); err != nil {
@@ -64,8 +65,12 @@ func (s *Service) RequestInvoiceRedFlush(ctx context.Context, p Principal, key, 
 	if active > 0 {
 		return "", fmt.Errorf("%w: active red flush request already exists", ErrConflict)
 	}
-	id := newID()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO settlement_invoice_red_flush_request(id,tenant_id,original_invoice_id,reason_code,reason_detail,idempotency_key,status,requested_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'SUBMITTED',?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, invoiceID, reasonCode, reason, key, p.UserID); err != nil {
+		if mysqlDuplicate(err) {
+			// 幂等记录不存在而红冲表已占用同 key：历史行无法核对内容，
+			// 按冲突返回，不伪装成首次成功。
+			return "", fmt.Errorf("%w: idempotency key was used before request binding", ErrConflict)
+		}
 		return "", err
 	}
 	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_INVOICE_RED_FLUSH_SUBMITTED", "invoice_red_flush_request", id, map[string]any{"actor_id": p.UserID, "invoice_id": invoiceID, "reason_code": reasonCode, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {

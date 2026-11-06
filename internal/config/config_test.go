@@ -87,6 +87,51 @@ func TestAuditDestinationRequiredResolution(t *testing.T) {
 	}
 }
 
+// TestAuditRequiredSwitchPrecedence 覆盖审计开关读取的键优先级：
+// SETTLEMENT_AUDIT_REQUIRED 优先，缺失时兼容平台统一键 PLATFORM_AUDIT_REQUIRED。
+func TestAuditRequiredSwitchPrecedence(t *testing.T) {
+	tests := []struct {
+		name        string
+		settlement  string
+		platformKey string
+		want        string
+	}{
+		{name: "settlement key wins", settlement: "false", platformKey: "true", want: "false"},
+		{name: "platform fallback when settlement missing", settlement: "", platformKey: "true", want: "true"},
+		{name: "platform fallback ignores blank settlement", settlement: "   ", platformKey: "false", want: "false"},
+		{name: "both empty", settlement: "", platformKey: "", want: ""},
+		{name: "platform value trimmed", settlement: "", platformKey: " true ", want: "true"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("SETTLEMENT_AUDIT_REQUIRED", test.settlement)
+			t.Setenv("PLATFORM_AUDIT_REQUIRED", test.platformKey)
+			if got := AuditRequiredSwitch(); got != test.want {
+				t.Fatalf("AuditRequiredSwitch() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// TestPlatformAuditRequiredKeyDrivesLoad 确认平台统一键在生产 descriptor 中声明后，
+// Load 得到的判定与 SETTLEMENT_AUDIT_REQUIRED 显式声明一致（不再只是装饰）。
+func TestPlatformAuditRequiredKeyDrivesLoad(t *testing.T) {
+	setValidProductionEnvironment(t)
+	t.Setenv("SETTLEMENT_PUBLIC_ORIGIN", "https://platform.example.com")
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("PLATFORM_ENVIRONMENT_CODE", "dev")
+	t.Setenv("SETTLEMENT_AUDIT_REQUIRED", "")
+	t.Setenv("PLATFORM_AUDIT_REQUIRED", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.AuditDestinationRequired {
+		t.Fatal("AuditDestinationRequired = false, want platform unified key to require audit")
+	}
+}
+
 // TestLoadRegistersIntegrationDestinationState 确认配置只登记目的地是否配置，
 // 不因 API 进程缺少审计凭据而退出；生产 fail-closed 由 worker 负责。
 func TestLoadRegistersIntegrationDestinationState(t *testing.T) {
@@ -95,6 +140,7 @@ func TestLoadRegistersIntegrationDestinationState(t *testing.T) {
 	t.Setenv("APP_ENV", "")
 	t.Setenv("PLATFORM_ENVIRONMENT_CODE", "prod")
 	t.Setenv("SETTLEMENT_AUDIT_REQUIRED", "")
+	t.Setenv("PLATFORM_AUDIT_REQUIRED", "")
 	t.Setenv("SETTLEMENT_AUDIT_CLIENT_ID", "settlement-audit")
 	t.Setenv("SETTLEMENT_AUDIT_CLIENT_SECRET", "audit-secret")
 	t.Setenv("SETTLEMENT_NOTIFICATION_CLIENT_ID", "")

@@ -352,7 +352,7 @@ func TestImportExportBeyondTenThousand(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := Principal{TenantID: in.TenantID, UserID: "finance", Permissions: map[string]bool{"settlement.admin": true}}
-	exported, err := s.CreateImportExport(ctx, p, prepared.ContractSnapshotID)
+	exported, err := s.CreateImportExport(ctx, p, prepared.ContractSnapshotID, "")
 	if err != nil || exported.Status != "SUCCEEDED" || exported.RowCount != 10001 || exported.ReceiptTotal != "10001.00" {
 		t.Fatalf("export=%+v err=%v", exported, err)
 	}
@@ -360,7 +360,10 @@ func TestImportExportBeyondTenThousand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	csvRows, err := csv.NewReader(bytes.NewReader(loaded.Content)).ReadAll()
+	if !bytes.HasPrefix(loaded.Content, []byte("\xef\xbb\xbf")) {
+		t.Fatal("reconciliation CSV missing UTF-8 BOM")
+	}
+	csvRows, err := csv.NewReader(bytes.NewReader(bytes.TrimPrefix(loaded.Content, []byte("\xef\xbb\xbf")))).ReadAll()
 	if err != nil || len(csvRows) != 10004 {
 		t.Fatalf("csv rows=%d err=%v", len(csvRows), err)
 	}
@@ -369,7 +372,7 @@ func TestImportExportBeyondTenThousand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	failed, err := s.CreateImportExport(ctx, p, prepared.ContractSnapshotID)
+	failed, err := s.CreateImportExport(ctx, p, prepared.ContractSnapshotID, "")
 	if err != nil || failed.Status != "FAILED" {
 		t.Fatalf("failed export=%+v err=%v", failed, err)
 	}
@@ -385,4 +388,66 @@ func TestImportExportBeyondTenThousand(t *testing.T) {
 		t.Fatalf("interrupted export=%+v err=%v", interrupted, err)
 	}
 
+}
+
+// TestImportExportIdempotency 验证导出重放键命中既有任务、空键仍新建且失败任务不被重试。
+// 参数：t为隔离MySQL测试上下文。
+// 返回值：无，重复建行、空键复用或失败任务被重建时失败。
+func TestImportExportIdempotency(t *testing.T) {
+	db, _ := invoiceArchiveMySQL(t)
+	ctx := context.Background()
+	s := &Service{DB: db, ContractImportEnabled: true}
+	in := importCommandFixture()
+	in.ExpectedFacts = []ExpectedImportFact{}
+	prepared, err := s.PrepareContractImport(ctx, in.TenantID, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := prepared.ContractSnapshotID
+	p := Principal{TenantID: in.TenantID, UserID: "finance", Permissions: map[string]bool{"settlement.admin": true}}
+	countRows := func() int {
+		t.Helper()
+		var count int
+		if err = db.QueryRow(`SELECT COUNT(*) FROM settlement_import_export WHERE tenant_id=? AND contract_snapshot_id=?`, in.TenantID, snapshot).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	first, err := s.CreateImportExport(ctx, p, snapshot, "reconcile-export-key")
+	if err != nil || first.Status != "SUCCEEDED" {
+		t.Fatalf("first export=%+v err=%v", first, err)
+	}
+	// 同键连续POST：返回同ID同状态，表里只有一行。
+	replayed, err := s.CreateImportExport(ctx, p, snapshot, "  reconcile-export-key  ")
+	if err != nil || replayed.ID != first.ID || replayed.Status != first.Status || replayed.SnapshotVersion != first.SnapshotVersion || replayed.RowCount != first.RowCount || replayed.ReceiptTotal != first.ReceiptTotal || replayed.AllocationTotal != first.AllocationTotal {
+		t.Fatalf("replayed export=%+v err=%v", replayed, err)
+	}
+	if count := countRows(); count != 1 {
+		t.Fatalf("keyed exports=%d", count)
+	}
+	// 空键（含纯空格）保持每次新建，不复用已有任务。
+	fresh, err := s.CreateImportExport(ctx, p, snapshot, "")
+	if err != nil || fresh.Status != "SUCCEEDED" || fresh.ID == first.ID {
+		t.Fatalf("empty key export=%+v err=%v", fresh, err)
+	}
+	again, err := s.CreateImportExport(ctx, p, snapshot, "   ")
+	if err != nil || again.Status != "SUCCEEDED" || again.ID == fresh.ID {
+		t.Fatalf("second empty key export=%+v err=%v", again, err)
+	}
+	// 模拟来源映射指向不存在的业务凭证：构建失败并持久FAILED。
+	if _, err = db.Exec(`INSERT INTO settlement_import_fact(tenant_id,contract_snapshot_id,source_system,fact_type,external_fact_id,request_hash,target_business_id,created_at) VALUES(?,?,'legacy','RECEIPT','MISSING',REPEAT('a',32),'missing',UTC_TIMESTAMP(3))`, in.TenantID, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := s.CreateImportExport(ctx, p, snapshot, "failing-export-key")
+	if err != nil || failed.Status != "FAILED" || failed.ErrorCode != "RECONCILIATION_EXPORT_FAILED" {
+		t.Fatalf("failed export=%+v err=%v", failed, err)
+	}
+	// 同键再次调用返回既有FAILED，不重试、不新建失败任务。
+	replayed, err = s.CreateImportExport(ctx, p, snapshot, "failing-export-key")
+	if err != nil || replayed.ID != failed.ID || replayed.Status != failed.Status || replayed.ErrorCode != failed.ErrorCode {
+		t.Fatalf("failed replay=%+v err=%v", replayed, err)
+	}
+	if count := countRows(); count != 4 {
+		t.Fatalf("exports after failed replay=%d", count)
+	}
 }

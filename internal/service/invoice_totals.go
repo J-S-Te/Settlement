@@ -50,8 +50,10 @@ type RequestMeta struct {
 
 type requestMetaKey struct{}
 
-// WithRequestMeta 由 HTTP 鉴权层在请求进入业务前写入。
-func enqueueCreditReversal(ctx context.Context, tx *sql.Tx, tenant, allocationID, receivableID string) (string, error) {
+// enqueueCreditReversal 保留冲销事实并仅在订阅时建立对外补偿投递。
+// 参数：ctx/tx 为事务，其余为财务坐标，subscribed 可选且默认保持旧行为。
+// 返回值：实际新补偿事件ID；未发送旧结清可准确取消但不伪造投递。
+func enqueueCreditReversal(ctx context.Context, tx *sql.Tx, tenant, allocationID, receivableID string, subscribed ...bool) (string, error) {
 	var originalEventID, eventType, status, settledAllocationID string
 	var payload []byte
 	err := tx.QueryRowContext(ctx, `SELECT completed.event_id,completed.event_type,completed.status,completed.allocation_id,completed.payload_json
@@ -74,6 +76,9 @@ func enqueueCreditReversal(ctx context.Context, tx *sql.Tx, tenant, allocationID
 	if status == "PENDING" || status == "RETRY_WAIT" {
 		_, err = tx.ExecContext(ctx, `UPDATE settlement_credit_sync SET status='CANCELLED',updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND event_id=? AND status IN ('PENDING','RETRY_WAIT')`, tenant, originalEventID)
 		return "", err
+	}
+	if len(subscribed) > 0 && !subscribed[0] {
+		return "", nil
 	}
 	var original struct {
 		CustomerID uint64 `json:"customer_id"`

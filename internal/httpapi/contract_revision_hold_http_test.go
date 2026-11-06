@@ -33,6 +33,9 @@ type revisionHoldPrincipal struct {
 	UserID      string
 	Roles       []string
 	Permissions []string
+	// ScopeType 为平台授权上下文返回的角色数据范围类型；空值保持 APPLICATION，
+	// 需要验证限制性范围（CONTRACT/PROJECT 等）时显式传入。
+	ScopeType string
 }
 
 // revisionHoldAuthHandler 构造绑定真实 OIDC 发现与授权上下文接口的结算入口。
@@ -58,12 +61,16 @@ func revisionHoldAuthHandler(t *testing.T, db *sql.DB, grant revisionHoldPrincip
 			http.Error(w, "denied", http.StatusForbidden)
 			return
 		}
+		scopeType := grant.ScopeType
+		if scopeType == "" {
+			scopeType = "APPLICATION"
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"sub": "qa-user", "subject_id": grant.UserID, "identity_id": grant.UserID,
 			"tenant_id": grant.TenantID, "client_id": "settlement-qa-web",
 			"application_code": "settlement", "environment_code": "test",
 			"roles": grant.Roles, "permissions": grant.Permissions,
-			"data_scopes":                   []map[string]string{{"role_code": grant.Roles[0], "scope_type": "APPLICATION"}},
+			"data_scopes":                   []map[string]string{{"role_code": grant.Roles[0], "scope_type": scopeType}},
 			"catalog_version":               "4",
 			"compatible_catalog_versions":   []string{"4"},
 			"role_config_hash":              "settlement-v4-contract-import",

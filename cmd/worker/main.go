@@ -60,9 +60,11 @@ func main() {
 		os.Exit(1)
 	}
 	// BIZ-XAPI-10：审计目的地按“显式开关 > 生产环境”判定，生产缺失即失败关闭；
+	// 显式开关由 config.AuditRequiredSwitch 读取（SETTLEMENT_AUDIT_REQUIRED 优先，
+	// 缺失时兼容平台统一键 PLATFORM_AUDIT_REQUIRED）。
 	// 通知目的地缺失只登记 degraded，不阻断 worker 启动，积压由 /readyz、/metrics 与扫描告警暴露。
 	auditRequired, auditRequiredErr := config.AuditDestinationRequired(
-		os.Getenv("SETTLEMENT_AUDIT_REQUIRED"),
+		config.AuditRequiredSwitch(),
 		os.Getenv("APP_ENV"),
 		environment,
 	)

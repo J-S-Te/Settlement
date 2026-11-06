@@ -52,6 +52,9 @@ type InvoiceFileGateway interface {
 // New 用途：按结算权限、责任范围和错误契约处理请求。
 // 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
 // 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
+// New 装配结算入口及显式财务来源，复用现有身份、授权和外部依赖。
+// 参数：db为自有库，cfg为运行配置，logger为日志，auth及两个机器验签器隔离入口，dependencies提供可选适配器。
+// 返回值：完整HTTP处理器；未配置依赖由各受保护入口明确拒绝。
 func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Authenticator, machine, taxMachine *platform.ServiceTokenVerifier, dependencies ...any) http.Handler {
 	var erp service.ERPProvider
 	var projectReferences service.ProjectReferenceResolver
@@ -88,6 +91,7 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 		}
 	}
 	api := &API{service: &service.Service{DB: db, CreditPublisher: publisher, ContractImportEnabled: cfg.ContractImportEnabled, InvoiceIssuanceMode: cfg.InvoiceIssuanceMode, TaxProviderCode: cfg.TaxProviderCode}, cfg: cfg, logger: logger, auth: auth, machine: machine, taxMachine: taxMachine, directory: directory, files: files}
+	api.service.ConfigureFinancialSources(cfg.NativeFinancialEnabled, cfg.CRMCreditSyncEnabled)
 	api.service.ERPProvider = erp
 	api.service.ProjectReferences = projectReferences
 	if roles, ok := directory.(service.RoleDirectory); ok {
@@ -171,7 +175,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a.serveContractImports(w, r) {
 		return
 	}
-	if a.serveRoleFinance(w, r) || a.serveRoleCollaboration(w, r) {
+	if a.serveNativeFinancial(w, r) || a.serveRoleFinance(w, r) || a.serveRoleCollaboration(w, r) {
 		return
 	}
 	switch {
@@ -609,6 +613,12 @@ func (a *API) integration(r *http.Request) (string, bool) {
 	return identity.TenantID, true
 }
 func (a *API) contractEvent(w http.ResponseWriter, r *http.Request) {
+	// 能力边界：合同联动未启用属于"能力不存在"（可选未购买/被停用），与认证
+	// 失败区分开，返回 404 与稳定错误码，避免发送方把未启用当成凭据错误重试。
+	if !a.cfg.IntegrationEnabled {
+		fail(w, http.StatusNotFound, "SETTLEMENT_CONTRACT_INTEGRATION_DISABLED", "合同联动未启用")
+		return
+	}
 	trustedTenant, ok := a.integration(r)
 	if !ok {
 		fail(w, http.StatusUnauthorized, "SETTLEMENT_MACHINE_UNAUTHENTICATED", "服务间令牌无效")
@@ -865,7 +875,7 @@ func (a *API) invoicedReceivablesTop10(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND cs.migration_state='RELEASED' AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.currency ASC,r.open_amount DESC,r.due_date ASC,r.id ASC LIMIT 10`, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,r.collection_status,r.invoice_status,cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.tenant_id=? AND cs.migration_state='RELEASED' AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.currency ASC,r.open_amount DESC,r.due_date ASC,r.id ASC LIMIT 10`, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -874,11 +884,12 @@ func (a *API) invoicedReceivablesTop10(w http.ResponseWriter, r *http.Request) {
 	items := []map[string]any{}
 	for rows.Next() {
 		var id, no, contract, customer, due, open, currency, collection, invoice string
-		if err := rows.Scan(&id, &no, &contract, &customer, &due, &open, &currency, &collection, &invoice); err != nil {
+		var basis financialBasisProjection
+		if err := rows.Scan(append([]any{&id, &no, &contract, &customer, &due, &open, &currency, &collection, &invoice}, basis.targets()...)...); err != nil {
 			respondError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"receivable_id": id, "receivable_no": no, "contract_no": contract, "customer_name": customer, "due_date": due, "open_amount": open, "currency": currency, "collection_status": collection, "invoice_status": invoice})
+		items = append(items, basis.decorate(map[string]any{"receivable_id": id, "receivable_no": no, "contract_no": contract, "customer_name": customer, "due_date": due, "open_amount": open, "currency": currency, "collection_status": collection, "invoice_status": invoice}))
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -909,8 +920,15 @@ func (a *API) createReportExport(w http.ResponseWriter, r *http.Request, reportT
 		return
 	}
 	if errors.Is(err, sql.ErrNoRows) {
+		// M-5：把申请人创建任务时的授权范围固化到任务行，worker 只认这份快照，
+		// 防止旧任务、在飞任务或申请人后续被缩权后仍按租户全量生成。
+		requesterScope, scopeErr := service.NewRequesterScope(p).Encode()
+		if scopeErr != nil {
+			respondError(w, scopeErr)
+			return
+		}
 		id = newRequestID()
-		_, err = a.service.DB.ExecContext(r.Context(), `INSERT INTO settlement_report_export_job(id,tenant_id,requested_by,report_type,idempotency_key,status,created_at,updated_at) VALUES(?,?,?,?,?,'PENDING',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, p.UserID, reportType, key)
+		_, err = a.service.DB.ExecContext(r.Context(), `INSERT INTO settlement_report_export_job(id,tenant_id,requested_by,requester_scope,report_type,idempotency_key,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'PENDING',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, p.UserID, requesterScope, reportType, key)
 	}
 	if err != nil {
 		respondError(w, err)
@@ -1001,7 +1019,7 @@ func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.queryScoped(r.Context(), p, "settlement.receivable.read", `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.tenant_id=? AND cs.migration_state='RELEASED' ORDER BY rp.due_date ASC,rp.id ASC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.receivable.read", `SELECT rp.id,cs.source_contract_no,cs.customer_name_snapshot,rp.installment_no,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,rp.confirmation_status,rp.version,cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_receivable_plan rp JOIN settlement_contract_snapshot cs ON cs.id=rp.contract_snapshot_id AND cs.tenant_id=rp.tenant_id WHERE rp.tenant_id=? AND cs.migration_state='RELEASED' ORDER BY rp.due_date ASC,rp.id ASC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1011,11 +1029,12 @@ func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, no, customer, due, planned, status string
 		var installment, version int
-		if err := rows.Scan(&id, &no, &customer, &installment, &due, &planned, &status, &version); err != nil {
+		var basis financialBasisProjection
+		if err := rows.Scan(append([]any{&id, &no, &customer, &installment, &due, &planned, &status, &version}, basis.targets()...)...); err != nil {
 			respondError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"id": id, "contract_no": no, "customer_name": customer, "installment_no": installment, "due_date": due, "planned_amount": planned, "status": status, "version": version})
+		items = append(items, basis.decorate(map[string]any{"id": id, "contract_no": no, "customer_name": customer, "installment_no": installment, "due_date": due, "planned_amount": planned, "status": status, "version": version}))
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -1073,13 +1092,16 @@ func (a *API) planCoverage(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]any{"items": items})
 }
 
+// receiptMatches 按客户、币种和原排序返回可核销应收并明确财务来源。
+// 参数：w/r 为经过原认证、许可及范围门禁的HTTP请求。
+// 返回值：无；匹配结果保留真实合同编号并追加本地依据元数据。
 func (a *API) receiptMatches(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.allocation.confirm")
 	if !ok {
 		return
 	}
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/receipts/"), "/matches")
-	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,LEAST(r.open_amount,rc.unallocated_amount),CASE WHEN r.open_amount=rc.unallocated_amount THEN 100 WHEN r.open_amount>rc.unallocated_amount THEN 80 ELSE 70 END FROM settlement_receipt rc JOIN settlement_receivable r ON r.tenant_id=rc.tenant_id AND r.currency=rc.currency JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id AND cs.customer_id=rc.customer_id WHERE rc.id=? AND rc.tenant_id=? AND rc.unallocated_amount>0 AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY 9 DESC,r.due_date ASC,r.id ASC LIMIT 20`, id, p.TenantID)
+	rows, err := a.service.DB.QueryContext(r.Context(), `SELECT r.id,r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.open_amount,r.currency,LEAST(r.open_amount,rc.unallocated_amount),CASE WHEN r.open_amount=rc.unallocated_amount THEN 100 WHEN r.open_amount>rc.unallocated_amount THEN 80 ELSE 70 END,cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_receipt rc JOIN settlement_receivable r ON r.tenant_id=rc.tenant_id AND r.currency=rc.currency JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id AND cs.customer_id=rc.customer_id WHERE rc.id=? AND rc.tenant_id=? AND rc.unallocated_amount>0 AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY 9 DESC,r.due_date ASC,r.id ASC LIMIT 20`, id, p.TenantID)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1089,11 +1111,12 @@ func (a *API) receiptMatches(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var receivableID, no, contract, customer, due, open, currency, suggested string
 		var score int
-		if err := rows.Scan(&receivableID, &no, &contract, &customer, &due, &open, &currency, &suggested, &score); err != nil {
+		var basis financialBasisProjection
+		if err := rows.Scan(append([]any{&receivableID, &no, &contract, &customer, &due, &open, &currency, &suggested, &score}, basis.targets()...)...); err != nil {
 			respondError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"receivable_id": receivableID, "receivable_no": no, "contract_no": contract, "customer_name": customer, "due_date": due, "open_amount": open, "currency": currency, "suggested_amount": suggested, "score": score})
+		items = append(items, basis.decorate(map[string]any{"receivable_id": receivableID, "receivable_no": no, "contract_no": contract, "customer_name": customer, "due_date": due, "open_amount": open, "currency": currency, "suggested_amount": suggested, "score": score}))
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -1130,7 +1153,7 @@ func (a *API) listReceivables(w http.ResponseWriter, r *http.Request, invoiceEli
 		like := "%" + keyword + "%"
 		args = append(args, like, like, like)
 	}
-	query := `SELECT r.id,r.receivable_no,r.contract_snapshot_id,cs.source_contract_no,cs.customer_id,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,r.collection_status,r.invoice_status,r.version, r.original_amount-r.invoiced_amount-COALESCE((SELECT SUM(a.reserved_amount-a.invoiced_amount-a.released_amount) FROM settlement_invoice_request_allocation a WHERE a.tenant_id=r.tenant_id AND a.receivable_id=r.id AND a.status='RESERVED'),0) FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE ` + strings.Join(where, " AND ") + ` ORDER BY r.due_date ASC,r.id ASC LIMIT ? OFFSET ?`
+	query := `SELECT r.id,r.receivable_no,r.contract_snapshot_id,cs.source_contract_no,cs.customer_id,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,r.collection_status,r.invoice_status,r.version, r.original_amount-r.invoiced_amount-COALESCE((SELECT SUM(a.reserved_amount-a.invoiced_amount-a.released_amount) FROM settlement_invoice_request_allocation a WHERE a.tenant_id=r.tenant_id AND a.receivable_id=r.id AND a.status='RESERVED'),0),cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE ` + strings.Join(where, " AND ") + ` ORDER BY r.due_date ASC,r.id ASC LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 	rows, err := a.queryScoped(r.Context(), p, permission, query, args...)
 	if err != nil {
@@ -1142,11 +1165,12 @@ func (a *API) listReceivables(w http.ResponseWriter, r *http.Request, invoiceEli
 	for rows.Next() {
 		var id, no, snapshot, contract, customerID, customer, due, original, open, currency, collection, invoice, invoiceable string
 		var version int
-		if err := rows.Scan(&id, &no, &snapshot, &contract, &customerID, &customer, &due, &original, &open, &currency, &collection, &invoice, &version, &invoiceable); err != nil {
+		var basis financialBasisProjection
+		if err := rows.Scan(append([]any{&id, &no, &snapshot, &contract, &customerID, &customer, &due, &original, &open, &currency, &collection, &invoice, &version, &invoiceable}, basis.targets()...)...); err != nil {
 			respondError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"id": id, "receivable_no": no, "contract_snapshot_id": snapshot, "contract_no": contract, "customer_id": customerID, "customer_name": customer, "due_date": due, "original_amount": original, "open_amount": open, "invoiceable_amount": invoiceable, "currency": currency, "collection_status": collection, "invoice_status": invoice, "version": version})
+		items = append(items, basis.decorate(map[string]any{"id": id, "receivable_no": no, "contract_snapshot_id": snapshot, "contract_no": contract, "customer_id": customerID, "customer_name": customer, "due_date": due, "original_amount": original, "open_amount": open, "invoiceable_amount": invoiceable, "currency": currency, "collection_status": collection, "invoice_status": invoice, "version": version}))
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -1226,7 +1250,12 @@ func (a *API) createReceipt(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
-	write(w, http.StatusCreated, map[string]string{"id": id})
+	// 回款号是用户下一步核销/对账要抄走的凭据：登记成功后一并返回，
+	// 否则前端提示里只能拿到内部 ID（或什么都没有）。
+	no := ""
+	_ = a.service.DB.QueryRowContext(r.Context(),
+		`SELECT receipt_no FROM settlement_receipt WHERE tenant_id=? AND id=?`, p.TenantID, id).Scan(&no)
+	write(w, http.StatusCreated, map[string]string{"id": id, "receipt_no": no})
 }
 func (a *API) createAllocation(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.allocation.confirm")
@@ -1408,7 +1437,7 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.rejection_reason,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),COALESCE((SELECT ia.channel FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_code FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_message FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE(sr.special_reason,''),COALESCE(sr.threshold_snapshot,''),COALESCE(sr.settings_version,0) FROM settlement_invoice_request ir LEFT JOIN settlement_invoice_special_review sr ON sr.invoice_request_id=ir.id AND sr.tenant_id=ir.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? AND cs.migration_state='RELEASED' ORDER BY ir.created_at DESC,ir.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ir.id,ir.request_no,cs.source_contract_no,ir.buyer_profile_snapshot,ir.invoice_type,ir.amount_excl_tax,ir.tax_amount,ir.amount_incl_tax,ir.status,ir.submitted_by,ir.approved_by,ir.rejection_reason,ir.version,ir.created_at,(SELECT COUNT(DISTINCT ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),(SELECT MIN(ii.tax_rate) FROM settlement_invoice_request_item ii WHERE ii.tenant_id=ir.tenant_id AND ii.invoice_request_id=ir.id),COALESCE((SELECT ia.channel FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_code FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE((SELECT ia.failure_message FROM settlement_invoice_issue_attempt ia WHERE ia.tenant_id=ir.tenant_id AND ia.invoice_request_id=ir.id ORDER BY ia.attempt_no DESC,ia.requested_at DESC LIMIT 1),''),COALESCE(sr.special_reason,''),COALESCE(sr.threshold_snapshot,''),COALESCE(sr.settings_version,0),cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_invoice_request ir LEFT JOIN settlement_invoice_special_review sr ON sr.invoice_request_id=ir.id AND sr.tenant_id=ir.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ir.tenant_id=? AND cs.migration_state='RELEASED' ORDER BY ir.created_at DESC,ir.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1424,7 +1453,8 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 		var taxRateCount int
 		var version int
 		var created any
-		if err := rows.Scan(&id, &no, &contract, &buyer, &kind, &excl, &tax, &incl, &status, &submitted, &approved, &rejectionReason, &version, &created, &taxRateCount, &taxRate, &issueChannel, &failureCode, &failureMessage, &specialReason, &thresholdSnapshot, &settingsVersion); err != nil {
+		var basis financialBasisProjection
+		if err := rows.Scan(append([]any{&id, &no, &contract, &buyer, &kind, &excl, &tax, &incl, &status, &submitted, &approved, &rejectionReason, &version, &created, &taxRateCount, &taxRate, &issueChannel, &failureCode, &failureMessage, &specialReason, &thresholdSnapshot, &settingsVersion}, basis.targets()...)...); err != nil {
 			respondError(w, err)
 			return
 		}
@@ -1432,7 +1462,7 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 		if !taxNumberVisible {
 			buyerTaxNo = ""
 		}
-		items = append(items, map[string]any{"id": id, "request_no": no, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "tax_rate_display": taxRateDisplay(taxRate.String, taxRateCount), "status": status, "submitted_by": submitted, "approved_by": approved, "rejection_reason": rejectionReason, "version": version, "created_at": created, "issue_channel": issueChannel, "failure_code": failureCode, "failure_message": failureMessage, "special_reason": specialReason, "threshold_snapshot": thresholdSnapshot, "settings_version": settingsVersion})
+		items = append(items, basis.decorate(map[string]any{"id": id, "request_no": no, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "tax_rate_display": taxRateDisplay(taxRate.String, taxRateCount), "status": status, "submitted_by": submitted, "approved_by": approved, "rejection_reason": rejectionReason, "version": version, "created_at": created, "issue_channel": issueChannel, "failure_code": failureCode, "failure_message": failureMessage, "special_reason": specialReason, "threshold_snapshot": thresholdSnapshot, "settings_version": settingsVersion}))
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -1463,7 +1493,7 @@ func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST", err.Error())
 		return
 	}
-	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,COALESCE((SELECT rf.status FROM settlement_invoice_red_flush_request rf WHERE rf.tenant_id=ti.tenant_id AND rf.original_invoice_id=ti.id ORDER BY rf.created_at DESC LIMIT 1),'') FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.tenant_id=? AND cs.migration_state='RELEASED' ORDER BY ti.issue_date DESC,ti.created_at DESC,ti.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.invoice.read", `SELECT ti.id,ti.invoice_request_id,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.invoice_type,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,COALESCE((SELECT rf.status FROM settlement_invoice_red_flush_request rf WHERE rf.tenant_id=ti.tenant_id AND rf.original_invoice_id=ti.id ORDER BY rf.created_at DESC LIMIT 1),''),cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.tenant_id=? AND cs.migration_state='RELEASED' ORDER BY ti.issue_date DESC,ti.created_at DESC,ti.id DESC LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -1473,7 +1503,8 @@ func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, requestID, code, number, contract, kind, amount, issueDate, status, channel, redFlushStatus string
 		var buyer []byte
-		if err := rows.Scan(&id, &requestID, &code, &number, &contract, &buyer, &kind, &amount, &issueDate, &status, &channel, &redFlushStatus); err != nil {
+		var basis financialBasisProjection
+		if err := rows.Scan(append([]any{&id, &requestID, &code, &number, &contract, &buyer, &kind, &amount, &issueDate, &status, &channel, &redFlushStatus}, basis.targets()...)...); err != nil {
 			respondError(w, err)
 			return
 		}
@@ -1481,7 +1512,7 @@ func (a *API) listTaxInvoices(w http.ResponseWriter, r *http.Request) {
 		if !taxNumberVisible {
 			buyerTaxNo = ""
 		}
-		items = append(items, map[string]any{"id": id, "invoice_request_id": requestID, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_incl_tax": amount, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "red_flush_status": redFlushStatus})
+		items = append(items, basis.decorate(map[string]any{"id": id, "invoice_request_id": requestID, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "invoice_type": kind, "amount_incl_tax": amount, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "red_flush_status": redFlushStatus}))
 	}
 	if err := rows.Err(); err != nil {
 		respondError(w, err)
@@ -1607,7 +1638,8 @@ func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	var invoiceID, requestID, requestNo, code, number, contract, kind, excl, tax, incl, issueDate, status, channel string
 	var buyer, seller []byte
-	err := a.service.DB.QueryRowContext(r.Context(), `SELECT ti.id,ti.invoice_request_id,ir.request_no,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.seller_profile_snapshot,ti.invoice_type,ti.amount_excl_tax,ti.tax_amount,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.id=? AND ti.tenant_id=?`, id, p.TenantID).Scan(&invoiceID, &requestID, &requestNo, &code, &number, &contract, &buyer, &seller, &kind, &excl, &tax, &incl, &issueDate, &status, &channel)
+	var basis financialBasisProjection
+	err := a.service.DB.QueryRowContext(r.Context(), `SELECT ti.id,ti.invoice_request_id,ir.request_no,ti.invoice_code,ti.invoice_no,cs.source_contract_no,ti.buyer_profile_snapshot,ti.seller_profile_snapshot,ti.invoice_type,ti.amount_excl_tax,ti.tax_amount,ti.amount_incl_tax,DATE_FORMAT(ti.issue_date,'%Y-%m-%d'),ti.status,ti.issued_by_channel,cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_tax_invoice ti JOIN settlement_invoice_request ir ON ir.id=ti.invoice_request_id AND ir.tenant_id=ti.tenant_id JOIN settlement_contract_snapshot cs ON cs.id=ir.contract_snapshot_id AND cs.tenant_id=ir.tenant_id WHERE ti.id=? AND ti.tenant_id=?`, id, p.TenantID).Scan(append([]any{&invoiceID, &requestID, &requestNo, &code, &number, &contract, &buyer, &seller, &kind, &excl, &tax, &incl, &issueDate, &status, &channel}, basis.targets()...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		fail(w, http.StatusNotFound, "TAX_INVOICE_NOT_FOUND", "发票不存在")
 		return
@@ -1679,7 +1711,7 @@ func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 	if redErr == nil {
 		redFlush = map[string]any{"id": redFlushID, "status": redFlushStatus, "reason_detail": redFlushReason, "review_reason": redFlushReviewReason, "version": redFlushVersion, "can_review": redFlushStatus == "SUBMITTED" && redFlushRequestedBy != p.UserID && p.Allows("settlement.invoice.approve")}
 	}
-	write(w, http.StatusOK, map[string]any{"id": invoiceID, "invoice_request_id": requestID, "request_no": requestNo, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "seller_name": sellerName, "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "document_count": len(documents), "documents": documents, "red_flush_request": redFlush, "items": invoiceDetailLinePayloads(items), "items_source": itemsSource, "request_items": invoiceDetailLinePayloads(requestLines)})
+	write(w, http.StatusOK, basis.decorate(map[string]any{"id": invoiceID, "invoice_request_id": requestID, "request_no": requestNo, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "seller_name": sellerName, "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "document_count": len(documents), "documents": documents, "red_flush_request": redFlush, "items": invoiceDetailLinePayloads(items), "items_source": itemsSource, "request_items": invoiceDetailLinePayloads(requestLines)}))
 }
 
 func (a *API) uploadInvoiceDocument(w http.ResponseWriter, r *http.Request) {
@@ -2234,7 +2266,10 @@ func (a *API) user(w http.ResponseWriter, r *http.Request, permission string) (s
 		return p, false
 	}
 	switch permission {
-	case "settlement.receipt.record", "settlement.receipt.read", "settlement.allocation.read", "settlement.allocation.confirm", "settlement.allocation.reverse", "settlement.invoice.approve", "settlement.invoice.issue", "settlement.invoice.special_approve", "settlement.settings.manage", "settlement.collaboration.manage":
+	// M-5：报表读取与导出按整个租户聚合/落盘，无法用合同责任谓词裁剪
+	// （报表角色不在 ContractPredicate 的按责任角色目录内，硬套谓词会把报表整片清空）。
+	// 因此与回款、核销、开票等财务操作同等要求全范围授权，限制性范围角色直接 403。
+	case "settlement.receipt.record", "settlement.receipt.read", "settlement.allocation.read", "settlement.allocation.confirm", "settlement.allocation.reverse", "settlement.invoice.approve", "settlement.invoice.issue", "settlement.invoice.special_approve", "settlement.settings.manage", "settlement.collaboration.manage", "settlement.report.read", "settlement.report.export":
 		if !p.Unrestricted(permission) {
 			fail(w, http.StatusForbidden, "SETTLEMENT_FORBIDDEN", "当前角色的数据范围不允许执行此财务操作")
 			return p, false
@@ -2264,8 +2299,13 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 // respondError 将真实业务错误映射为稳定HTTP契约，包括明确的历史恢复阻塞。
 // 参数：w为响应，err为业务错误。
 // 返回值：无，错误响应写入HTTP。
+// respondError 将业务拒绝映射为稳定HTTP错误，不泄露内部存储细节。
+// 参数：w为响应写入器，err为服务层返回的错误。
+// 返回值：无；输出可识别的错误码和用户提示。
 func respondError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, service.ErrCreditSyncNotSubscribed):
+		fail(w, http.StatusConflict, "CREDIT_SYNC_NOT_SUBSCRIBED", "CRM信用联动未订阅，未发起投递，历史记录保留待核对")
 	case errors.Is(err, service.ErrProjectReferenceMismatch):
 		// 权威项目服务在同一版本更换了合同/客户：已对账映射不被静默覆盖，
 		// 返回可识别的冲突码要求人工核对，而不是通用“记录已变化”。

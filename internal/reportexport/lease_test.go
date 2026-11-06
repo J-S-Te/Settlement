@@ -116,8 +116,9 @@ func TestCompensationOfOldGenerationCannotReleaseNewGenerationFile(t *testing.T)
 	defer db.Close()
 	g := &recordingGateway{fileIDs: []string{"file-old", "file-new"}, retireFileID: "file-old"}
 	w := &Worker{DB: db, TenantID: "tenant", Gateway: g, GatewayApplicationID: "settlement", WorkerID: "worker", GatewayMode: "required"}
+	requesterScope := unrestrictedRequesterScope(t, "user")
 	for _, generation := range []uint64{7, 8} {
-		if err := w.generate(context.Background(), job{id: "job1", tenantID: "tenant", reportType: InvoicedReceivablesCSV, generation: generation}); err != nil {
+		if err := w.generate(context.Background(), job{id: "job1", tenantID: "tenant", reportType: InvoicedReceivablesCSV, generation: generation, requestedBy: "user", requesterScope: requesterScope}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -141,7 +142,7 @@ func TestExpiredLeaseDoesNotUploadOrBind(t *testing.T) {
 	defer db.Close()
 	g := &recordingGateway{}
 	w := &Worker{DB: db, TenantID: "tenant", WorkerID: "worker", Gateway: g, GatewayMode: "required", GatewayApplicationID: "settlement"}
-	w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", reportType: InvoicedReceivablesCSV})
+	w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", reportType: InvoicedReceivablesCSV, requestedBy: "user", requesterScope: unrestrictedRequesterScope(t, "user")})
 	if g.uploads != 0 || g.binds != 0 {
 		t.Fatalf("expired lease performed gateway side effects: uploads=%d binds=%d", g.uploads, g.binds)
 	}
@@ -218,7 +219,7 @@ func TestGenerateFilenameIsStableForIdenticalRetry(t *testing.T) {
 	db := sql.OpenDB(d)
 	defer db.Close()
 	w := &Worker{DB: db, TenantID: "tenant", WorkerID: "worker"}
-	w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", reportType: InvoicedReceivablesCSV})
+	w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", reportType: InvoicedReceivablesCSV, requestedBy: "user", requesterScope: unrestrictedRequesterScope(t, "user")})
 	var filename string
 	for i, q := range d.execs {
 		if strings.Contains(q, "SET status='READY'") {
@@ -241,7 +242,7 @@ func TestZeroRowPublicationLeavesRecoverableIntent(t *testing.T) {
 	defer db.Close()
 	g := &recordingGateway{}
 	w := &Worker{DB: db, TenantID: "tenant", WorkerID: "worker", Gateway: g, GatewayMode: "required", GatewayApplicationID: "settlement"}
-	err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", reportType: InvoicedReceivablesCSV, generation: 7})
+	err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", reportType: InvoicedReceivablesCSV, generation: 7, requestedBy: "user", requesterScope: unrestrictedRequesterScope(t, "user")})
 	if !errors.Is(err, errLeaseLost) {
 		t.Fatalf("zero-row publication must report lost lease, got %v", err)
 	}
@@ -329,9 +330,9 @@ func TestCompensationFailureDoesNotStarveNewExports(t *testing.T) {
 		if strings.Contains(q, "SELECT id,tenant_id,report_type,lease_generation") {
 			claims++
 			if claims == 1 {
-				return &exportRows{columns: 4, values: [][]driver.Value{{"new-job", "tenant", InvoicedReceivablesCSV, int64(0)}}}, nil
+				return &exportRows{columns: 6, values: [][]driver.Value{{"new-job", "tenant", InvoicedReceivablesCSV, int64(0), "user", unrestrictedRequesterScope(t, "user")}}}, nil
 			}
-			return &exportRows{columns: 4}, nil
+			return &exportRows{columns: 6}, nil
 		}
 		return &exportRows{columns: 9}, nil
 	}}
@@ -367,7 +368,7 @@ func TestLeaseLostAfterUploadDoesNotBindOrPublish(t *testing.T) {
 	defer db.Close()
 	g := &recordingGateway{}
 	w := &Worker{DB: db, TenantID: "tenant", WorkerID: "worker", Gateway: g, GatewayMode: "required", GatewayApplicationID: "settlement"}
-	err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", generation: 7})
+	err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", generation: 7, requestedBy: "user", requesterScope: unrestrictedRequesterScope(t, "user")})
 	if !errors.Is(err, errLeaseLost) || g.uploads != 1 || g.binds != 0 {
 		t.Fatalf("lost lease continued gateway work: err=%v uploads=%d binds=%d", err, g.uploads, g.binds)
 	}
@@ -386,7 +387,7 @@ func TestGatewayFailureRetainsIntentAndRequiredOrDualBehavior(t *testing.T) {
 			defer db.Close()
 			g := &recordingGateway{bindErr: errors.New("bind response lost")}
 			w := &Worker{DB: db, TenantID: "tenant", WorkerID: "worker", Gateway: g, GatewayMode: mode, GatewayApplicationID: "settlement"}
-			err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", generation: 7})
+			err := w.generate(context.Background(), job{id: "job-1", tenantID: "tenant", generation: 7, requestedBy: "user", requesterScope: unrestrictedRequesterScope(t, "user")})
 			if (mode == "required") != (err != nil) {
 				t.Fatalf("mode=%s error=%v", mode, err)
 			}
