@@ -90,12 +90,16 @@ func (r *taxDetailRows) Next(dest []driver.Value) error {
 	return nil
 }
 
+// taxDetailHeaderRow 构造保留原票头列及明确合同来源的持久化夹具。
+// 参数：id/requestID/requestNo/code/number为单据标识，kind为票种，excl/tax/incl为金额，status/channel为状态及渠道。
+// 返回值：原票头列后追加依据类型、本地ID/编号/版本及客户命名空间。
 func taxDetailHeaderRow(id, requestID, requestNo, code, number, kind, excl, tax, incl, status, channel string) []driver.Value {
 	buyer, _ := json.Marshal(map[string]any{"name": "客户", "tax_no": "91330000"})
 	seller, _ := json.Marshal(map[string]any{"name": "销方"})
 	return []driver.Value{
 		id, requestID, requestNo, code, number, "HT-1", buyer, seller,
 		kind, excl, tax, incl, "2026-10-18", status, channel,
+		"CONTRACT", "", "", int64(0), "legacy",
 	}
 }
 
@@ -126,9 +130,15 @@ func taxDetailQueries(header []driver.Value, invoiceItems, requestItems [][]driv
 
 type taxDetailResponse struct {
 	Data struct {
-		AmountInclTax string `json:"amount_incl_tax"`
-		ItemsSource   string `json:"items_source"`
-		Items         []struct {
+		AmountInclTax        string `json:"amount_incl_tax"`
+		ContractNo           string `json:"contract_no"`
+		BasisType            string `json:"basis_type"`
+		LocalDocumentID      string `json:"local_document_id"`
+		LocalDocumentNo      string `json:"local_document_no"`
+		LocalDocumentVersion int    `json:"local_document_version"`
+		CustomerNamespace    string `json:"customer_namespace"`
+		ItemsSource          string `json:"items_source"`
+		Items                []struct {
 			LineNo        int    `json:"line_no"`
 			ItemName      string `json:"item_name"`
 			AmountExclTax string `json:"amount_excl_tax"`
@@ -231,5 +241,30 @@ func TestRedTaxInvoiceWithoutIssuedItemsIsRejected(t *testing.T) {
 	response := requestTaxInvoiceDetail(t, "INV-RED", taxDetailQueries(header, nil, requested))
 	if response.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// TestTaxInvoiceDetailPreservesFinancialBasis 验证真实详情响应明确区分合同与本地依据。
+// 参数：t 为测试上下文。
+// 返回值：无；合同列被本地编号覆盖、来源丢失或票面金额变化时失败。
+func TestTaxInvoiceDetailPreservesFinancialBasis(t *testing.T) {
+	for _, local := range []bool{false, true} {
+		t.Run(map[bool]string{false: "contract", true: "local"}[local], func(t *testing.T) {
+			header := taxDetailHeaderRow("INV-1", "REQ-1", "IR-1", "BLUE", "B-1", "VAT_SPECIAL", "100.00", "6.00", "106.00", "ISSUED", "MANUAL")
+			contract, kind, id, no, namespace, version := "HT-1", "CONTRACT", "", "", "legacy", 0
+			if local {
+				contract, kind, id, no, namespace, version = "", "LOCAL_FINANCIAL", "local-id", "FB-1", "settlement_local", 1
+			}
+			header[5], header[15], header[16], header[17], header[18], header[19] = contract, kind, id, no, int64(version), namespace
+			stored := [][]driver.Value{taxDetailItemRow(1, "票面服务", "30101", "100.00", "0.060000", "6.00", "106.00")}
+			response := requestTaxInvoiceDetail(t, "INV-1", taxDetailQueries(header, stored, stored))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			body := decodeTaxDetail(t, response)
+			if body.Data.ContractNo != contract || body.Data.BasisType != kind || body.Data.LocalDocumentID != id || body.Data.LocalDocumentNo != no || body.Data.LocalDocumentVersion != version || body.Data.CustomerNamespace != namespace || body.Data.AmountInclTax != "106.00" {
+				t.Fatalf("source=%+v", body.Data)
+			}
+		})
 	}
 }

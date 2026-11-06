@@ -95,13 +95,15 @@ func TestContractRevisionHoldMigrationIsIdempotentAndAuditable(t *testing.T) {
 	}
 }
 
-// TestReportExportRequesterScopeMigrationFailsClosed 验证报表任务的范围快照迁移。
-// 参数：t 为测试上下文，核对 JSON NULL 列、不回填及历史任务失败关闭。
+// TestReportExportRequesterScopeMigrationFailsClosed 验证 M-5 迁移为导出任务增加
+// 申请人范围快照列：JSON NULL、紧跟 requested_by、不回填也不设默认值，
+// 使历史任务在 worker 侧保持失败关闭。
+// 参数：t 为测试上下文。
 // 返回值：无；列定义、位置或回填语义不符时失败。
 func TestReportExportRequesterScopeMigrationFailsClosed(t *testing.T) {
 	const name = "000026_report_export_requester_scope.sql"
 	if !strings.HasPrefix(name, "000026") {
-		t.Fatal("M-5 迁移必须接在现有最大编号 000025 之后")
+		t.Fatal("M-5 迁移为已发布 026（mainline），本地 baseline 顺延为 027")
 	}
 	body, err := Files.ReadFile(name)
 	if err != nil {

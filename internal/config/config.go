@@ -32,6 +32,7 @@ type Config struct {
 	MySQLDSN                     string
 	DevelopmentAuth              bool
 	IntegrationEnabled           bool
+	NativeFinancialEnabled       bool
 	IntegrationBearerToken       string
 	OutboxWorkerEnabled          bool
 	OutboxWorkerBatchSize        int
@@ -150,9 +151,9 @@ func isProductionEnvironmentCode(value string) bool {
 // Load 用途：读取并校验结算启动配置，拒绝不完整的项目引用机器身份。
 // 参数：无，从进程环境读取配置。
 // 返回值：返回经校验配置及配置错误，不输出凭据。
-// Load 从实际环境加载结算配置，新历史导入入口严格布尔且默认关闭。
-// 参数：无。
-// 返回值：校验后的配置，环境值或依赖配置错误返回错误。
+// Load 读取结算配置，按显式能力验证独立机器身份与本地财务开关。
+// 参数：无；从进程环境读取。
+// 返回值：有效配置；缺失身份或非法设置时返回错误。
 func Load() (Config, error) {
 	trustedProxies, trustedErr := parseTrustedProxies(env("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128"))
 	if trustedErr != nil {
@@ -244,6 +245,9 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("SETTLEMENT_DEVELOPMENT_AUTH=true is forbidden when SETTLEMENT_PUBLIC_ORIGIN is a public non-loopback origin: development auth bypasses every settlement authentication check")
 		}
 	}
+	if c.NativeFinancialEnabled, err = boolEnv("SETTLEMENT_NATIVE_FINANCIAL_ENABLED", false); err != nil {
+		return c, err
+	}
 	if c.IntegrationEnabled, err = boolEnv("SETTLEMENT_INTEGRATION_ENABLED", false); err != nil {
 		return c, err
 	}
@@ -291,7 +295,18 @@ func Load() (Config, error) {
 	if c.HTTPAddress == "" || c.MySQLDSN == "" {
 		return c, fmt.Errorf("SETTLEMENT_HTTP_ADDR and SETTLEMENT_MYSQL_DSN are required")
 	}
-	if c.PlatformMachineTokenPublicKeyPath != "" || c.PlatformMachineTokenIssuer != "" || c.ContractOAuthClientID != "" || c.ContractApplicationID != "" || c.ContractEnvironmentID != "" {
+	// 原生财务模式（SETTLEMENT_NATIVE_FINANCIAL_ENABLED=true 且合同集成关闭）下
+	// 不允许残留合同集成身份：半套残留会让后续集成启用难以核对，也要把明确的
+	// 模式冲突与"缺机器验签材料"区分开。原生+集成同开的共存模式仍合法，本地
+	// 基线与合同事实按 basis_type 并存，不受本检查影响。
+	if c.NativeFinancialEnabled && !c.IntegrationEnabled {
+		for name, value := range map[string]string{"CONTRACT_INTEGRATION_CLIENT_ID": c.ContractClientID, "CONTRACT_INTEGRATION_AUDIENCE": c.ContractAudience, "CONTRACT_INTEGRATION_OAUTH_CLIENT_ID": c.ContractOAuthClientID, "CONTRACT_INTEGRATION_APPLICATION_ID": c.ContractApplicationID, "CONTRACT_INTEGRATION_ENVIRONMENT_ID": c.ContractEnvironmentID} {
+			if value != "" {
+				return c, fmt.Errorf("%s must be empty in native financial mode (SETTLEMENT_NATIVE_FINANCIAL_ENABLED=true with SETTLEMENT_INTEGRATION_ENABLED=false); clear the leftover contract identity or re-enable settlement integration", name)
+			}
+		}
+	}
+	if (c.IntegrationEnabled && !c.DevelopmentAuth) || c.ContractClientID != "" || c.ContractAudience != "" || c.ContractOAuthClientID != "" || c.ContractApplicationID != "" || c.ContractEnvironmentID != "" {
 		if c.DevelopmentAuth {
 			return c, fmt.Errorf("platform machine tokens require production authentication")
 		}

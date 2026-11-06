@@ -3,8 +3,10 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"math/big"
 	"strconv"
@@ -23,13 +25,39 @@ type ImportExport struct {
 	Content         []byte `json:"-"`
 }
 
+// importExportRetentionDays 是暂存对账导出可下载内容的保留期；到期后只保留任务摘要。
+// 与报表导出的 7 天保留语义一致，避免导出文件字节永久占用数据库。
+const importExportRetentionDays = 7
+
+// purgeExpiredImportExports 用途：按租户清理超过保留期的对账导出字节并标记过期。
+// 参数：ctx 为上下文，tenant 为可信租户。
+// 返回值：清理语句失败时返回错误；只影响本租户已成功且仍持有内容的到期行。
+//
+// 语义：不新增过期时间列，用 created_at 判定保留期；清空内容并把任务置为 EXPIRED，
+// 使下载继续走“非 SUCCEEDED → 409”，绝不返回空成功文件；未到期任务与其它租户不受影响。
+func (s *Service) purgeExpiredImportExports(ctx context.Context, tenant string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE settlement_import_export SET content=NULL,status='EXPIRED',error_code='EXPORT_EXPIRED' WHERE tenant_id=? AND status='SUCCEEDED' AND content IS NOT NULL AND created_at<DATE_SUB(UTC_TIMESTAMP(3),INTERVAL ? DAY)`, tenant, importExportRetentionDays)
+	return err
+}
+
 // CreateImportExport 为授权财务建立可查询的持久导出，失败不会生成空成功文件。
-// 参数：ctx为上下文，p为可信财务主体，snapshot为本地导入快照。
-// 返回值：已生成或持久失败状态；授权及创建失败返回错误。
-func (s *Service) CreateImportExport(ctx context.Context, p Principal, snapshot string) (ImportExport, error) {
+// 参数：ctx为上下文，p为可信财务主体，snapshot为本地导入快照，idempotencyKey为可选重放键。
+// 返回值：已生成、持久失败或同键既有任务；授权及创建失败返回错误。
+func (s *Service) CreateImportExport(ctx context.Context, p Principal, snapshot, idempotencyKey string) (ImportExport, error) {
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
 	result := ImportExport{ID: newID(), Status: "PENDING"}
 	if err := financeAccess(p, "settlement.import.reconcile"); err != nil {
 		return result, err
+	}
+	// 新建前先执行到期清理：同一租户的旧导出不会再被查询时才过期，
+	// 清理失败按内部错误失败关闭，不继续生成新文件。
+	if err := s.purgeExpiredImportExports(ctx, p.TenantID); err != nil {
+		return result, err
+	}
+	// 重放键与租户、快照、申请人共同派生稳定主键：重复提交命中同一行，
+	// 相同键换租户或快照也不会互相复用任务；空键仍按随机主键每次新建。
+	if idempotencyKey != "" {
+		result.ID = importExportID(p.TenantID, snapshot, p.UserID, idempotencyKey)
 	}
 	var exists int
 	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM settlement_contract_import WHERE tenant_id=? AND contract_snapshot_id=?`, p.TenantID, snapshot).Scan(&exists); err != nil {
@@ -40,6 +68,14 @@ func (s *Service) CreateImportExport(ctx context.Context, p Principal, snapshot 
 	}
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO settlement_import_export(id,tenant_id,contract_snapshot_id,requested_by,status,created_at) VALUES(?,?,?,?,'PENDING',UTC_TIMESTAMP(3))`, result.ID, p.TenantID, snapshot, p.UserID)
 	if err != nil {
+		if idempotencyKey != "" && mysqlDuplicate(err) {
+			// 同键任务已存在：原样返回既有状态（含已失败），不重建、不重试。
+			if existing, found, findErr := s.findImportExport(ctx, p.TenantID, snapshot, result.ID); findErr != nil {
+				return result, findErr
+			} else if found {
+				return existing, nil
+			}
+		}
 		return result, err
 	}
 	err = s.buildImportExport(ctx, p.TenantID, snapshot, &result)
@@ -54,6 +90,29 @@ func (s *Service) CreateImportExport(ctx context.Context, p Principal, snapshot 
 		}
 	}
 	return result, nil
+}
+
+// importExportID 由租户、快照、申请人和重放键派生稳定主键，满足表CHAR(32)且不跨范围复用。
+// 参数：tenant为租户，snapshot为导入快照，user为申请人，key为非空重放键。
+// 返回值：摘要hex前32位的大写主键。
+func importExportID(tenant, snapshot, user, key string) string {
+	digest := sha256.Sum256([]byte(tenant + "\x00" + snapshot + "\x00" + user + "\x00" + key))
+	return strings.ToUpper(hex.EncodeToString(digest[:]))[:32]
+}
+
+// findImportExport 按租户、快照和主键读取既有任务摘要，内容不在POST返回所以不查大字段。
+// 参数：ctx为上下文，tenant为租户，snapshot为快照，id为导出任务。
+// 返回值：任务摘要、是否存在及存储错误。
+func (s *Service) findImportExport(ctx context.Context, tenant, snapshot, id string) (ImportExport, bool, error) {
+	var result ImportExport
+	err := s.DB.QueryRowContext(ctx, `SELECT id,status,snapshot_version,row_count,receipt_total,allocation_total,error_code FROM settlement_import_export WHERE tenant_id=? AND contract_snapshot_id=? AND id=?`, tenant, snapshot, id).Scan(&result.ID, &result.Status, &result.SnapshotVersion, &result.RowCount, &result.ReceiptTotal, &result.AllocationTotal, &result.ErrorCode)
+	if err == sql.ErrNoRows {
+		return ImportExport{}, false, nil
+	}
+	if err != nil {
+		return ImportExport{}, false, err
+	}
+	return result, true, nil
 }
 
 // buildImportExport 在共用快照锁下导出全部来源映射，核对总行数和业务金额后发布。
@@ -80,6 +139,8 @@ func (s *Service) buildImportExport(ctx context.Context, tenant, snapshot string
 		return err
 	}
 	var buffer bytes.Buffer
+	// 与报表导出 CSV 保持一致：Excel 中文环境需要 UTF-8 BOM 才会按 UTF-8 解析。
+	buffer.WriteString("\xef\xbb\xbf")
 	writer := csv.NewWriter(&buffer)
 	if err = writer.Write([]string{"来源系统", "事实类型", "来源事实ID", "目标业务ID", "金额", "币种"}); err != nil {
 		rows.Close()
@@ -182,6 +243,8 @@ func importCSVCell(value string) string {
 }
 
 // GetImportExport 查询持久导出状态及已发布内容，保持暂存财务范围隔离。
+// 过期的PENDING只在返回值上标记中断，不写库，避免与仍在构建的线程互相覆盖。
+// 超过保留期的成功导出在查询前清空内容并标记 EXPIRED，下载因此按冲突拒绝。
 // 参数：ctx为上下文，p为可信财务主体，snapshot为快照，id为导出任务。
 // 返回值：完整状态及成功文件；越权、缺失或存储故障返回错误。
 func (s *Service) GetImportExport(ctx context.Context, p Principal, snapshot, id string) (ImportExport, error) {
@@ -189,13 +252,22 @@ func (s *Service) GetImportExport(ctx context.Context, p Principal, snapshot, id
 	if err := financeAccess(p, "settlement.import.reconcile"); err != nil {
 		return result, err
 	}
-	_, err := s.DB.ExecContext(ctx, `UPDATE settlement_import_export SET status='FAILED',error_code='EXPORT_PROCESS_INTERRUPTED',finished_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND contract_snapshot_id=? AND id=? AND status='PENDING' AND created_at<DATE_SUB(UTC_TIMESTAMP(3),INTERVAL 5 MINUTE)`, p.TenantID, snapshot, id)
-	if err != nil {
+	if err := s.purgeExpiredImportExports(ctx, p.TenantID); err != nil {
 		return result, err
 	}
-	err = s.DB.QueryRowContext(ctx, `SELECT id,status,snapshot_version,row_count,receipt_total,allocation_total,error_code,content FROM settlement_import_export WHERE tenant_id=? AND contract_snapshot_id=? AND id=?`, p.TenantID, snapshot, id).Scan(&result.ID, &result.Status, &result.SnapshotVersion, &result.RowCount, &result.ReceiptTotal, &result.AllocationTotal, &result.ErrorCode, &result.Content)
+	var createdAt time.Time
+	err := s.DB.QueryRowContext(ctx, `SELECT id,status,snapshot_version,row_count,receipt_total,allocation_total,error_code,content,created_at FROM settlement_import_export WHERE tenant_id=? AND contract_snapshot_id=? AND id=?`, p.TenantID, snapshot, id).Scan(&result.ID, &result.Status, &result.SnapshotVersion, &result.RowCount, &result.ReceiptTotal, &result.AllocationTotal, &result.ErrorCode, &result.Content, &createdAt)
 	if err == sql.ErrNoRows {
 		return result, ErrNotFound
 	}
-	return result, err
+	if err != nil {
+		return result, err
+	}
+	// 仅把超时未完成的PENDING显示为中断：构建线程随后仍可按PENDING提交，
+	// 下一次查询即可看到SUCCEEDED，任务内容不会被查询动作改写为失败。
+	if result.Status == "PENDING" && createdAt.Before(time.Now().UTC().Add(-5*time.Minute)) {
+		result.Status = "FAILED"
+		result.ErrorCode = "EXPORT_PROCESS_INTERRUPTED"
+	}
+	return result, nil
 }

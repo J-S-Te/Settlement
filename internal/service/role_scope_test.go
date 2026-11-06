@@ -40,8 +40,8 @@ func TestRolePermissionIsRequired(t *testing.T) {
 	}
 }
 
-// TestUnrestrictedRequiresWholeTenantReportScope 验证报表读取/导出只在APPLICATION / ENVIRONMENT
-// /TENANT 范围下视为全范围授权。
+// TestUnrestrictedRequiresWholeTenantReportScope 验证报表读取/导出只在
+// APPLICATION / ENVIRONMENT / TENANT 范围下视为全范围授权。
 // 参数：t 为测试上下文。
 // 返回值：无，受限报表角色被判为全范围或缺失权限被放行时失败。
 func TestUnrestrictedRequiresWholeTenantReportScope(t *testing.T) {
@@ -75,8 +75,8 @@ func TestUnrestrictedRequiresWholeTenantReportScope(t *testing.T) {
 	}
 }
 
-// TestRequesterScopeSnapshotRoundTripsAuthorizationOnly 验证导出任务保存的申请人范围快照只含范围
-// 判定字段、与回构主体等价，且不携带身份证明细与IP。
+// TestRequesterScopeSnapshotRoundTripsAuthorizationOnly 验证导出任务保存的申请人
+// 范围快照只含范围判定字段、与回构主体等价，且不携带身份证明细与IP。
 // 参数：t 为测试上下文。
 // 返回值：无，快照泄漏敏感字段、丢失授权语义或回构不可重复时失败。
 func TestRequesterScopeSnapshotRoundTripsAuthorizationOnly(t *testing.T) {
@@ -130,8 +130,8 @@ func TestRequesterScopeSnapshotRoundTripsAuthorizationOnly(t *testing.T) {
 	}
 }
 
-// TestDecodeRequesterScopeRejectsMissingOrMalformedSnapshot 验证空值与非法JSON无法回构为可放行的
-// 范围，调用方必须据此失败关闭。
+// TestDecodeRequesterScopeRejectsMissingOrMalformedSnapshot 验证空值与非法JSON
+// 无法回构为可放行的范围，调用方必须据此失败关闭。
 // 参数：t 为测试上下文。
 // 返回值：无，空值/非法JSON被静默接受时失败。
 func TestDecodeRequesterScopeRejectsMissingOrMalformedSnapshot(t *testing.T) {

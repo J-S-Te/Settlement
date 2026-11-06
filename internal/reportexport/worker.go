@@ -71,6 +71,11 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 		limit = 5
 	}
 	var failures []error
+	// 每轮先清理已过期的导出字节，再处理补偿与认领；
+	// 清理失败不影响本轮继续认领，但会随其它失败一并上报。
+	if err := w.purgeExpiredContent(ctx); err != nil {
+		failures = append(failures, err)
+	}
 	if err := w.reconcileEffects(ctx, limit); err != nil {
 		failures = append(failures, err)
 	}
@@ -96,7 +101,7 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 // 参数：ctx为导出上下文，tenantID为绑定租户。
 // 返回值：完整CSV；查询或编码失败返回错误。
 func (w *Worker) csv(ctx context.Context, tenantID string) ([]byte, error) {
-	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE cs.migration_state='RELEASED' AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.open_amount DESC,r.due_date ASC,r.id ASC`, tenantID)
+	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,r.collection_status,r.invoice_status,cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE cs.migration_state='RELEASED' AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 AND r.invoice_status<>'NOT_INVOICED' ORDER BY r.open_amount DESC,r.due_date ASC,r.id ASC`, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -104,11 +109,11 @@ func (w *Worker) csv(ctx context.Context, tenantID string) ([]byte, error) {
 	var buffer bytes.Buffer
 	buffer.Write([]byte{0xEF, 0xBB, 0xBF})
 	writer := csv.NewWriter(&buffer)
-	if err := writer.Write([]string{"应收单号", "合同号", "客户", "到期日", "原始应收金额", "未回款金额", "币种", "回款状态", "开票状态"}); err != nil {
+	if err := writer.Write([]string{"应收单号", "合同号", "客户", "到期日", "原始应收金额", "未回款金额", "币种", "回款状态", "开票状态", "依据类型", "本地依据ID", "本地依据编号", "本地依据版本", "客户命名空间"}); err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var values [9]string
+		var values [14]string
 		pointers := make([]any, len(values))
 		for i := range values {
 			pointers[i] = &values[i]
@@ -152,7 +157,7 @@ func (w *Worker) agingCSV(ctx context.Context, tenantID string) ([]byte, error) 
 	today := businessclock.Today()
 	args := append([]any{today}, bucketArgs...)
 	args = append(args, tenantID)
-	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,GREATEST(TIMESTAMPDIFF(DAY,r.due_date,?),0),`+bucket+`,r.collection_status,r.invoice_status FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE cs.migration_state='RELEASED' AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY r.due_date ASC,r.id ASC`, args...)
+	rows, err := w.DB.QueryContext(ctx, `SELECT r.receivable_no,cs.source_contract_no,cs.customer_name_snapshot,DATE_FORMAT(r.due_date,'%Y-%m-%d'),r.original_amount,r.open_amount,r.currency,GREATEST(TIMESTAMPDIFF(DAY,r.due_date,?),0),`+bucket+`,r.collection_status,r.invoice_status,cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE cs.migration_state='RELEASED' AND r.tenant_id=? AND r.recognition_status='CONFIRMED' AND r.open_amount>0 ORDER BY r.due_date ASC,r.id ASC`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -160,11 +165,11 @@ func (w *Worker) agingCSV(ctx context.Context, tenantID string) ([]byte, error) 
 	var buffer bytes.Buffer
 	buffer.Write([]byte{0xEF, 0xBB, 0xBF})
 	writer := csv.NewWriter(&buffer)
-	if err := writer.Write([]string{"应收单号", "合同号", "客户", "到期日", "原始应收金额", "未回款金额", "币种", "逾期天数", "账龄区间", "回款状态", "开票状态"}); err != nil {
+	if err := writer.Write([]string{"应收单号", "合同号", "客户", "到期日", "原始应收金额", "未回款金额", "币种", "逾期天数", "账龄区间", "回款状态", "开票状态", "依据类型", "本地依据ID", "本地依据编号", "本地依据版本", "客户命名空间"}); err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var values [11]string
+		var values [16]string
 		pointers := make([]any, len(values))
 		for i := range values {
 			pointers[i] = &values[i]

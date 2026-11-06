@@ -23,6 +23,16 @@ func outbox(ctx context.Context, tx *sql.Tx, tenant, destination, eventType, agg
 			payload = envelope
 		}
 	}
+	// AUD-IP-2026：来源地址必须在序列化前富化，审计 detail 与 outbox payload
+	// 共用同一份富化后的 body；否则审计缺少地址，平台只能拿投递连接地址冒充。
+	// 平台据此区分登录地址、操作地址与投递地址。
+	var auditDetail map[string]any
+	if destination == "PLATFORM_AUDIT" {
+		if value, ok := payload.(map[string]any); ok {
+			enrichAuditIP(value, ctx)
+			auditDetail = value
+		}
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -32,18 +42,19 @@ func outbox(ctx context.Context, tx *sql.Tx, tenant, destination, eventType, agg
 		return err
 	}
 	if destination == "PLATFORM_AUDIT" {
-		// AUD-IP-2026：审计 detail 必须携带三类来源地址，平台据此区分
-		// 登录地址、操作地址与投递地址，而不是拿投递连接地址冒充用户地址。
-		if value, ok := payload.(map[string]any); ok {
-			enrichAuditIP(value, ctx)
-		}
 		actor := "SYSTEM"
-		if value, ok := payload.(map[string]any); ok {
-			if v, ok := value["actor_id"].(string); ok && v != "" {
+		// 本地审计 result 与平台侧同源：取 payload 的 result，缺省才 SUCCESS；
+		// 硬编码 SUCCESS 会把失败操作伪装成成功。
+		result := "SUCCESS"
+		if auditDetail != nil {
+			if v, ok := auditDetail["actor_id"].(string); ok && v != "" {
 				actor = v
 			}
+			if v, ok := auditDetail["result"].(string); ok && v != "" {
+				result = v
+			}
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO settlement_audit_event(id,tenant_id,actor_id,action,resource_type,resource_id,result,reason_code,request_id,correlation_id,detail_json,occurred_at) VALUES(?,?,?,?,?,?,'SUCCESS','',?,?,?,UTC_TIMESTAMP(3))`, newID(), tenant, actor, eventType, aggregateType, aggregateID, id, id, body)
+		_, err = tx.ExecContext(ctx, `INSERT INTO settlement_audit_event(id,tenant_id,actor_id,action,resource_type,resource_id,result,reason_code,request_id,correlation_id,detail_json,occurred_at) VALUES(?,?,?,?,?,?,?,'',?,?,?,UTC_TIMESTAMP(3))`, newID(), tenant, actor, eventType, aggregateType, aggregateID, result, id, id, body)
 	}
 	return err
 }

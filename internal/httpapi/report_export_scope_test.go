@@ -14,8 +14,8 @@ import (
 	"github.com/j-s-te/settlement/internal/testutil/scriptdb"
 )
 
-// reportScopeGrant 返回报表入口的在线授权：财务经理角色目录内同时具备报表读取与导出能力，可由
-// scopeType 控制是否受合同/项目范围限制。
+// reportScopeGrant 返回报表入口的在线授权：财务经理角色目录内同时具备
+// 报表读取与导出能力，可由 scopeType 控制是否受合同/项目范围限制。
 // 参数：scopeType 为平台返回的数据范围类型。
 // 返回值：可直接交给真实 OIDC 会话测试基建的授权元数据。
 func reportScopeGrant(scopeType string) revisionHoldPrincipal {
@@ -28,8 +28,8 @@ func reportScopeGrant(scopeType string) revisionHoldPrincipal {
 	}
 }
 
-// TestReportEndpointsRejectRestrictedDataScope 验证 M-5：数据范围受限的主体即使持有报表读取/导出
-// 权限，也被 7 个报表入口统一 403，且拒绝发生在任何业务查询之前。
+// TestReportEndpointsRejectRestrictedDataScope 验证 M-5：数据范围受限的主体即使持有
+// 报表读取/导出权限，也被 7 个报表入口统一 403，且拒绝发生在任何业务查询之前。
 // 参数：t 为测试上下文。
 // 返回值：无；任一入口非 403、错误码不符或触达业务SQL时失败。
 func TestReportEndpointsRejectRestrictedDataScope(t *testing.T) {
@@ -63,8 +63,8 @@ func TestReportEndpointsRejectRestrictedDataScope(t *testing.T) {
 	}
 }
 
-// TestReportDashboardAllowsApplicationDataScope 验证 APPLICATION 范围主体仍可读取看板，租户边界取
-// 自可信会话而不是客户端声明。
+// TestReportDashboardAllowsApplicationDataScope 验证 APPLICATION 范围主体仍可读取
+// 看板，租户边界取自可信会话而不是客户端声明。
 // 参数：t 为测试上下文。
 // 返回值：无；非 200 或租户绑定不符时失败。
 func TestReportDashboardAllowsApplicationDataScope(t *testing.T) {
@@ -93,8 +93,8 @@ func TestReportDashboardAllowsApplicationDataScope(t *testing.T) {
 	}
 }
 
-// TestReportExportCreationSnapshotsRequesterScope 验证创建导出任务时把申请人的授权范围快照写入任
-// 务行，且快照不含租户、身份证明细和IP。
+// TestReportExportCreationSnapshotsRequesterScope 验证创建导出任务时把申请人的
+// 授权范围快照写入任务行，且快照不含租户、身份证明细和IP。
 // 参数：t 为测试上下文。
 // 返回值：无；未写入快照、快照字段不符或响应非 202 时失败。
 func TestReportExportCreationSnapshotsRequesterScope(t *testing.T) {

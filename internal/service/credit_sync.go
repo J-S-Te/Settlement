@@ -33,6 +33,9 @@ func insertCreditSyncEvent(ctx context.Context, tx *sql.Tx, tenant, eventID, all
 // 参数：ctx为上下文，tenant/eventID为可信租户及目标信用事件。
 // 返回值：同步结果错误；历史暂存事件不会对外发送。
 func (s *Service) RetryCreditSync(ctx context.Context, tenant, eventID string) error {
+	if !s.creditSubscribed() {
+		return ErrCreditSyncNotSubscribed
+	}
 	if s.CreditPublisher == nil {
 		return errors.New("CRM credit publisher is not configured")
 	}

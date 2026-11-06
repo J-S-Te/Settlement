@@ -11,8 +11,8 @@ import (
 	"github.com/j-s-te/settlement/internal/service"
 )
 
-// unrestrictedRequesterScope 返回测试用的全范围申请人快照：结算财务经理在TENANT 范围持有
-// settlement.report.export，与创建任务时写入仓库的快照同构。
+// unrestrictedRequesterScope 返回测试用的全范围申请人快照：结算财务经理在
+// TENANT 范围持有 settlement.report.export，与创建任务时写入仓库的快照同构。
 // 参数：t 为测试上下文，userID 为申请人。
 // 返回值：requester_scope JSON 列值；编码失败即失败。
 func unrestrictedRequesterScope(t *testing.T, userID string) []byte {
@@ -67,8 +67,8 @@ func failedMessages(t *testing.T, d *exportDB) ([]string, []string) {
 	return messages, jobs
 }
 
-// TestGenerateFailsClosedWithoutUnrestrictedRequesterScope 验证申请人范围快照缺失、编码非法、申请
-// 人与任务归属不一致或仅有限范围时，任务被置为 FAILED 且不生成文件。
+// TestGenerateFailsClosedWithoutUnrestrictedRequesterScope 验证申请人范围快照缺失、
+// 编码非法、申请人与任务归属不一致或仅有限范围时，任务被置为 FAILED 且不生成文件。
 // 参数：t 为测试上下文。
 // 返回值：无；生成文件、错误码不可识别或原因不可读时失败。
 func TestGenerateFailsClosedWithoutUnrestrictedRequesterScope(t *testing.T) {
@@ -137,8 +137,8 @@ func TestGeneratePublishesWithUnrestrictedRequesterScope(t *testing.T) {
 	}
 }
 
-// TestRunOnceSkipsBadScopeJobAndKeepsBatchMoving 验证一条历史无快照任务被置为 FAILED 后，同批后续
-// 合法任务仍正常生成，坏任务不会卡住整个导出队列。
+// TestRunOnceSkipsBadScopeJobAndKeepsBatchMoving 验证一条历史无快照任务被置为 FAILED 后，
+// 同批后续合法任务仍正常生成，坏任务不会卡住整个导出队列。
 // 参数：t 为测试上下文。
 // 返回值：无；批处理中断、合法任务未发布或失败原因不可读时失败。
 func TestRunOnceSkipsBadScopeJobAndKeepsBatchMoving(t *testing.T) {

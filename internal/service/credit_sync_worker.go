@@ -15,6 +15,7 @@ import (
 // 租约过期后被重新接管，同时防止第二个工作器并发发送
 // 相同事件。
 type CreditSyncWorker struct {
+	SubscriptionDisabled bool
 	DB                   *sql.DB
 	Publisher            CreditEventPublisher
 	BatchSize            int
@@ -30,7 +31,13 @@ type claimedCreditEvent struct {
 	payload  []byte
 }
 
+// RunOnce 只在真实订阅与许可有效时领取信用积压。
+// 参数：ctx 为取消与许可上下文。
+// 返回值：执行错误；停订阅保持历史行不变，不假标成功。
 func (w *CreditSyncWorker) RunOnce(ctx context.Context) error {
+	if w != nil && w.SubscriptionDisabled {
+		return nil
+	}
 	if w == nil || w.DB == nil {
 		return errors.New("credit sync worker database is not configured")
 	}

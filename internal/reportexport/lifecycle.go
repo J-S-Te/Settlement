@@ -258,10 +258,9 @@ func (w *Worker) fail(ctx context.Context, item job, stage string, cause error) 
 }
 
 // failWithMessage 用途：在持有有效租约时把任务置为 FAILED 并写入面向申请人的可读原因。
-// 参数：ctx为上下文，item为已认领任务，stage为失败阶段，message为申请人可读原因，cause为内部原因
-// 。
-// 返回值：任务确实置为 FAILED 时返回带阶段与内部原因的聚合错误；租约已丢失或状态不是本代次
-// PROCESSING 时返回实际错误，绝不覆盖新代次。
+// 参数：ctx为上下文，item为已认领任务，stage为失败阶段，message为申请人可读原因，cause为内部原因。
+// 返回值：任务确实置为 FAILED 时返回带阶段与内部原因的聚合错误；
+// 租约已丢失或状态不是本代次 PROCESSING 时返回实际错误，绝不覆盖新代次。
 func (w *Worker) failWithMessage(ctx context.Context, item job, stage, message string, cause error) error {
 	slog.ErrorContext(ctx, "report export job failed", "job_id", item.id, "stage", stage, "error_type", fmt.Sprintf("%T", cause))
 	result, err := w.DB.ExecContext(ctx, `UPDATE settlement_report_export_job SET status='FAILED',error_message=?,locked_by='',locked_until=NULL,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=? AND status='PROCESSING' AND locked_by=? AND lease_generation=? AND locked_until>UTC_TIMESTAMP(3)`, message, item.id, item.tenantID, w.WorkerID, item.generation)
@@ -273,8 +272,8 @@ func (w *Worker) failWithMessage(ctx context.Context, item job, stage, message s
 
 // checkRequesterScope 用途：按任务行保存的申请人范围快照判定是否允许全租户导出。
 // 参数：item 为已认领任务，含 requested_by 与 requester_scope 原始列值。
-// 返回值：快照缺失、JSON 非法、申请人不一致或回构后不再具备全范围导出能力时返回错误，调用方必须失
-// 败关闭，绝不按租户全量生成。
+// 返回值：快照缺失、JSON 非法、申请人不一致或回构后不再具备全范围导出能力时返回错误，
+// 调用方必须失败关闭，绝不按租户全量生成。
 func checkRequesterScope(item job) error {
 	scope, err := service.DecodeRequesterScope(item.requesterScope)
 	if err != nil {

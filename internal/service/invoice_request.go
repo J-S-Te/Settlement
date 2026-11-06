@@ -28,7 +28,16 @@ func (s *Service) CreateInvoiceRequest(ctx context.Context, p Principal, key str
 	if textTooLong(in.SpecialReason, 500) {
 		return "", ErrInvalid
 	}
-	buyer, _ := json.Marshal(in.BuyerProfile)
+	// 买方身份与发票要素由服务端受控校验，不再把客户端 JSON 原样入库/透传税控。
+	buyerProfile, err := normalizeInvoiceProfile(in.BuyerProfile, buyerProfileFields, "buyer_profile")
+	if err != nil {
+		return "", err
+	}
+	invoiceType, err := normalizeInvoiceType(in.InvoiceType)
+	if err != nil {
+		return "", err
+	}
+	buyer, _ := json.Marshal(buyerProfile)
 	normalized, excl, tax, incl, err := normalizeInvoiceItems(in.Items)
 	if err != nil {
 		return "", err
@@ -64,15 +73,19 @@ func (s *Service) CreateInvoiceRequest(ctx context.Context, p Principal, key str
 		Items              []InvoiceItemInput       `json:"items"`
 		Allocations        []InvoiceAllocationInput `json:"allocations"`
 		SpecialReason      string                   `json:"special_reason"`
-	}{in.ContractSnapshotID, buyer, in.InvoiceType, normalized, in.Allocations, in.SpecialReason}
+	}{in.ContractSnapshotID, buyer, invoiceType, normalized, in.Allocations, in.SpecialReason}
 	if existing, replay, claimErr := claimIdempotency(ctx, tx, p.TenantID, createInvoiceRequestCommand, key, id, idempotencyRequest); claimErr != nil {
 		return "", claimErr
 	} else if replay {
 		return existing, nil
 	}
-	var snapshot string
-	if err = tx.QueryRowContext(ctx, `SELECT id FROM settlement_contract_snapshot WHERE id=? AND tenant_id=? AND financial_status='EFFECTIVE'`, in.ContractSnapshotID, p.TenantID).Scan(&snapshot); err != nil {
+	// 客户一致性取自同事务内已生效的合同快照：buyer_profile 不能声明别的客户。
+	var snapshot, snapshotCustomer string
+	if err = tx.QueryRowContext(ctx, `SELECT id,customer_id FROM settlement_contract_snapshot WHERE id=? AND tenant_id=? AND financial_status='EFFECTIVE'`, in.ContractSnapshotID, p.TenantID).Scan(&snapshot, &snapshotCustomer); err != nil {
 		return "", ErrInvalid
+	}
+	if err = requireBuyerProfileCustomer(buyerProfile, snapshotCustomer); err != nil {
+		return "", err
 	}
 	for _, allocation := range in.Allocations {
 		reserved := allocation.ReservedAmount
@@ -84,7 +97,7 @@ func (s *Service) CreateInvoiceRequest(ctx context.Context, p Principal, key str
 			return "", ErrConflict
 		}
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_invoice_request(id,tenant_id,request_no,contract_snapshot_id,buyer_profile_snapshot,invoice_type,amount_excl_tax,tax_amount,amount_incl_tax,status,idempotency_key,submitted_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'SUBMITTED',?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, "IR-"+id[:12], in.ContractSnapshotID, buyer, in.InvoiceType, excl.FloatString(2), tax.FloatString(2), incl.FloatString(2), key, p.UserID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_invoice_request(id,tenant_id,request_no,contract_snapshot_id,buyer_profile_snapshot,invoice_type,amount_excl_tax,tax_amount,amount_incl_tax,status,idempotency_key,submitted_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'SUBMITTED',?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, p.TenantID, "IR-"+id[:12], in.ContractSnapshotID, buyer, invoiceType, excl.FloatString(2), tax.FloatString(2), incl.FloatString(2), key, p.UserID)
 	if err != nil {
 		if mysqlDuplicate(err) {
 			var existing string

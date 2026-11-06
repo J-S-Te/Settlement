@@ -25,6 +25,20 @@ func (s *Service) ReverseAllocation(ctx context.Context, p Principal, key, alloc
 		return "", err
 	}
 	defer tx.Rollback()
+	id := newID()
+	// 冲销的幂等键绑定请求内容：同 key 改金额或原因不得回放旧成功。
+	// 先认领再读取原核销状态，保证同内容重试在原单已变化后仍返回首次结果。
+	idempotencyRequest := struct {
+		AllocationID string `json:"allocation_id"`
+		Amount       string `json:"amount"`
+		ReasonCode   string `json:"reason_code"`
+		ReasonDetail string `json:"reason_detail"`
+	}{allocationID, value, in.ReasonCode, in.ReasonDetail}
+	if existing, replay, claimErr := claimIdempotency(ctx, tx, p.TenantID, "REVERSE_RECEIPT_ALLOCATION", key, id, idempotencyRequest); claimErr != nil {
+		return "", claimErr
+	} else if replay {
+		return existing, nil
+	}
 	var receiptID, receivableID, currency, confirmedBy, allocated, reversed string
 	err = tx.QueryRowContext(ctx, `SELECT a.receipt_id,a.receivable_id,a.currency,a.confirmed_by,a.allocated_amount,COALESCE((SELECT SUM(r.reversed_amount) FROM settlement_receipt_allocation_reversal r WHERE r.original_allocation_id=a.id),0) FROM settlement_receipt_allocation a WHERE a.id=? AND a.tenant_id=? AND a.status IN('CONFIRMED','PARTIALLY_REVERSED') FOR UPDATE`, allocationID, p.TenantID).Scan(&receiptID, &receivableID, &currency, &confirmedBy, &allocated, &reversed)
 	if err != nil {
@@ -44,14 +58,12 @@ func (s *Service) ReverseAllocation(ctx context.Context, p Principal, key, alloc
 	if decimalGreater(value, remaining.FloatString(2)) {
 		return "", ErrConflict
 	}
-	id := newID()
 	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_receipt_allocation_reversal(id,tenant_id,reversal_no,original_allocation_id,reversed_amount,reason_code,reason_detail,approved_by,reversed_at,idempotency_key) VALUES(?,?,?,?,?,?,?,?,UTC_TIMESTAMP(3),?)`, id, p.TenantID, "RV-"+id[:12], allocationID, value, in.ReasonCode, in.ReasonDetail, p.UserID, key)
 	if err != nil {
 		if mysqlDuplicate(err) {
-			var existing string
-			if e := tx.QueryRowContext(ctx, `SELECT id FROM settlement_receipt_allocation_reversal WHERE tenant_id=? AND idempotency_key=?`, p.TenantID, key).Scan(&existing); e == nil {
-				return existing, nil
-			}
+			// 幂等记录不存在而冲销表已占用同 key：可能是本次改动前的历史行，
+			// 无法核对内容，按冲突返回，不伪装成首次成功。
+			return "", fmt.Errorf("%w: idempotency key was used before request binding", ErrConflict)
 		}
 		return "", err
 	}
@@ -99,7 +111,7 @@ func (s *Service) ReverseAllocation(ctx context.Context, p Principal, key, alloc
 	}
 	var reversalCreditEventID string
 	if settledBeforeReversal {
-		reversalCreditEventID, err = enqueueCreditReversal(ctx, tx, p.TenantID, allocationID, receivableID)
+		reversalCreditEventID, err = enqueueCreditReversal(ctx, tx, p.TenantID, allocationID, receivableID, s.creditSubscribed())
 		if err != nil {
 			return "", err
 		}

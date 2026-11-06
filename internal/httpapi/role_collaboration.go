@@ -112,9 +112,9 @@ func (a *API) contractResponsibility(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusAccepted, map[string]any{"accepted": true, "event_id": event.EventID, "applied": changed})
 }
 
-// contractReferences 用途：返回当前责任范围内的合同选择项。
+// contractReferences 用途：返回当前责任范围内的合同及明确本地来源的财务依据选择项。
 // 参数：w为响应，r为包含分页参数的当前会话请求。
-// 返回值：无，仅返回可见合同，不接受客户端扩大范围。
+// 返回值：无；保留合同编号及责任语义，补充本地元数据，不接受客户端扩大范围。
 func (a *API) contractReferences(w http.ResponseWriter, r *http.Request) {
 	p, ok := a.user(w, r, "settlement.receivable.read")
 	if !ok {
@@ -125,7 +125,7 @@ func (a *API) contractReferences(w http.ResponseWriter, r *http.Request) {
 		respondError(w, service.ErrInvalid)
 		return
 	}
-	rows, err := a.queryScoped(r.Context(), p, "settlement.receivable.read", `SELECT cs.id,cs.source_contract_no,cs.customer_id,cs.customer_name_snapshot,cs.project_id,cs.currency,cs.contract_amount,COALESCE(cr.owner_user_id,'') FROM settlement_contract_snapshot cs LEFT JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE WHERE cs.tenant_id=? AND cs.financial_status='EFFECTIVE' ORDER BY cs.updated_at DESC,cs.id LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
+	rows, err := a.queryScoped(r.Context(), p, "settlement.receivable.read", `SELECT cs.id,cs.source_contract_no,cs.customer_id,cs.customer_name_snapshot,cs.project_id,cs.currency,cs.contract_amount,COALESCE(cr.owner_user_id,''),cs.basis_type,COALESCE(cs.local_document_id,''),COALESCE(cs.local_document_no,''),COALESCE(cs.local_document_version,0),cs.customer_namespace FROM settlement_contract_snapshot cs LEFT JOIN settlement_contract_responsibility cr ON cr.tenant_id=cs.tenant_id AND cr.source_contract_id=cs.source_contract_id AND cr.active=TRUE WHERE cs.tenant_id=? AND cs.financial_status='EFFECTIVE' ORDER BY cs.updated_at DESC,cs.id LIMIT ? OFFSET ?`, p.TenantID, limit, offset)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -134,11 +134,12 @@ func (a *API) contractReferences(w http.ResponseWriter, r *http.Request) {
 	items := []map[string]any{}
 	for rows.Next() {
 		var id, no, customer, name, project, currency, amount, owner string
-		if err = rows.Scan(&id, &no, &customer, &name, &project, &currency, &amount, &owner); err != nil {
+		var basis financialBasisProjection
+		if err = rows.Scan(append([]any{&id, &no, &customer, &name, &project, &currency, &amount, &owner}, basis.targets()...)...); err != nil {
 			respondError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"id": id, "contract_no": no, "customer_id": customer, "customer_name": name, "project_id": project, "currency": currency, "contract_amount": amount, "owner_user_id": owner})
+		items = append(items, basis.decorate(map[string]any{"id": id, "contract_no": no, "customer_id": customer, "customer_name": name, "project_id": project, "currency": currency, "contract_amount": amount, "owner_user_id": owner}))
 	}
 	if err = rows.Err(); err != nil {
 		respondError(w, err)

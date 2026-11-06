@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 )
 
 func (s *Service) RegisterManualInvoice(ctx context.Context, p Principal, requestID string, in ManualInvoiceInput) (string, error) {
@@ -17,10 +16,24 @@ func (s *Service) RegisterManualInvoice(ctx context.Context, p Principal, reques
 	if err != nil {
 		return "", err
 	}
-	if _, err = time.Parse("2006-01-02", in.IssueDate); err != nil {
-		return "", ErrInvalid
+	// 票号与开票日期都来自客户端人工登记：长度/字符白名单、北京业务日上界
+	// 必须服务端判定，不能只靠前端表单。
+	if err = validateInvoiceDocumentNumber(code, "invoice_code"); err != nil {
+		return "", err
 	}
-	seller, _ := json.Marshal(in.SellerProfile)
+	if err = validateInvoiceDocumentNumber(no, "invoice_no"); err != nil {
+		return "", err
+	}
+	issueDate, err := validateInvoiceIssueDate(in.IssueDate)
+	if err != nil {
+		return "", err
+	}
+	// 销售方档案同样按白名单受控，拒绝任意键写入票面快照。
+	sellerProfile, err := normalizeInvoiceProfile(in.SellerProfile, sellerProfileFields, "seller_profile")
+	if err != nil {
+		return "", err
+	}
+	seller, _ := json.Marshal(sellerProfile)
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
@@ -40,7 +53,7 @@ func (s *Service) RegisterManualInvoice(ctx context.Context, p Principal, reques
 		return "", fmt.Errorf("%w: invoice currency is missing", ErrInvalid)
 	}
 	id := newID()
-	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_tax_invoice(id,tenant_id,invoice_request_id,invoice_code,invoice_no,invoice_type,currency,amount_excl_tax,tax_amount,amount_incl_tax,issue_date,buyer_profile_snapshot,seller_profile_snapshot,status,issued_by_channel,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'ISSUED','MANUAL',UTC_TIMESTAMP(3))`, id, p.TenantID, requestID, code, no, kind, currency, excl, tax, incl, in.IssueDate, buyer, seller)
+	_, err = tx.ExecContext(ctx, `INSERT INTO settlement_tax_invoice(id,tenant_id,invoice_request_id,invoice_code,invoice_no,invoice_type,currency,amount_excl_tax,tax_amount,amount_incl_tax,issue_date,buyer_profile_snapshot,seller_profile_snapshot,status,issued_by_channel,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'ISSUED','MANUAL',UTC_TIMESTAMP(3))`, id, p.TenantID, requestID, code, no, kind, currency, excl, tax, incl, issueDate, buyer, seller)
 	if err != nil {
 		return "", err
 	}
