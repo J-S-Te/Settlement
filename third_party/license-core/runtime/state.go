@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,6 +45,72 @@ type FileRuntime struct {
 	binding      Binding
 	platformKeys map[string]ed25519.PublicKey
 	vendorKeys   map[string]ed25519.PublicKey
+
+	// verifications 统计读路径实际执行的验签次数
+	// （strict + VerifySnapshot 及其内嵌授权验签），
+	// 用于确认缓存只跳过重复验签，不改变判定。
+	verifications atomic.Int64
+
+	cache verificationCache
+}
+
+// verificationCache 以每次实际读取到的状态文件原始字节的 SHA-256 为键，
+// 缓存 strict、VerifySnapshot 及其内部两份授权验签的结果。
+// 它只跳过重复的密码学验签；打开文件、fstat 的 regular/0600/size 校验、
+// 时钟观察与落盘、以及全部授权判定仍在每次读取时执行。
+// 状态文件字节变化会得到不同键，任何 save() 落盘都会使已有条目失效。
+// 该 mutex 只保护结构本身：查找、回填、失效是独立临界区，
+// 持锁期间不执行文件或密码学操作，也不跨 withLock 调用持锁。
+type verificationCache struct {
+	mu      sync.Mutex
+	epoch   uint64
+	entries map[[sha256.Size]byte]cachedVerification
+}
+
+type cachedVerification struct {
+	state    State
+	snapshot PlatformSnapshot
+}
+
+// verificationCacheMaxEntries 限制缓存条目数，避免频繁外部改写导致无界增长。
+const verificationCacheMaxEntries = 4
+
+func (c *verificationCache) lookup(key [sha256.Size]byte) (cachedVerification, uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cached, ok := c.entries[key]
+	return cached, c.epoch, ok
+}
+
+// store 只在同一 epoch 内回填，避免 save() 之后写入过期结果。
+func (c *verificationCache) store(key [sha256.Size]byte, cached cachedVerification, epoch uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.epoch != epoch {
+		return
+	}
+	if len(c.entries) >= verificationCacheMaxEntries {
+		c.entries = make(map[[sha256.Size]byte]cachedVerification)
+	}
+	c.entries[key] = cached
+}
+
+func (c *verificationCache) invalidate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.epoch++
+	c.entries = make(map[[sha256.Size]byte]cachedVerification)
+}
+
+// clone 复制可变的 ConsumedRecoveryIDs，避免缓存条目与调用方共享底层数组。
+func (s State) clone() State {
+	if s.ConsumedRecoveryIDs == nil {
+		return s
+	}
+	ids := make([]string, len(s.ConsumedRecoveryIDs))
+	copy(ids, s.ConsumedRecoveryIDs)
+	s.ConsumedRecoveryIDs = ids
+	return s
 }
 
 // NewFileRuntime 不会创建或初始化已授权状态。父目录须由服务部署负责持有和保护，
@@ -80,7 +149,7 @@ func NewFileRuntime(path string, binding Binding, platformKeys, vendorKeys map[s
 			}
 		}
 	}
-	return &FileRuntime{absolute, binding, pk, vk}, nil
+	return &FileRuntime{path: absolute, binding: binding, platformKeys: pk, vendorKeys: vk, cache: verificationCache{entries: make(map[[sha256.Size]byte]cachedVerification)}}, nil
 }
 
 func (r *FileRuntime) withLock(ctx context.Context, action func() error) (result error) {
@@ -118,6 +187,12 @@ func (r *FileRuntime) load() (State, PlatformSnapshot, error) {
 	if readErr != nil || closeErr != nil {
 		return state, PlatformSnapshot{}, errors.Join(readErr, closeErr)
 	}
+	sum := sha256.Sum256(raw)
+	cached, epoch, ok := r.cache.lookup(sum)
+	if ok {
+		return cached.state.clone(), cached.snapshot, nil
+	}
+	r.verifications.Add(1)
 	if err := strict(raw, &state, stateFields); err != nil {
 		return state, PlatformSnapshot{}, err
 	}
@@ -135,10 +210,13 @@ func (r *FileRuntime) load() (State, PlatformSnapshot, error) {
 		}
 		seen[id] = true
 	}
+	r.cache.store(sum, cachedVerification{state: state.clone(), snapshot: snapshot}, epoch)
 	return state, snapshot, nil
 }
 
 func (r *FileRuntime) save(state State) (result error) {
+	// 任何 save() 调用后都必须失效，避免进程内继续复用旧字节的验签结果。
+	r.cache.invalidate()
 	raw, err := json.Marshal(state)
 	if err != nil || len(raw) > maxBytes {
 		return ErrState
