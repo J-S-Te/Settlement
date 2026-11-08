@@ -122,13 +122,28 @@ func (s *Service) AdjustPlan(ctx context.Context, p Principal, id string, in Pla
 	if _, err = tx.ExecContext(ctx, `UPDATE settlement_receivable SET due_date=?,original_amount=?,open_amount=?-received_allocated_amount-write_off_amount,collection_status=CASE WHEN ?=received_allocated_amount+write_off_amount THEN 'SETTLED' WHEN received_allocated_amount>0 THEN 'PARTIALLY_SETTLED' ELSE 'UNPAID' END,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND id=?`, in.DueDate, planned, planned, planned, p.TenantID, receivable); err != nil {
 		return err
 	}
+	wasSettled := add(used).Cmp(add(original)) == 0
+	isSettled := add(used).Cmp(add(planned)) == 0
+	var creditEventID string
+	if wasSettled != isSettled {
+		creditEventID, err = s.enqueueAdjustedPlanCredit(ctx, tx, p, snapshot, receivable, isSettled)
+		if err != nil {
+			return err
+		}
+	}
 	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_PLAN_ADJUSTED", "receivable_plan", id, map[string]any{"actor_id": p.UserID, "old_due_date": oldDate, "due_date": in.DueDate, "old_amount": oldAmount, "amount": planned, "reason": in.Reason, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
 		return err
 	}
 	if err = auditPlanCoverageDeviation(ctx, tx, p, coverage, in.Reason, "ADJUST_PLAN"); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if creditEventID != "" && s.CreditPublisher != nil {
+		_ = s.RetryCreditSync(ctx, p.TenantID, creditEventID)
+	}
+	return nil
 }
 
 // UpdateProjectMappingNote 用途：在本人协作范围内维护映射说明，不改变合同客户权威归属。

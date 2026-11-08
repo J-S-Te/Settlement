@@ -171,8 +171,11 @@ func openCreditReversalTx(t *testing.T, connector *creditReversalConnector) (*sq
 	return db, tx
 }
 
+// TestCreditReversalCancelsUndeliveredCompletionByReceivable 验证从未发送的结清可安全取消。
+// 参数：t为测试上下文，使用事务边界夹具。
+// 返回值：无；出现对外补偿或原结清未取消时失败。
 func TestCreditReversalCancelsUndeliveredCompletionByReceivable(t *testing.T) {
-	for _, status := range []string{"PENDING", "RETRY_WAIT"} {
+	for _, status := range []string{"PENDING"} {
 		t.Run(status, func(t *testing.T) {
 			payload := completedCreditPayload(t, "ALLOC-B")
 			connector := &creditReversalConnector{
@@ -306,5 +309,30 @@ func TestCreditReversalSkipsFactsWithoutActiveCompletion(t *testing.T) {
 				t.Fatalf("commit err=%v committed=%v", err, connector.committed)
 			}
 		})
+	}
+}
+
+// TestCreditReversalPreservesUnknownCompletion 验证丢失ACK的结清必须保留并建立撤销补偿。
+// 参数：t为测试上下文，RETRY_WAIT表示至少尝试过一次的未知结果。
+// 返回值：无；未知事实被取消或没有建立补偿事件时失败。
+func TestCreditReversalPreservesUnknownCompletion(t *testing.T) {
+	payload := completedCreditPayload(t, "ALLOC-B")
+	connector := &creditReversalConnector{
+		t: t,
+		queries: []creditReversalQueryStep{{
+			match:  "FROM settlement_credit_sync",
+			check:  assertQueryIdentity,
+			values: []driver.Value{"EVENT-B", creditEventCompleted, "RETRY_WAIT", "ALLOC-B", payload},
+		}},
+		execs: []creditReversalExecStep{{
+			match: "INSERT INTO settlement_credit_sync",
+		}},
+	}
+	db, tx := openCreditReversalTx(t, connector)
+	defer db.Close()
+	defer tx.Rollback()
+	eventID, err := enqueueCreditReversal(context.Background(), tx, "tenant-a", "ALLOC-A", "RECV-1")
+	if err != nil || eventID == "" {
+		t.Fatalf("未知结清必须保留并生成补偿，event=%q err=%v", eventID, err)
 	}
 }

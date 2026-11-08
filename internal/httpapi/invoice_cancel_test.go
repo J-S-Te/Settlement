@@ -57,7 +57,7 @@ func TestInvoiceCancelRouteRequiresIdempotencyKey(t *testing.T) {
 	}
 }
 
-// TestInvoiceCancelThroughHTTP 验证死信后作废通过HTTP把申请置为已作废并释放预留。
+// TestInvoiceCancelThroughHTTP 验证确定未受理的失败申请可经HTTP作废并释放预留。
 // 参数：t为测试上下文。
 // 返回值：无；事务边界、锁定顺序或响应状态不符时失败。
 func TestInvoiceCancelThroughHTTP(t *testing.T) {
@@ -67,7 +67,7 @@ func TestInvoiceCancelThroughHTTP(t *testing.T) {
 		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_idempotency_record"},
 		scriptdb.Step{Kind: "query", SQL: "SELECT id,COALESCE(command_event_id,'') FROM settlement_invoice_issue_attempt", Rows: [][]driver.Value{{"attempt-1", "event-1"}}},
 		scriptdb.Step{Kind: "query", SQL: "settlement_outbox_event WHERE tenant_id=? AND event_id=? ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE", Rows: [][]driver.Value{{"TAX_INVOICE_COMMAND", "DEAD_LETTER"}}},
-		scriptdb.Step{Kind: "query", SQL: "FROM settlement_invoice_issue_attempt WHERE tenant_id=? AND id=? FOR UPDATE", Rows: [][]driver.Value{{"PENDING", true, "event-1"}}},
+		scriptdb.Step{Kind: "query", SQL: "FROM settlement_invoice_issue_attempt WHERE tenant_id=? AND id=? FOR UPDATE", Rows: [][]driver.Value{{"ISSUE_FAILED", true, "event-1"}}},
 		scriptdb.Step{Kind: "query", SQL: "FROM settlement_invoice_request WHERE id=? AND tenant_id=? FOR UPDATE", Rows: [][]driver.Value{{"ISSUE_PENDING", "applicant", int64(3)}}},
 		scriptdb.Step{Kind: "query", SQL: "SELECT contract_snapshot_id FROM settlement_invoice_request", Rows: [][]driver.Value{{"snapshot-1"}}},
 		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state FROM settlement_contract_snapshot", Rows: [][]driver.Value{{"RELEASED"}}},
@@ -97,5 +97,30 @@ func TestInvoiceCancelThroughHTTP(t *testing.T) {
 	}
 	if eventType, _ := auditArgs[4].Value.(string); eventType != "SETTLEMENT_INVOICE_CANCELLED" {
 		t.Fatalf("审计事件类型=%v", auditArgs[4].Value)
+	}
+}
+
+// TestInvoiceCancelHTTPRejectsUnknownDelivery 验证旧PENDING死信不能作为未受理证据。
+// 参数：t为HTTP测试上下文，SQL夹具只允许读取命令与尝试后回滚。
+// 返回值：无；必须返回冲突且不得查询或修改申请、额度与成功审计。
+func TestInvoiceCancelHTTPRejectsUnknownDelivery(t *testing.T) {
+	db := scriptdb.Open(t,
+		scriptdb.Step{Kind: "begin"},
+		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_idempotency_record"},
+		scriptdb.Step{Kind: "query", SQL: "SELECT id,COALESCE(command_event_id,'') FROM settlement_invoice_issue_attempt", Rows: [][]driver.Value{{"attempt-1", "event-1"}}},
+		scriptdb.Step{Kind: "query", SQL: "settlement_outbox_event WHERE tenant_id=? AND event_id=? ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE", Rows: [][]driver.Value{{"TAX_INVOICE_COMMAND", "DEAD_LETTER"}}},
+		scriptdb.Step{Kind: "query", SQL: "FROM settlement_invoice_issue_attempt WHERE tenant_id=? AND id=? FOR UPDATE", Rows: [][]driver.Value{{"PENDING", true, "event-1"}}},
+		scriptdb.Step{Kind: "rollback"},
+	)
+	handler := New(db, config.Config{DevelopmentAuth: true, PublicOrigin: "https://settlement.test"}, slog.Default(), nil, nil, nil)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/invoice-requests/request-1/cancel", strings.NewReader(`{"version":3,"reason":"未知结果不能释放额度"}`))
+	r.Header.Set("Origin", "https://settlement.test")
+	r.Header.Set("X-CSRF-Token", "1")
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Idempotency-Key", "cancel-unknown")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 }

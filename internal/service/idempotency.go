@@ -9,6 +9,9 @@ import (
 	"fmt"
 )
 
+// claimIdempotency 在业务事务内绑定原键、请求摘要与首次成功资源。
+// 参数：ctx/tx为事务，tenant/command/key为命令身份，resourceID为候选结果，request为规范内容。
+// 返回值：资源标识和回放标记；同键异内容或数据库失败返回错误。
 func claimIdempotency(ctx context.Context, tx *sql.Tx, tenant, command, key, resourceID string, request any) (string, bool, error) {
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -25,7 +28,8 @@ func claimIdempotency(ctx context.Context, tx *sql.Tx, tenant, command, key, res
 	}
 	var storedHash []byte
 	var storedID string
-	if err = tx.QueryRowContext(ctx, `SELECT request_hash,resource_id FROM settlement_idempotency_record WHERE tenant_id=? AND command_type=? AND idempotency_key=?`, tenant, command, key).Scan(&storedHash, &storedID); err != nil {
+	// 授权查询可能已建立RR快照；唯一键等待后必须当前读，才能看到刚提交的首次结果。
+	if err = tx.QueryRowContext(ctx, `SELECT request_hash,resource_id FROM settlement_idempotency_record WHERE tenant_id=? AND command_type=? AND idempotency_key=? FOR UPDATE`, tenant, command, key).Scan(&storedHash, &storedID); err != nil {
 		return "", false, err
 	}
 	if !bytes.Equal(storedHash, digest[:]) {

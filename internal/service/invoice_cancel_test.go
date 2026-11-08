@@ -65,6 +65,9 @@ func invoiceCancelSteps(scenario invoiceCancelScenario, auditArgs *[]driver.Name
 		if !scenario.neverAccepted || (scenario.attemptStatus != "PENDING" && scenario.attemptStatus != "ISSUE_FAILED") {
 			return append(steps, scriptdb.Step{Kind: "rollback"})
 		}
+		if scenario.attemptStatus == "PENDING" && scenario.commandEvent != "" {
+			return append(steps, scriptdb.Step{Kind: "rollback"})
+		}
 	}
 	steps = append(steps, scriptdb.Step{Kind: "query", SQL: "FROM settlement_invoice_request WHERE id=? AND tenant_id=? FOR UPDATE", Rows: [][]driver.Value{{scenario.requestStatus, scenario.applicant, int64(scenario.storedVersion)}}})
 	if (scenario.requestStatus != "ISSUE_PENDING" && scenario.requestStatus != "ISSUE_FAILED") || scenario.storedVersion != scenario.wantVersion {
@@ -100,18 +103,18 @@ func invoiceCancelSteps(scenario invoiceCancelScenario, auditArgs *[]driver.Name
 // 返回值：无；任一场景状态机或写入边界不符时失败。
 func TestCancelInvoiceRequestStateMatrix(t *testing.T) {
 	for _, scenario := range []invoiceCancelScenario{
-		{name: "死信后作废释放额度", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "PENDING", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer"},
+		{name: "旧待发送死信缺证据拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "PENDING", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
 		{name: "无命令的人工申请作废", requestStatus: "ISSUE_PENDING", applicant: "applicant", storedVersion: 2, wantVersion: 2, actor: "reviewer"},
 		{name: "已明确失败的申请作废", requestStatus: "ISSUE_FAILED", applicant: "applicant", attemptStatus: "ISSUE_FAILED", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer"},
 		{name: "税控已受理必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "PENDING", neverAccepted: false, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
 		{name: "未知结果必须拒绝", requestStatus: "ISSUE_UNKNOWN", applicant: "applicant", attemptStatus: "UNKNOWN", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
-		{name: "厂商冲突结果必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "PENDING", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, unresolved: 1, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
-		{name: "已有发票必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "PENDING", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, invoices: 1, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
+		{name: "厂商冲突结果必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "ISSUE_FAILED", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, unresolved: 1, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
+		{name: "已有发票必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "ISSUE_FAILED", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, invoices: 1, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
 		{name: "命令已被重投必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "PENDING", neverAccepted: true, commandEvent: "event-1", outboxStatus: "PENDING", lockedCmd: "event-1", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
 		{name: "命令事实缺失必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "PENDING", neverAccepted: true, commandEvent: "event-1", outboxStatus: "", lockedCmd: "event-1", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
 		{name: "命令已被新尝试取代必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "PENDING", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-2", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrConflict},
-		{name: "版本不一致必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "PENDING", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, storedVersion: 4, wantVersion: 3, actor: "reviewer", want: ErrConflict},
-		{name: "申请人必须回避", requestStatus: "ISSUE_PENDING", applicant: "reviewer", attemptStatus: "PENDING", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrInvalid},
+		{name: "版本不一致必须拒绝", requestStatus: "ISSUE_PENDING", applicant: "applicant", attemptStatus: "ISSUE_FAILED", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, storedVersion: 4, wantVersion: 3, actor: "reviewer", want: ErrConflict},
+		{name: "申请人必须回避", requestStatus: "ISSUE_PENDING", applicant: "reviewer", attemptStatus: "ISSUE_FAILED", neverAccepted: true, commandEvent: "event-1", outboxStatus: "DEAD_LETTER", lockedCmd: "event-1", withAttempt: true, storedVersion: 3, wantVersion: 3, actor: "reviewer", want: ErrInvalid},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			var auditArgs []driver.NamedValue

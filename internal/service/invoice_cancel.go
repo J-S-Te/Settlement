@@ -86,6 +86,10 @@ func (s *Service) CancelInvoiceRequest(ctx context.Context, p Principal, key, id
 		if !neverAccepted {
 			return fmt.Errorf("%w: 税控已受理该尝试，禁止作废，请先对账或红冲", ErrConflict)
 		}
+		// 旧版本在发送后丢失回执仍可能留下PENDING；死信不能证明从未发送。
+		if attemptStatus == "PENDING" && commandEventID != "" {
+			return fmt.Errorf("%w: 税控命令缺少确定未受理证据，请先对账或恢复投递", ErrConflict)
+		}
 		if !cancellableAttemptStatuses[attemptStatus] {
 			return fmt.Errorf("%w: 开票尝试状态为 %s，无法证明未受理，禁止作废", ErrConflict, attemptStatus)
 		}

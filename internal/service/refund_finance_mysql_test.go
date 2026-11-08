@@ -30,7 +30,7 @@ func refundFinanceMySQL(t *testing.T) *sql.DB {
 
 // seedRefundReceipt 建立金额固定且日期确定的隔离回款事实。
 // 参数：t 测试上下文，db 独占测试库，tenant 测试租户。
-// 返回值：新回款ID。
+// 返回值：初始状态为AVAILABLE的新回款ID。
 func seedRefundReceipt(t *testing.T, db *sql.DB, tenant string) string {
 	t.Helper()
 	id := newID()
@@ -39,14 +39,14 @@ func seedRefundReceipt(t *testing.T, db *sql.DB, tenant string) string {
  currency,receipt_date,payment_method,bank_transaction_reference,source_type,status,
  idempotency_key,created_at,updated_at)
  VALUES(?,?,?,'customer','隔离客户',100,100,'CNY','2020-01-01','BANK',?,'MANUAL',
- 'CONFIRMED',?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, tenant, id, id, id)
+ 'AVAILABLE',?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, id, tenant, id, id, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return id
 }
 
-// TestMySQLRefundConfirmationIsAtomicAndKeepsHeldBalance 验证自然审批、并发确认及审计金额不变量。
+// TestMySQLRefundConfirmationIsAtomicAndKeepsHeldBalance 验证北京业务日、并发确认及暂挂不变量。
 // 参数：t 测试上下文；仅在主验证器提供显式隔离DSN时运行。
 // 返回值：无；任何重复确认、事实重写或余额变化时失败。
 func TestMySQLRefundConfirmationIsAtomicAndKeepsHeldBalance(t *testing.T) {
@@ -79,7 +79,7 @@ func TestMySQLRefundConfirmationIsAtomicAndKeepsHeldBalance(t *testing.T) {
 	}
 	in.Version = 3
 	bad := in
-	bad.CompletedAt = "2019-12-31T23:59:59Z"
+	bad.CompletedAt = "2019-12-31T15:59:59Z" // 北京时间12月31日，确实早于回款日。
 	if err = svc.ConfirmReceiptRefund(t.Context(), p, id, bad); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("before receipt: %v", err)
 	}
