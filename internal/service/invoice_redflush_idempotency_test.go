@@ -40,7 +40,7 @@ func redFlushAttemptRow(requestStatus, attemptStatus, originalStatus string, seq
 		"invoice-original", requestStatus, attemptStatus,
 		"INVOICE_ERROR", "税额错误", "request-1", "VAT_NORMAL", "CNY",
 		"100.00", "13.00", "113.00", []byte(`{}`), []byte(`{}`),
-		"tax-provider", "external-request-1", sequence, originalStatus,
+		"tax-provider", "external-request-1", sequence, originalStatus, "red-request-1",
 	}
 }
 

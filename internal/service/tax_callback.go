@@ -286,22 +286,42 @@ func recordLateIssueCallbackAfterCancel(ctx context.Context, tx *sql.Tx, tenant,
 	return "PROVIDER_CONFLICT", outbox(ctx, tx, tenant, "PLATFORM_AUDIT", "SETTLEMENT_TAX_PROVIDER_CONFLICT", "invoice_request", requestID, payload)
 }
 
+// applyRedFlushCallback 在锁定的税控尝试关系内应用红冲回执。
+// 参数：ctx为上下文，tx为回执事务，tenant为可信租户，event为税控事件。
+// 返回值：处理状态；申请错配或财务事实冲突时返回错误并回滚。
 func (s *Service) applyRedFlushCallback(ctx context.Context, tx *sql.Tx, tenant string, event TaxCallbackEvent) (string, error) {
-	var originalInvoiceID, status, attemptStatus, reasonCode, reasonDetail, requestID, kind, currency, excl, tax, incl, providerCode, externalRequestID, originalInvoiceStatus string
+	var originalInvoiceID, status, attemptStatus, reasonCode, reasonDetail, requestID string
+	var kind, currency, excl, tax, incl, providerCode, externalRequestID string
+	var originalInvoiceStatus, authoritativeRequestID string
 	var lastSequence uint64
 	var buyer, originalSeller []byte
-	err := tx.QueryRowContext(ctx, `SELECT ra.original_invoice_id,rf.status,ra.status,rf.reason_code,rf.reason_detail,ti.invoice_request_id,ti.invoice_type,ti.currency,ti.amount_excl_tax,ti.tax_amount,ti.amount_incl_tax,ti.buyer_profile_snapshot,ti.seller_profile_snapshot,ra.provider_code,ra.external_request_id,ra.result_sequence,ti.status FROM settlement_invoice_red_flush_attempt ra JOIN settlement_invoice_red_flush_request rf ON rf.id=ra.red_flush_request_id AND rf.tenant_id=ra.tenant_id JOIN settlement_tax_invoice ti ON ti.id=ra.original_invoice_id AND ti.tenant_id=ra.tenant_id WHERE ra.id=? AND ra.tenant_id=? FOR UPDATE`, event.RedFlushAttemptID, tenant).Scan(&originalInvoiceID, &status, &attemptStatus, &reasonCode, &reasonDetail, &requestID, &kind, &currency, &excl, &tax, &incl, &buyer, &originalSeller, &providerCode, &externalRequestID, &lastSequence, &originalInvoiceStatus)
+	err := tx.QueryRowContext(ctx, `SELECT ra.original_invoice_id,rf.status,ra.status,
+	 rf.reason_code,rf.reason_detail,ti.invoice_request_id,ti.invoice_type,ti.currency,
+	 ti.amount_excl_tax,ti.tax_amount,ti.amount_incl_tax,ti.buyer_profile_snapshot,
+	 ti.seller_profile_snapshot,ra.provider_code,ra.external_request_id,ra.result_sequence,
+	 ti.status,ra.red_flush_request_id
+	 FROM settlement_invoice_red_flush_attempt ra
+	 JOIN settlement_invoice_red_flush_request rf
+	 ON rf.id=ra.red_flush_request_id AND rf.tenant_id=ra.tenant_id
+	 JOIN settlement_tax_invoice ti
+	 ON ti.id=ra.original_invoice_id AND ti.tenant_id=ra.tenant_id
+	 WHERE ra.id=? AND ra.tenant_id=? FOR UPDATE`, event.RedFlushAttemptID, tenant).Scan(
+		&originalInvoiceID, &status, &attemptStatus, &reasonCode, &reasonDetail,
+		&requestID, &kind, &currency, &excl, &tax, &incl, &buyer, &originalSeller,
+		&providerCode, &externalRequestID, &lastSequence, &originalInvoiceStatus,
+		&authoritativeRequestID,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", err
 	}
-	if event.RedFlushRequestID == "" {
-		if err = tx.QueryRowContext(ctx, `SELECT red_flush_request_id FROM settlement_invoice_red_flush_attempt WHERE id=? AND tenant_id=?`, event.RedFlushAttemptID, tenant).Scan(&event.RedFlushRequestID); err != nil {
-			return "", err
-		}
+	if event.RedFlushRequestID != "" && event.RedFlushRequestID != authoritativeRequestID {
+		return "", fmt.Errorf("%w: red_flush_request_id does not match locked attempt", ErrConflict)
 	}
+	// 兼容旧回执未携带申请ID，所有写入始终使用锁内读取的权威关系。
+	event.RedFlushRequestID = authoritativeRequestID
 	if event.ExternalRequestID != externalRequestID || event.ProviderCode != providerCode {
 		return "", fmt.Errorf("%w: external_request_id does not match red flush request", ErrConflict)
 	}

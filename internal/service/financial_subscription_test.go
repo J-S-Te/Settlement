@@ -64,15 +64,17 @@ func TestFinancialSubscriptionRequiresTrustedContractCustomer(t *testing.T) {
 	}
 }
 
-// TestFinancialSubscriptionReversalDoesNotCreatePausedDelivery 验证真实冲销可取消未发旧任务但不新建停订阅投递。
+// TestFinancialSubscriptionReversalPreservesPausedCompensation 验证暂停订阅仍保存必要补偿意图。
 // 参数：t 为测试上下文。
-// 返回值：无；伪造DELIVERED或插入新补偿行时失败。
-func TestFinancialSubscriptionReversalDoesNotCreatePausedDelivery(t *testing.T) {
+// 返回值：无；已尝试事实被取消、补偿意图丢失或伪造DELIVERED时失败。
+func TestFinancialSubscriptionReversalPreservesPausedCompensation(t *testing.T) {
 	for _, state := range []string{"DELIVERED", "PROCESSING", "PENDING", "RETRY_WAIT"} {
 		t.Run(state, func(t *testing.T) {
 			steps := []scriptdb.Step{{Kind: "begin"}, {Kind: "query", SQL: "SELECT completed.event_id", Rows: [][]driver.Value{{"old", creditEventCompleted, state, "allocation", []byte(`{"customer_id":7}`)}}}}
-			if state == "PENDING" || state == "RETRY_WAIT" {
+			if state == "PENDING" {
 				steps = append(steps, scriptdb.Step{Kind: "exec", SQL: "SET status='CANCELLED'"})
+			} else {
+				steps = append(steps, scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_credit_sync"})
 			}
 			steps = append(steps, scriptdb.Step{Kind: "commit"})
 			db := scriptdb.Open(t, steps...)
@@ -80,8 +82,8 @@ func TestFinancialSubscriptionReversalDoesNotCreatePausedDelivery(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			id, err := enqueueCreditReversal(context.Background(), tx, "tenant", "allocation", "receivable", false)
-			if err != nil || id != "" {
+			id, err := enqueueCreditReversal(context.Background(), tx, "tenant", "allocation", "receivable")
+			if err != nil || (state == "PENDING") != (id == "") {
 				t.Fatalf("id=%s err=%v", id, err)
 			}
 			if err = tx.Commit(); err != nil {
@@ -121,13 +123,16 @@ func TestNativeAllocationRetainsLocalMoneyWithoutCRM(t *testing.T) {
 	db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "SELECT contract_snapshot_id", Rows: [][]driver.Value{{"snapshot"}}},
 		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state", Rows: [][]driver.Value{{"NORMAL"}}}, scriptdb.Step{Kind: "query", SQL: "SELECT migration_state", Rows: [][]driver.Value{{"NORMAL"}}},
 		scriptdb.Step{Kind: "query", SQL: "SELECT COUNT(*) FROM settlement_import_fact", Rows: [][]driver.Value{{int64(0)}}},
+		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state", Rows: [][]driver.Value{{"NORMAL"}}},
+		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_idempotency_record"},
 		scriptdb.Step{Kind: "query", SQL: "SELECT unallocated_amount", Rows: [][]driver.Value{{"100.00", "CNY", "2020-02-01", customer}}},
 		scriptdb.Step{Kind: "query", SQL: "SELECT r.open_amount", Rows: [][]driver.Value{{"100.00", "100.00", "CNY", customer, "2020-02-01", "", int64(1)}}},
 		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_receipt_allocation"}, scriptdb.Step{Kind: "exec", SQL: "UPDATE settlement_receipt SET unallocated_amount"}, scriptdb.Step{Kind: "exec", SQL: "UPDATE settlement_receivable SET open_amount"},
 		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_outbox_event"}, scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_audit_event"}, scriptdb.Step{Kind: "commit"})
 	s := &Service{DB: db}
 	s.ConfigureFinancialSources(true, true)
-	id, err := s.ConfirmAllocation(context.Background(), nativeTestPrincipal("settlement_finance_manager"), "allocate-key", AllocationInput{ReceiptID: "receipt", ReceivableID: "receivable", Amount: "100.00", MatchMode: "MANUAL"})
+	p := roleFlowPrincipal("settlement_accountant", "finance-a", "tenant-a")
+	id, err := s.ConfirmAllocation(context.Background(), p, "allocate-key", AllocationInput{ReceiptID: "receipt", ReceivableID: "receivable", Amount: "100.00", MatchMode: "MANUAL"})
 	if err != nil || id == "" {
 		t.Fatalf("id=%s err=%v", id, err)
 	}

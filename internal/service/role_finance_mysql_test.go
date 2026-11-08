@@ -46,7 +46,7 @@ func TestMySQLRoleFinanceWorkflow(t *testing.T) {
 		t.Fatalf("director attempt=%s err=%v", attempt, err)
 	}
 	receipt, allocation := newID(), newID()
-	if _, err = db.Exec(`INSERT INTO settlement_receipt(id,tenant_id,receipt_no,customer_id,customer_name_snapshot,amount,unallocated_amount,currency,receipt_date,payment_method,bank_transaction_reference,source_type,status,idempotency_key,created_at,updated_at) VALUES(?,?,?,'customer','测试客户',100,90,'CNY',CURDATE(),'BANK',?,'MANUAL','CONFIRMED',?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, receipt, tenant, receipt, receipt, receipt); err != nil {
+	if _, err = db.Exec(`INSERT INTO settlement_receipt(id,tenant_id,receipt_no,customer_id,customer_name_snapshot,amount,unallocated_amount,currency,receipt_date,payment_method,bank_transaction_reference,source_type,status,idempotency_key,created_at,updated_at) VALUES(?,?,?,'customer','测试客户',100,90,'CNY',CURDATE(),'BANK',?,'MANUAL','PARTIALLY_ALLOCATED',?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, receipt, tenant, receipt, receipt, receipt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = db.Exec(`INSERT INTO settlement_receipt_allocation(id,tenant_id,allocation_no,receipt_id,receivable_id,allocated_amount,currency,status,match_mode,confirmed_by,confirmed_at,idempotency_key,created_at) VALUES(?,?,?,?,?,10,'CNY','CONFIRMED','MANUAL','accountant',UTC_TIMESTAMP(3),?,UTC_TIMESTAMP(3))`, allocation, tenant, allocation, receipt, r, allocation); err != nil {

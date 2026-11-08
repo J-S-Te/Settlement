@@ -111,7 +111,7 @@ func (s *Service) ReverseAllocation(ctx context.Context, p Principal, key, alloc
 	}
 	var reversalCreditEventID string
 	if settledBeforeReversal {
-		reversalCreditEventID, err = enqueueCreditReversal(ctx, tx, p.TenantID, allocationID, receivableID, s.creditSubscribed())
+		reversalCreditEventID, err = enqueueCreditReversal(ctx, tx, p.TenantID, allocationID, receivableID)
 		if err != nil {
 			return "", err
 		}
