@@ -12,13 +12,41 @@ import (
 const creditEventCompleted = "customer.credit.payment.completed.v1"
 const creditEventReversed = "customer.credit.payment.reversed.v1"
 
+// original_event_id 是同应收内部前驱，不进入 CRM 消息；撤销引用原完成，
+// 下一次完成引用前轮撤销，只有确认前驱受理后才允许继续发送。
+const creditPredecessorReady = `(original_event_id='' OR EXISTS (
+ SELECT 1 FROM settlement_credit_sync predecessor
+ WHERE predecessor.tenant_id=settlement_credit_sync.tenant_id
+ AND predecessor.receivable_id=settlement_credit_sync.receivable_id
+ AND predecessor.event_id=settlement_credit_sync.original_event_id
+ AND predecessor.status='DELIVERED'))`
+
 // ErrCreditSyncAuthorization 表示 CRM 信用同步被凭据或用途授权拒绝（401/403、
 // invalid_client/invalid_scope）。它与 5xx/网络类失败语义不同：修复受控接入配置
 // 之前重试不会成功，HTTP 层必须让运营看到不可立即重试的明确错误，而不是 503。
 var ErrCreditSyncAuthorization = errors.New("CRM credit delivery is not authorized")
 
-func insertCreditSync(ctx context.Context, tx *sql.Tx, tenant, eventID, allocationID, receivableID string, payload []byte) error {
-	return insertCreditSyncEvent(ctx, tx, tenant, eventID, allocationID, receivableID, creditEventCompleted, "", payload)
+// insertCreditSync 将新完成排在前轮撤销之后，保持每个应收的不可变事实顺序。
+// 参数：ctx/tx为财务事务，其余为租户、事件、核销、应收身份和事件内容。
+// 返回值：前驱查询或事件持久化错误，成功时无错误。
+func insertCreditSync(ctx context.Context, tx *sql.Tx,
+	tenant, eventID, allocationID, receivableID string, payload []byte,
+) error {
+	var predecessor string
+	err := tx.QueryRowContext(ctx, `SELECT reversed.event_id
+	 FROM settlement_credit_sync reversed
+	 WHERE reversed.tenant_id=? AND reversed.receivable_id=? AND reversed.event_type=?
+	 AND NOT EXISTS (SELECT 1 FROM settlement_credit_sync following
+	  WHERE following.tenant_id=reversed.tenant_id
+	  AND following.original_event_id=reversed.event_id
+	  AND following.event_type=? AND following.status<>'CANCELLED')
+	 ORDER BY reversed.created_at DESC,reversed.id DESC LIMIT 1 FOR UPDATE`,
+		tenant, receivableID, creditEventReversed, creditEventCompleted).Scan(&predecessor)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return insertCreditSyncEvent(ctx, tx, tenant, eventID, allocationID, receivableID,
+		creditEventCompleted, predecessor, payload)
 }
 
 // insertCreditSyncEvent 将历史结清事件暂存，普通事件维持待投递。
@@ -29,7 +57,7 @@ func insertCreditSyncEvent(ctx context.Context, tx *sql.Tx, tenant, eventID, all
 	return err
 }
 
-// RetryCreditSync 认领并重试信用同步，历史HOLD保持不可投递。
+// RetryCreditSync 仅在前驱已确认时认领重试信用同步，历史HOLD保持不可投递。
 // 参数：ctx为上下文，tenant/eventID为可信租户及目标信用事件。
 // 返回值：同步结果错误；历史暂存事件不会对外发送。
 func (s *Service) RetryCreditSync(ctx context.Context, tenant, eventID string) error {
@@ -46,7 +74,14 @@ func (s *Service) RetryCreditSync(ctx context.Context, tenant, eventID string) e
 	defer tx.Rollback()
 	var id string
 	var payload []byte
-	err = tx.QueryRowContext(ctx, `SELECT id,payload_json FROM settlement_credit_sync WHERE tenant_id=? AND event_id=? AND status IN ('PENDING','RETRY_WAIT') AND NOT EXISTS(SELECT 1 FROM settlement_receivable r JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id WHERE r.id=settlement_credit_sync.receivable_id AND r.tenant_id=settlement_credit_sync.tenant_id AND cs.migration_state='HOLD') FOR UPDATE`, tenant, eventID).Scan(&id, &payload)
+	err = tx.QueryRowContext(ctx, `SELECT id,payload_json FROM settlement_credit_sync
+	 WHERE tenant_id=? AND event_id=? AND status IN ('PENDING','RETRY_WAIT')
+	 AND `+creditPredecessorReady+` AND NOT EXISTS(
+	  SELECT 1 FROM settlement_receivable r JOIN settlement_contract_snapshot cs
+	  ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id
+	  WHERE r.id=settlement_credit_sync.receivable_id
+	  AND r.tenant_id=settlement_credit_sync.tenant_id AND cs.migration_state='HOLD')
+	 FOR UPDATE`, tenant, eventID).Scan(&id, &payload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}

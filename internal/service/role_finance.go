@@ -143,7 +143,7 @@ func (s *Service) ApproveReceiptDifference(ctx context.Context, p Principal, id 
 	if resolution == "REFUND_PENDING" {
 		state = "REFUND_PENDING"
 	} else if kind != "SHORTPAYMENT" {
-		if _, err = tx.ExecContext(ctx, `UPDATE settlement_receipt SET unallocated_amount=unallocated_amount+?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND id=?`, value, p.TenantID, receipt); err != nil {
+		if err = releaseReceiptDifferenceBalance(ctx, tx, p.TenantID, receipt, value); err != nil {
 			return err
 		}
 	}
@@ -154,6 +154,33 @@ func (s *Service) ApproveReceiptDifference(ctx context.Context, p Principal, id 
 		return err
 	}
 	return tx.Commit()
+}
+
+// releaseReceiptDifferenceBalance 在同一行锁内恢复差异余额和可核销状态。
+// 参数：ctx为审批上下文，tx为审批事务，tenant/receipt为回款归属，value为暂挂金额。
+// 返回值：非有效回款状态返回冲突，其余数据库错误由调用方整体回滚。
+func releaseReceiptDifferenceBalance(ctx context.Context, tx *sql.Tx,
+	tenant, receipt, value string,
+) error {
+	// MySQL按从左到右赋值，先用释放前余额计算状态，避免重复累加value。
+	result, err := tx.ExecContext(ctx, `UPDATE settlement_receipt
+	 SET status=CASE WHEN unallocated_amount+?=amount THEN 'AVAILABLE'
+	 ELSE 'PARTIALLY_ALLOCATED' END,
+	 unallocated_amount=unallocated_amount+?,version=version+1,updated_at=UTC_TIMESTAMP(3)
+	 WHERE tenant_id=? AND id=?
+	 AND status IN ('AVAILABLE','PARTIALLY_ALLOCATED','FULLY_ALLOCATED')`,
+		value, value, tenant, receipt)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return ErrConflict
+	}
+	return nil
 }
 
 type ERPProvider interface {

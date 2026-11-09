@@ -562,7 +562,7 @@ type AllocationInput struct {
 	MatchConfidence int         `json:"match_confidence"`
 }
 
-// ConfirmAllocation 在范围、余额与客户一致时确认核销并按真实订阅产生信用事实。
+// ConfirmAllocation 在授权范围内幂等确认核销，并按真实订阅产生信用事实。
 // 参数：ctx/p 为授权上下文，key 为幂等键，in 为回款与应收关联。
 // 返回值：核销ID；任何财务校验或持久化失败返回错误。
 func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string, in AllocationInput) (string, error) {
@@ -581,17 +581,20 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 	if in.MatchConfidence < 0 || in.MatchConfidence > 100 || (in.MatchMode == "SUGGESTED" && in.MatchConfidence == 0) {
 		return "", fmt.Errorf("%w: match_confidence must be between 1 and 100 for suggested matches", ErrInvalid)
 	}
+	if !p.Allows("settlement.allocation.confirm") {
+		return "", ErrForbidden
+	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
 	id := newID()
-	if in.ImportFact != nil && !p.Allows("settlement.allocation.confirm") {
-		return "", ErrForbidden
-	}
 	var snapshot string
 	if err = tx.QueryRowContext(ctx, `SELECT contract_snapshot_id FROM settlement_receivable WHERE tenant_id=? AND id=?`, p.TenantID, in.ReceivableID).Scan(&snapshot); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
 		return "", err
 	}
 	// 来源事实始终绑定真实应收快照，目标已放行也不能跨合同核销。
@@ -632,6 +635,16 @@ func (s *Service) ConfirmAllocation(ctx context.Context, p Principal, key string
 	if in.ImportFact == nil {
 		if err = rejectImportedReceiptMutation(ctx, tx, p.TenantID, in.ReceiptID); err != nil {
 			return "", err
+		}
+		if err = s.requireWriteScopeTx(ctx, tx, p, "settlement.allocation.confirm", snapshot); err != nil {
+			return "", err
+		}
+		existing, replay, claimErr := claimAllocationIdempotency(ctx, tx, p, key, id, a, in)
+		if claimErr != nil {
+			return "", claimErr
+		}
+		if replay {
+			return existing, nil
 		}
 	}
 	var receiptAvailable, receiptCurrency, receiptDate, receivableOpen, receivableOriginal, receivableCurrency, receiptCustomer, receivableCustomer string

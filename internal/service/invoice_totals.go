@@ -50,13 +50,19 @@ type RequestMeta struct {
 
 type requestMetaKey struct{}
 
-// enqueueCreditReversal 保留冲销事实并仅在订阅时建立对外补偿投递。
-// 参数：ctx/tx 为事务，其余为财务坐标，subscribed 可选且默认保持旧行为。
+// enqueueCreditReversal 保存既有CRM结清的补偿意图，暂停订阅仅阻止对外发送。
+// 参数：ctx/tx为事务，其余为租户、核销及应收坐标；核销为空时沿用原事实坐标。
 // 返回值：实际新补偿事件ID；未发送旧结清可准确取消但不伪造投递。
-func enqueueCreditReversal(ctx context.Context, tx *sql.Tx, tenant, allocationID, receivableID string, subscribed ...bool) (string, error) {
+func enqueueCreditReversal(ctx context.Context, tx *sql.Tx,
+	tenant, allocationID, receivableID string,
+) (string, error) {
 	var originalEventID, eventType, status, settledAllocationID string
 	var payload []byte
-	err := tx.QueryRowContext(ctx, `SELECT completed.event_id,completed.event_type,completed.status,completed.allocation_id,completed.payload_json
+	err := tx.QueryRowContext(ctx, `SELECT completed.event_id,completed.event_type,
+		CASE WHEN completed.status='PENDING' AND
+		 (completed.attempt_count>0 OR completed.last_attempt_at IS NOT NULL)
+		 THEN 'RETRY_WAIT' ELSE completed.status END,
+		completed.allocation_id,completed.payload_json
 		FROM settlement_credit_sync completed
 		WHERE completed.tenant_id=? AND completed.receivable_id=? AND completed.event_type=? AND completed.status<>'CANCELLED'
 		  AND NOT EXISTS (
@@ -73,14 +79,13 @@ func enqueueCreditReversal(ctx context.Context, tx *sql.Tx, tenant, allocationID
 	if eventType == creditEventReversed || status == "CANCELLED" {
 		return "", nil
 	}
-	if status == "PENDING" || status == "RETRY_WAIT" {
-		_, err = tx.ExecContext(ctx, `UPDATE settlement_credit_sync SET status='CANCELLED',updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND event_id=? AND status IN ('PENDING','RETRY_WAIT')`, tenant, originalEventID)
+	// 失败 ACK 不能证明 CRM 未受理。只有从未认领过的待发事实才可取消。
+	if status == "PENDING" {
+		_, err = tx.ExecContext(ctx, `UPDATE settlement_credit_sync SET status='CANCELLED',updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND event_id=? AND status='PENDING' AND attempt_count=0 AND last_attempt_at IS NULL`, tenant, originalEventID)
 		return "", err
 	}
-	if len(subscribed) > 0 && !subscribed[0] {
-		return "", nil
-	}
 	var original struct {
+		PaymentID  string `json:"payment_id"`
 		CustomerID uint64 `json:"customer_id"`
 		ContractNo string `json:"contract_no"`
 		PeriodNo   string `json:"period_no"`
@@ -91,10 +96,16 @@ func enqueueCreditReversal(ctx context.Context, tx *sql.Tx, tenant, allocationID
 	if err = json.Unmarshal(payload, &original); err != nil {
 		return "", err
 	}
+	if original.PaymentID == "" {
+		original.PaymentID = settledAllocationID
+	}
+	if allocationID == "" {
+		allocationID = settledAllocationID
+	}
 	reversalEventID := newID()
 	reversalPayload, err := json.Marshal(map[string]any{
 		"event_id": reversalEventID, "event_type": creditEventReversed, "tenant_id": tenant,
-		"payment_id": reversalEventID, "reversal_of_payment_id": settledAllocationID,
+		"payment_id": reversalEventID, "reversal_of_payment_id": original.PaymentID,
 		"customer_id": original.CustomerID, "contract_no": original.ContractNo,
 		"period_no": original.PeriodNo, "due_date": original.DueDate, "paid_date": original.PaidDate,
 		"due_amount": original.DueAmount, "paid_amount": "0.00", "source_system": "settlement",

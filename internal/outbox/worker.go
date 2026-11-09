@@ -107,6 +107,9 @@ func (s *Store) PendingByDestination(ctx context.Context) (map[string]int64, err
 	return pending, nil
 }
 
+// Delivered 原子标记出站成功与税控确认受理，不覆盖已完成的税控结果。
+// 参数：ctx为落库预算，events为已收到完整可信回执的本轮事件。
+// 返回值：租约丢失或持久化错误，失败保留可恢复状态。
 func (s *Store) Delivered(ctx context.Context, events []Event) error {
 	for _, e := range events {
 		tx, err := s.DB.BeginTx(ctx, nil)
@@ -133,9 +136,9 @@ func (s *Store) Delivered(ctx context.Context, events []Event) error {
 				return errors.New("invalid tax command payload")
 			}
 			if payload.AttemptID != "" {
-				_, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_issue_attempt SET status='ACCEPTED',accepted_at=COALESCE(accepted_at,UTC_TIMESTAMP(3)),next_reconcile_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 1 MINUTE) WHERE id=? AND tenant_id=? AND status='PENDING'`, payload.AttemptID, e.TenantID)
+				_, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_issue_attempt SET status='ACCEPTED',accepted_at=COALESCE(accepted_at,UTC_TIMESTAMP(3)),next_reconcile_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 1 MINUTE) WHERE id=? AND tenant_id=? AND status IN ('PENDING','UNKNOWN')`, payload.AttemptID, e.TenantID)
 			} else if payload.RedFlushAttemptID != "" {
-				_, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_red_flush_attempt SET status='ACCEPTED',accepted_at=COALESCE(accepted_at,UTC_TIMESTAMP(3)),next_reconcile_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 1 MINUTE) WHERE id=? AND tenant_id=? AND status='PENDING'`, payload.RedFlushAttemptID, e.TenantID)
+				_, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_red_flush_attempt SET status='ACCEPTED',accepted_at=COALESCE(accepted_at,UTC_TIMESTAMP(3)),next_reconcile_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 1 MINUTE) WHERE id=? AND tenant_id=? AND status IN ('PENDING','UNKNOWN')`, payload.RedFlushAttemptID, e.TenantID)
 			} else {
 				err = errors.New("tax command is missing attempt id")
 			}
@@ -344,6 +347,9 @@ func (w *Worker) deliverBatch(ctx context.Context, destination Destination, even
 	if len(filtered) == 0 {
 		return nil
 	}
+	if destination.Name == "TAX_INVOICE_COMMAND" {
+		return w.deliverTaxEvents(ctx, destination, filtered, store)
+	}
 	if err = w.deliver(ctx, destination, filtered); err != nil {
 		if errors.Is(err, ErrLicensePaused) {
 			return nil
@@ -358,6 +364,10 @@ func (w *Worker) deliverBatch(ctx context.Context, destination Destination, even
 	}
 	return store.Delivered(ctx, filtered)
 }
+
+// deliver 核验许可和凭据，保存税控发送意图后校验完整投递回执。
+// 参数：ctx为批次预算，d为目的地，events为当前有效租约内事件。
+// 返回值：发送、回执或保护事务错误，不把未知结果伪装为未受理。
 func (w *Worker) deliver(ctx context.Context, d Destination, events []Event) error {
 	if d.Name != "PLATFORM_AUDIT" && d.Name != "PLATFORM_NOTIFICATION" && w.CheckBusinessLicense != nil {
 		if w.CheckBusinessLicense(ctx) != nil {
@@ -390,6 +400,15 @@ func (w *Worker) deliver(ctx context.Context, d Destination, events []Event) err
 	if d.Name != "PLATFORM_AUDIT" && d.Name != "PLATFORM_NOTIFICATION" && w.CheckBusinessLicense != nil {
 		if w.CheckBusinessLicense(ctx) != nil {
 			return ErrLicensePaused
+		}
+	}
+	if d.Name == "TAX_INVOICE_COMMAND" {
+		recorder, ok := w.eventStoreHandle().(taxDispatchRecorder)
+		if !ok {
+			return errors.Join(errTaxDispatchProtection, errors.New("tax dispatch persistence is not configured"))
+		}
+		if err = recorder.BeginTaxDispatch(ctx, events); err != nil {
+			return errors.Join(errTaxDispatchProtection, err)
 		}
 	}
 	resp, err := w.HTTP.Do(req)
