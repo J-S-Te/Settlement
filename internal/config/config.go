@@ -274,6 +274,9 @@ func Load() (Config, error) {
 	if c.DashboardMachineEnabled, err = boolEnv("SETTLEMENT_DASHBOARD_MACHINE_ENABLED", false); err != nil {
 		return c, err
 	}
+	if _, err = c.ReimbursementCosts(); err != nil {
+		return c, err
+	}
 	if err = c.validateDashboardMachine(); err != nil {
 		return c, err
 	}

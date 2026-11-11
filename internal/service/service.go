@@ -28,6 +28,9 @@ type CreditEventPublisher interface {
 }
 
 type Service struct {
+	RecognitionDirectory   RecognitionDirectory
+	RecognitionEnvironment string
+	ReimbursementCosts     ReimbursementCostSource
 	NativeFinancialEnabled bool
 	CreditSyncSubscribed   *bool
 	ProjectReferences      ProjectReferenceResolver

@@ -1,6 +1,6 @@
 {
-  "catalog_version": "4",
-  "claims_role_config_hash": "settlement-v4-contract-import",
+  "catalog_version": "5",
+  "claims_role_config_hash": "settlement-v5-recognition",
   "policy": {
     "max_effective_roles": 12
   },
@@ -268,6 +268,27 @@
       "resource_code": "contract_revision",
       "resource_name": "合同修订",
       "risk_level": "HIGH"
+    },
+    {
+      "code": "settlement.recognition.read",
+      "name": "查看财务确认",
+      "action": "read",
+      "resource_code": "recognition",
+      "description": "查看财务确认"
+    },
+    {
+      "code": "settlement.recognition.record",
+      "name": "登记提交财务确认",
+      "action": "record",
+      "resource_code": "recognition",
+      "description": "登记提交财务确认"
+    },
+    {
+      "code": "settlement.recognition.review",
+      "name": "独立复核财务确认与冲回",
+      "action": "review",
+      "resource_code": "recognition",
+      "description": "独立复核财务确认与冲回"
     }
   ],
   "roles": [
@@ -306,7 +327,10 @@
         "settlement.import.reconcile",
         "settlement.import.release",
         "settlement.revision.read",
-        "settlement.revision.resolve"
+        "settlement.revision.resolve",
+        "settlement.recognition.read",
+        "settlement.recognition.record",
+        "settlement.recognition.review"
       ]
     },
     {
@@ -329,7 +353,9 @@
         "settlement.voucher.manage",
         "settlement.import.reconcile",
         "settlement.import.release",
-        "settlement.revision.read"
+        "settlement.revision.read",
+        "settlement.recognition.read",
+        "settlement.recognition.record"
       ]
     },
     {
@@ -344,7 +370,9 @@
         "settlement.report.read",
         "settlement.report.export",
         "settlement.notification.read",
-        "settlement.revision.read"
+        "settlement.revision.read",
+        "settlement.recognition.read",
+        "settlement.recognition.review"
       ]
     },
     {
@@ -419,7 +447,9 @@
         "settlement.import.release",
         "settlement.finance.override",
         "settlement.revision.read",
-        "settlement.revision.resolve"
+        "settlement.revision.resolve",
+        "settlement.recognition.read",
+        "settlement.recognition.review"
       ]
     },
     {

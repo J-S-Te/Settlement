@@ -97,6 +97,15 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 	api.service.ConfigureFinancialSources(cfg.NativeFinancialEnabled, cfg.CRMCreditSyncEnabled)
 	api.service.ERPProvider = erp
 	api.service.ProjectReferences = projectReferences
+	api.service.RecognitionEnvironment = cfg.OIDCEnvironmentCode
+	if source, ok := directory.(service.RecognitionDirectory); ok {
+		api.service.RecognitionDirectory = source
+	}
+	for _, dependency := range dependencies {
+		if source, ok := dependency.(service.ReimbursementCostSource); ok {
+			api.service.ReimbursementCosts = source
+		}
+	}
 	if roles, ok := directory.(service.RoleDirectory); ok {
 		api.service.RoleDirectory = roles
 	}
@@ -175,6 +184,13 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusForbidden, "SETTLEMENT_CSRF_REJECTED", "写请求来源校验失败")
 			return
 		}
+	}
+	if a.serveRecognitions(w, r) {
+		return
+	}
+	if r.URL.Path == "/internal/v1/dashboard/metrics" && r.Method == http.MethodGet {
+		a.dashboardMetrics(w, r)
+		return
 	}
 	if a.serveContractImports(w, r) {
 		return

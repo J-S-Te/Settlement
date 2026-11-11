@@ -44,13 +44,12 @@ func New(baseURL string, httpClient *http.Client, token TokenSource) (*Client, e
 	return &Client{baseURL: baseURL, httpClient: httpClient, token: token}, nil
 }
 
-// Upload 上传结算附件并返回文件 ID；requestID 用于完整请求哈希幂等。
-// Upload 用途：按财务用途上传文件，回单与发票使用独立purpose。
-// 参数：ctx为上下文，requestID为幂等键，applicationID为应用，classification为用途，
+// Upload 按显式财务用途上传真实文件，并保留请求身份供失败恢复。
+// 参数：ctx为请求边界，requestID为幂等身份，applicationID/classification为应用及用途；
 //
-//	name与mediaType为文件元数据，content为文件内容流。
+//	name/mediaType/content为真实文件名称、类型与字节流。
 //
-// 返回值：返回网关文件ID；上传或回执无效时返回错误。
+// 返回值：已就绪文件ID；上传或回执错误时失败关闭。
 func (c *Client) Upload(ctx context.Context, requestID, applicationID, classification, name, mediaType string, content io.Reader) (string, error) {
 	if strings.TrimSpace(requestID) == "" || strings.TrimSpace(applicationID) == "" || strings.TrimSpace(name) == "" || content == nil {
 		return "", errors.New("request ID, application ID, file name and content are required")
@@ -62,6 +61,9 @@ func (c *Client) Upload(ctx context.Context, requestID, applicationID, classific
 	switch classificationValue {
 	case "INVOICE_DOCUMENT", "ELECTRONIC_INVOICE":
 		_ = writer.WriteField("purpose", "settlement.invoice.document")
+		classificationValue = "CONFIDENTIAL"
+	case "RECOGNITION_EVIDENCE":
+		_ = writer.WriteField("purpose", "settlement.recognition.evidence")
 		classificationValue = "CONFIDENTIAL"
 	case "RECEIPT_DOCUMENT":
 		_ = writer.WriteField("purpose", "settlement.receipt.document")

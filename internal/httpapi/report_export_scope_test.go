@@ -124,7 +124,7 @@ func TestReportExportCreationSnapshotsRequesterScope(t *testing.T) {
 	if err := json.Unmarshal(raw, &snapshot); err != nil {
 		t.Fatalf("requester_scope 不是合法JSON: %v", err)
 	}
-	if snapshot["user_id"] != grant.UserID || snapshot["catalog_version"] != "4" {
+	if snapshot["user_id"] != grant.UserID || snapshot["catalog_version"] != "5" {
 		t.Fatalf("快照缺少申请人或目录版本: %s", raw)
 	}
 	permissions, _ := snapshot["permissions"].([]any)

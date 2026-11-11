@@ -15,13 +15,16 @@ import (
 )
 
 type Reference struct {
-	TenantID   string `json:"tenant_id"`
-	ProjectID  string `json:"project_id"`
-	ContractID string `json:"contract_id"`
-	CustomerID string `json:"customer_id"`
-	Name       string `json:"name"`
-	Version    uint64 `json:"version"`
-	Active     bool   `json:"active"`
+	OwnerOrgID        string   `json:"owner_org_id"`
+	ManagerIdentityID string   `json:"manager_identity_id"`
+	ServiceItemIDs    []string `json:"service_item_ids"`
+	TenantID          string   `json:"tenant_id"`
+	ProjectID         string   `json:"project_id"`
+	ContractID        string   `json:"contract_id"`
+	CustomerID        string   `json:"customer_id"`
+	Name              string   `json:"name"`
+	Version           uint64   `json:"version"`
+	Active            bool     `json:"active"`
 }
 type Client struct {
 	baseURL string

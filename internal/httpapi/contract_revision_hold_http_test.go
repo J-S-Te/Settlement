@@ -71,10 +71,10 @@ func revisionHoldAuthHandler(t *testing.T, db *sql.DB, grant revisionHoldPrincip
 			"application_code": "settlement", "environment_code": "test",
 			"roles": grant.Roles, "permissions": grant.Permissions,
 			"data_scopes":                   []map[string]string{{"role_code": grant.Roles[0], "scope_type": scopeType}},
-			"catalog_version":               "4",
-			"compatible_catalog_versions":   []string{"4"},
-			"role_config_hash":              "settlement-v4-contract-import",
-			"compatible_role_config_hashes": []string{"settlement-v4-contract-import"},
+			"catalog_version":               "5",
+			"compatible_catalog_versions":   []string{"5"},
+			"role_config_hash":              "settlement-v5-recognition",
+			"compatible_role_config_hashes": []string{"settlement-v5-recognition"},
 			"authorization_revision":        1,
 		})
 	}))
