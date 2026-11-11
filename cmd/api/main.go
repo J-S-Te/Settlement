@@ -24,9 +24,9 @@ import (
 	"golang.org/x/oauth2/clientcredentials"
 )
 
-// main 用途：装配结算API、身份、文件及权威项目引用服务并管理退出。
-// 参数：无，读取经过校验的进程配置。
-// 返回值：无，启动失败通过日志与进程退出报告。
+// main 装配结算API及独立机器用途，启动受控HTTP服务。
+// 参数：无，读取已校验运行配置。
+// 返回值：无，初始化失败时退出进程。
 func main() {
 	licenseCtx, licenseStop := context.WithCancel(context.Background())
 	defer licenseStop()
@@ -126,6 +126,19 @@ func main() {
 		dependencies = append(dependencies, fileGateway)
 	}
 	dependencies = append(dependencies, commercialGate)
+	if cfg.DashboardMachineEnabled {
+		dashboardMachine, verifyErr := platform.NewDashboardTokenVerifier(context.Background(), platform.ClientCredentialsVerifierOptions{
+			Issuer: cfg.DashboardMachineIssuer, Audience: cfg.DashboardMachineAudience,
+			PublicKeyPath: cfg.DashboardMachinePublicKeyPath, ClientID: cfg.DashboardMachineClientID,
+			TenantID: cfg.OIDCTenantID, CallerApplicationCode: cfg.DashboardMachineCallerApplicationCode,
+			CallerEnvironmentCode: cfg.DashboardMachineCallerEnvironmentCode, RequiredScope: cfg.DashboardMachineRequiredScope,
+		}, cfg.DashboardMachineOAuthClientID)
+		if verifyErr != nil {
+			slog.Error("initialize dashboard machine token verifier", "error", verifyErr)
+			os.Exit(1)
+		}
+		dependencies = append(dependencies, &httpapi.DashboardIntegrationOptions{Verifier: dashboardMachine})
+	}
 	if cfg.HandoverMachineEnabled {
 		// 交接协议与合同/项目仓库使用同一平台 application JWT 信任域：
 		// 平台自身 ApplicationJWTManager 签发（caller=platform、env=prod、scope=handover.machine），

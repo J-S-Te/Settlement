@@ -22,6 +22,17 @@ const CRMCreditPaymentIngestScope = "customer.credit.payment.ingest"
 // API 为独立子系统，不得复用其他应用的数据库、
 // 浏览器 Cookie 或机器客户端凭据。
 type Config struct {
+	// DashboardMachineClientID绑定JWT sub；OAuthClientID绑定注册记录oauth_client_id。
+	DashboardMachineEnabled               bool
+	DashboardMachineClientID              string
+	DashboardMachineOAuthClientID         string
+	DashboardMachineAudience              string
+	DashboardMachineIssuer                string
+	DashboardMachinePublicKeyPath         string
+	DashboardMachineCallerApplicationCode string
+	DashboardMachineCallerEnvironmentCode string
+	DashboardMachineRequiredScope         string
+
 	CentralSessionEnabled        bool
 	CentralSessionPublicBaseURL  string
 	ProjectReferenceURL          string
@@ -148,18 +159,24 @@ func isProductionEnvironmentCode(value string) bool {
 	}
 }
 
-// Load 用途：读取并校验结算启动配置，拒绝不完整的项目引用机器身份。
+// Load 读取并校验结算启动配置与各独立机器用途。
 // 参数：无，从进程环境读取配置。
-// 返回值：返回经校验配置及配置错误，不输出凭据。
-// Load 读取结算配置，按显式能力验证独立机器身份与本地财务开关。
-// 参数：无；从进程环境读取。
-// 返回值：有效配置；缺失身份或非法设置时返回错误。
+// 返回值：有效配置；依赖或受信身份缺失、设置非法时返回错误。
 func Load() (Config, error) {
 	trustedProxies, trustedErr := parseTrustedProxies(env("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128"))
 	if trustedErr != nil {
 		return Config{}, fmt.Errorf("APP_TRUSTED_PROXIES: %w", trustedErr)
 	}
 	c := Config{
+		DashboardMachineClientID:              strings.TrimSpace(os.Getenv("SETTLEMENT_DASHBOARD_MACHINE_CLIENT_ID")),
+		DashboardMachineOAuthClientID:         strings.TrimSpace(os.Getenv("SETTLEMENT_DASHBOARD_MACHINE_OAUTH_CLIENT_ID")),
+		DashboardMachineAudience:              strings.TrimSpace(os.Getenv("SETTLEMENT_DASHBOARD_MACHINE_AUDIENCE")),
+		DashboardMachineIssuer:                strings.TrimSpace(os.Getenv("SETTLEMENT_DASHBOARD_MACHINE_ISSUER")),
+		DashboardMachinePublicKeyPath:         strings.TrimSpace(os.Getenv("SETTLEMENT_DASHBOARD_MACHINE_PUBLIC_KEY_PATH")),
+		DashboardMachineCallerApplicationCode: strings.TrimSpace(os.Getenv("SETTLEMENT_DASHBOARD_MACHINE_CALLER_APPLICATION_CODE")),
+		DashboardMachineCallerEnvironmentCode: strings.TrimSpace(os.Getenv("SETTLEMENT_DASHBOARD_MACHINE_CALLER_ENVIRONMENT_CODE")),
+		DashboardMachineRequiredScope:         strings.TrimSpace(os.Getenv("SETTLEMENT_DASHBOARD_MACHINE_REQUIRED_SCOPE")),
+
 		ProjectReferenceURL:          strings.TrimSpace(os.Getenv("SETTLEMENT_PROJECT_REFERENCE_URL")),
 		ProjectReferenceTokenURL:     strings.TrimSpace(os.Getenv("SETTLEMENT_PROJECT_REFERENCE_TOKEN_URL")),
 		ProjectReferenceClientID:     strings.TrimSpace(os.Getenv("SETTLEMENT_PROJECT_REFERENCE_CLIENT_ID")),
@@ -252,6 +269,12 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.TaxResultIngestEnabled, err = boolEnv("SETTLEMENT_TAX_RESULT_INGEST_ENABLED", false); err != nil {
+		return c, err
+	}
+	if c.DashboardMachineEnabled, err = boolEnv("SETTLEMENT_DASHBOARD_MACHINE_ENABLED", false); err != nil {
+		return c, err
+	}
+	if err = c.validateDashboardMachine(); err != nil {
 		return c, err
 	}
 	if c.HandoverMachineEnabled, err = boolEnv("SETTLEMENT_HANDOVER_ENABLED", false); err != nil {

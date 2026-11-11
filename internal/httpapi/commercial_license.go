@@ -56,7 +56,7 @@ func commercialOperation(method, path string) core.Operation {
 	if method != http.MethodGet {
 		return core.MUTATE_BUSINESS
 	}
-	if path == "/internal/v1/handover/responsibilities" {
+	if path == "/internal/v1/dashboard/finance" || path == "/internal/v1/handover/responsibilities" {
 		return core.READ_HISTORY
 	}
 	if strings.HasPrefix(path, "/internal/v1/handover/transfers/") {

@@ -31,6 +31,8 @@ import (
 )
 
 type API struct {
+	dashboardMachine handoverVerifier
+
 	handover        *handover.Service
 	handoverMachine handoverVerifier
 	service         *service.Service
@@ -49,12 +51,9 @@ type InvoiceFileGateway interface {
 	Download(context.Context, string) ([]byte, error)
 }
 
-// New 用途：按结算权限、责任范围和错误契约处理请求。
-// 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
-// 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
-// New 装配结算入口及显式财务来源，复用现有身份、授权和外部依赖。
-// 参数：db为自有库，cfg为运行配置，logger为日志，auth及两个机器验签器隔离入口，dependencies提供可选适配器。
-// 返回值：完整HTTP处理器；未配置依赖由各受保护入口明确拒绝。
+// New 装配结算入口及显式财务来源，复用既有身份与授权。
+// 参数：db为自有库，cfg为配置，logger为日志，auth及机器验签器隔离入口，dependencies为可选适配器。
+// 返回值：HTTP处理器；未配置依赖由受保护入口明确拒绝。
 func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Authenticator, machine, taxMachine *platform.ServiceTokenVerifier, dependencies ...any) http.Handler {
 	var erp service.ERPProvider
 	var projectReferences service.ProjectReferenceResolver
@@ -64,7 +63,11 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 	var commercial CommercialLicenseGate
 	var handoverService *handover.Service
 	var handoverMachine handoverVerifier
+	var dashboardMachine handoverVerifier
 	for _, dependency := range dependencies {
+		if value, ok := dependency.(*DashboardIntegrationOptions); ok && value != nil {
+			dashboardMachine = value.Verifier
+		}
 		if value, ok := dependency.(service.ERPProvider); ok {
 			erp = value
 		}
@@ -97,6 +100,7 @@ func New(db *sql.DB, cfg config.Config, logger *slog.Logger, auth *platform.Auth
 	if roles, ok := directory.(service.RoleDirectory); ok {
 		api.service.RoleDirectory = roles
 	}
+	api.dashboardMachine = dashboardMachine
 	api.commercial = commercial
 	api.service.CheckInvoiceArchiveLicense = api.checkInvoiceArchiveLicense
 	if handoverService != nil && handoverMachine != nil {
@@ -179,6 +183,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.URL.Path == "/internal/v1/dashboard/finance" && r.Method == http.MethodGet:
+		a.dashboardFinance(w, r)
+		return
 	case r.URL.Path == "/healthz":
 		write(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
