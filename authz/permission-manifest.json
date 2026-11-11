@@ -274,21 +274,24 @@
       "name": "查看财务确认",
       "action": "read",
       "resource_code": "recognition",
-      "description": "查看财务确认"
+      "resource_name": "财务确认",
+      "risk_level": "LOW"
     },
     {
       "code": "settlement.recognition.record",
       "name": "登记提交财务确认",
       "action": "record",
       "resource_code": "recognition",
-      "description": "登记提交财务确认"
+      "resource_name": "财务确认",
+      "risk_level": "MEDIUM"
     },
     {
       "code": "settlement.recognition.review",
       "name": "独立复核财务确认与冲回",
       "action": "review",
       "resource_code": "recognition",
-      "description": "独立复核财务确认与冲回"
+      "resource_name": "财务确认",
+      "risk_level": "HIGH"
     }
   ],
   "roles": [
