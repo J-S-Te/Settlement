@@ -75,12 +75,15 @@ func identifier(s string) bool {
 	return true
 }
 func validTime(t int64) bool { return t > 0 && t <= maxTime }
+// validBinding 用途：校验运行绑定的身份格式及有限商业应用边界。
+// 参数：b为当前消费者的实例、环境、应用与服务绑定。
+// 返回值：全部身份合法且应用已知时为真，否则拒绝该绑定。
 func validBinding(b Binding) bool {
 	if !identifier(b.InstanceID) || !identifier(b.Environment) || !identifier(b.ServiceID) {
 		return false
 	}
 	switch b.Application {
-	case "customer_and_opportunity", "customer_portal", "contract_management", "project_management", "settlement", "data_analysis":
+	case "customer_and_opportunity", "customer_portal", "contract_management", "project_management", "settlement", "data_analysis", "reimbursement":
 		return true
 	}
 	return false

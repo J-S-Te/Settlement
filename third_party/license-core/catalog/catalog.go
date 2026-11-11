@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // Version 仅在组件契约变化时更新。常规镜像重建不改变版本，
@@ -57,6 +58,10 @@ type Component struct {
 }
 
 var componentsByApplication = map[string][]Component{
+	"reimbursement": {
+		{Application: "reimbursement", ServiceID: "reimbursement-api", Role: RoleAPI, RegistrationProtocol: RegistrationProtocolV2},
+		{Application: "reimbursement", ServiceID: "reimbursement-worker", Role: RoleWorker, RegistrationProtocol: RegistrationProtocolV2},
+	},
 	"contract_management": {
 		{Application: "contract_management", ServiceID: "contract-api", Role: RoleAPI, RegistrationProtocol: RegistrationProtocolV2},
 		{Application: "contract_management", ServiceID: "contract-worker", Role: RoleWorker, RegistrationProtocol: RegistrationProtocolV2},
@@ -91,6 +96,18 @@ var componentsByApplication = map[string][]Component{
 		{Application: "settlement", ServiceID: "settlement-api", Role: RoleAPI, RegistrationProtocol: RegistrationProtocolV2},
 		{Application: "settlement", ServiceID: "settlement-worker", Role: RoleWorker, RegistrationProtocol: RegistrationProtocolV2},
 	},
+}
+
+// Applications 用途：返回目录内全部商业应用码的已排序副本。
+// 参数：无。
+// 返回值：与内部目录隔离的已排序应用码，调用方可安全修改。
+func Applications() []string {
+	applications := make([]string, 0, len(componentsByApplication))
+	for application := range componentsByApplication {
+		applications = append(applications, application)
+	}
+	sort.Strings(applications)
+	return applications
 }
 
 // Components 返回指定应用的有限组件目录副本。

@@ -63,7 +63,7 @@ var (
 	ErrDenied   = errors.New("commercial license denies operation")
 	ErrRollback = errors.New("commercial license rollback rejected")
 )
-var applications = map[string]bool{"customer_and_opportunity": true, "customer_portal": true, "contract_management": true, "project_management": true, "settlement": true, "data_analysis": true}
+var applications = map[string]bool{"customer_and_opportunity": true, "customer_portal": true, "contract_management": true, "project_management": true, "settlement": true, "data_analysis": true, "reimbursement": true}
 
 func identifier(s string) bool {
 	if len(s) == 0 || len(s) > 128 || strings.TrimSpace(s) != s {
