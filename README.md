@@ -108,3 +108,22 @@
 后台默认向实际销售负责人发计划确认/到期/逾期提醒；配置默认提前3天、逾期第1天、每7天重复，30天升级经理/管理层通知。经理与管理层通知不授予额外写权限。原定制催收员策略继续执行；负责人提醒以独立阶段游标防重复，失败候选5分钟后重试，避免批首失效人员饿死后续销售。冻结暂停、结清关闭，目录失败不会派给无资格人员。
 
 上线前需执行新增结算迁移000016–000019及合同迁移000032，发布并同步各应用目录，再由有权人员实际分配角色/项目。当前任务只完成源码和本地/隔离验证，未改现行业务环境或真实授权。真实OIDC、跨服务机器凭据、ERP/税控、文件网关及浏览器验收单独核实；证据见[角色任务记录](../.ai/qa/settlement-role-completion-20261028/TASK_STATE.md)。
+
+## 财务看板独立机器来源（2026-11-11）
+
+`GET /internal/v1/dashboard/finance` 是数据分析的独立只读来源，精确 GET 归类 `READ_HISTORY`。仅接受平台 application JWT；不得复用合同摄取令牌、交接令牌、浏览器会话或人工财务权限。用途名为 `settlement_dashboard_read`，唯一 scope 为 `dashboard.settlement.read`，调用应用固定 `data_analysis`。
+
+用途默认关闭，既有部署无需补字段即可正常启动，调用端点明确返回503。开启 `SETTLEMENT_DASHBOARD_MACHINE_ENABLED=true` 时，以下同前缀字段全部必填：
+
+- `CLIENT_ID`：JWT `sub` 的专用机器主体编码。
+- `OAUTH_CLIENT_ID`：JWT `oauth_client_id` 的已注册OAuth客户端记录ID，与主体编码分别绑定。
+- `AUDIENCE`、`ISSUER`、`PUBLIC_KEY_PATH`：平台受众、发行者和只读Ed25519公钥路径。
+- `CALLER_APPLICATION_CODE=data_analysis`、`CALLER_ENVIRONMENT_CODE`、`REQUIRED_SCOPE=dashboard.settlement.read`。
+
+租户绑定已有 `OIDC_TENANT_ID`。开启但缺字段或用途漂移时启动失败；无Bearer或验签、租户、注册ID、生效时间任一不符返回401，不接受请求参数/请求头指定租户。该用途不在进程内授予或创建外部机器身份，须由平台受控接线。
+
+成功响应直接返回 BusinessSnapshot JSON（不包 `data`）：`available`、`tenant_id`、`snapshot_at`、`metrics`、`missing_metrics`、`basis`、`source_code=settlement` 及可选真实 `source_updated_at`（RFC3339）。`metrics` 包含 `currencies`、`month`、`as_of_date`；每币种行包含 `currency`、`original_minor`、`allocated_minor`、`open_minor`、`over_90_minor`、`month_receipts_minor`、可空 `collection_rate`。
+
+金额聚合不换汇，SQL DECIMAL 字符串精确转 int64 分，精度异常和溢出失败关闭。CONFIRMED 应收只计同租户 RELEASED 合同快照；已核销直接取净 `received_allocated_amount`，不重复累加旧 allocation；未清余额沿用包含 writeoff 的权威 open_amount。回款仅 AVAILABLE/PARTIALLY_ALLOCATED/FULLY_ALLOCATED 三态，排除 HOLD 等未释放导入事实。本次唯一取时统一按北京时间算业务日、90天截止日和当月半开窗口。零分母回款率为 null；收入确认与部门成本保持 `missing_metrics`。整个来源读取在30秒超时的单个只读可重复读事务内完成，按币种有界聚合，提交失败不返回成功。
+
+开发测试复用既有 SQL 边界驱动、httptest 和合成签名，不声称其替代真实数据库。真实 SQL 回归需显式私有普通文件 `SETTLEMENT_DASHBOARD_TEST_DSN_FILE`，只接受 tcp 回环 `127.0.0.1` 和 `settlement_test_` 前缀隔离库；运行 `go test ./internal/service -run '^TestDashboardFinanceMySQL$' -count=1 -v`。未配置则安全跳过，不连接业务库。
