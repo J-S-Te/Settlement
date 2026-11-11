@@ -21,6 +21,7 @@ import (
 	"github.com/j-s-te/settlement/internal/httpapi"
 	"github.com/j-s-te/settlement/internal/platform"
 	"github.com/j-s-te/settlement/internal/projectreference"
+	"github.com/j-s-te/settlement/internal/service"
 	"golang.org/x/oauth2/clientcredentials"
 )
 
@@ -164,6 +165,19 @@ func main() {
 			os.Exit(1)
 		}
 		dependencies = append(dependencies, handoverService, handoverMachine)
+	}
+	costSettings, costErr := cfg.ReimbursementCosts()
+	if costErr != nil {
+		slog.Error("invalid reimbursement cost configuration")
+		os.Exit(1)
+	}
+	if costSettings.Enabled {
+		source, err := service.NewReimbursementCosts(costSettings.URL, costSettings.TokenURL, costSettings.ClientID, costSettings.ClientSecret, costSettings.TenantID, costSettings.Environment)
+		if err != nil {
+			slog.Error("reimbursement cost client unavailable")
+			os.Exit(1)
+		}
+		dependencies = append(dependencies, source)
 	}
 	if cfg.ProjectReferenceURL != "" {
 		projectClient, clientErr := projectreference.New(cfg.ProjectReferenceURL, cfg.ProjectReferenceClientID, cfg.ProjectReferenceClientSecret, cfg.ProjectReferenceTokenURL, 10*time.Second)

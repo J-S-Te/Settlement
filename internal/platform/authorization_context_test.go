@@ -14,7 +14,7 @@ import (
 // 参数：t为测试上下文。
 // 返回值：无，N/N-1兼容或残缺窗口拒绝行为异常时失败。
 func TestSettlementCatalogCompatibilityAcceptsNMinusOneAndRejectsPartialWindow(t *testing.T) {
-	value := authorizationContext{CatalogVersion: "5", CompatibleCatalogVersions: []string{"5", "4"}, RoleConfigHash: "hash-5", CompatibleRoleConfigHashes: []string{"hash-5", "settlement-v4-contract-import"}}
+	value := authorizationContext{CatalogVersion: "6", CompatibleCatalogVersions: []string{"6", "5"}, RoleConfigHash: "hash-6", CompatibleRoleConfigHashes: []string{"hash-6", "settlement-v5-recognition"}}
 	if err := validateSettlementCatalogCompatibility(value); err != nil {
 		t.Fatalf("N-1 catalog rejected: %v", err)
 	}

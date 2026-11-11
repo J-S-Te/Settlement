@@ -127,3 +127,15 @@
 金额聚合不换汇，SQL DECIMAL 字符串精确转 int64 分，精度异常和溢出失败关闭。CONFIRMED 应收只计同租户 RELEASED 合同快照；已核销直接取净 `received_allocated_amount`，不重复累加旧 allocation；未清余额沿用包含 writeoff 的权威 open_amount。回款仅 AVAILABLE/PARTIALLY_ALLOCATED/FULLY_ALLOCATED 三态，排除 HOLD 等未释放导入事实。本次唯一取时统一按北京时间算业务日、90天截止日和当月半开窗口。零分母回款率为 null；收入确认与部门成本保持 `missing_metrics`。整个来源读取在30秒超时的单个只读可重复读事务内完成，按币种有界聚合，提交失败不返回成功。
 
 开发测试复用既有 SQL 边界驱动、httptest 和合成签名，不声称其替代真实数据库。真实 SQL 回归需显式私有普通文件 `SETTLEMENT_DASHBOARD_TEST_DSN_FILE`，只接受 tcp 回环 `127.0.0.1` 和 `settlement_test_` 前缀隔离库；运行 `go test ./internal/service -run '^TestDashboardFinanceMySQL$' -count=1 -v`。未配置则安全跳过，不连接业务库。
+
+## 财务经营确认账本
+
+「收入与成本确认」登记的是本系统有真实凭证、经独立财务复核的经营确认事实，不自动推断总账政策。会计使用`settlement.recognition.record`登记/编辑本人草稿并提交；复核员与财务经理使用`settlement.recognition.review`独立确认或退回。明细需要`settlement.recognition.read`和明确TENANT/ORG范围；配置管理员不取得财务能力，登记/提交人不能自审。已确认记录不可覆写，更正须关联原事实另建冲回并独立审核，冲回不能超过原净额与税额。
+
+发生日与确认日独立保存；看板按北京确认月列不含税净额，税额分列，冲回在本次确认月列负数，币种不换汇。组织/人员由受控在职目录选择并冻结为本次业务归属，项目/服务项由既有专用项目引用校验；不声称当前目录可以证明历史任职。
+
+财务原件经`POST /api/v1/recognitions/evidence`上传，PDF/JPEG/PNG最多10MiB，文件魔数与类型须一致。沿现有网关身份使用`settlement.recognition.evidence`，资源类型`settlement_recognition_evidence`、绑定类型`EVIDENCE`。上传/绑定失败保留PENDING意图，同内容同幂等键恢复，只有READY引用可用于确认。下载逐次验证当前组织范围、原网关身份、文件SHA256并记录审计；沿用已有结算凭证也会校验真实同租户、币种及核销关系。
+
+报销专用读取默认关闭，见`.env.example`的`SETTLEMENT_REIMBURSEMENT_COST_*`。启用后只从唯一报销权威源取得付款/全额冲正及批准快照中的费用项、费用性质、发生日和精确分摊；项目支出副本不会再累加。PREPAYMENT由逐项expense_nature确定，需要实际发生/摊销依据并独立确认，不能因付款自动计成本。同单旧付款冲正而原确认尚未独立冲回时，整单后续确认冻结；重付不会获得新的费用额度。
+
+业务入口`/api/v1/recognitions`及`/:id/submit|decision`，草稿PATCH带expected_version；读取真实limit/offset分页。机器`GET /internal/v1/dashboard/metrics`沿既有dashboard专用身份与READ_HISTORY，单RR事务输出最多10000行/8MiB，超限整体失败；未知旧报销付款明确列reimbursement_unknown，不猜填费用性质，也不抹掉已有确认。

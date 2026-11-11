@@ -51,7 +51,7 @@ func (a *API) serveImportQueries(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	if machine && id == "capabilities" {
-		write(w, http.StatusOK, map[string]any{"schema_version": 1, "prepare_enabled": a.cfg.ContractImportEnabled, "phases": []string{"PREPARE", "RELEASE"}, "import_modes": []string{"CONTINUE_LIVE", "HISTORICAL_CLOSED"}, "supported_fact_types": []string{"RECEIPT", "ALLOCATION"}, "blocked_fact_types": []string{"REVERSAL", "REFUND", "INVOICE", "RED_INVOICE"}, "expected_facts_required": true, "catalog_version": "4", "reconcile_permission": "settlement.import.reconcile", "release_permission": "settlement.import.release"})
+		write(w, http.StatusOK, map[string]any{"schema_version": 1, "prepare_enabled": a.cfg.ContractImportEnabled, "phases": []string{"PREPARE", "RELEASE"}, "import_modes": []string{"CONTINUE_LIVE", "HISTORICAL_CLOSED"}, "supported_fact_types": []string{"RECEIPT", "ALLOCATION"}, "blocked_fact_types": []string{"REVERSAL", "REFUND", "INVOICE", "RED_INVOICE"}, "expected_facts_required": true, "catalog_version": "5", "reconcile_permission": "settlement.import.reconcile", "release_permission": "settlement.import.release"})
 		return true
 	}
 	if id != "" {
