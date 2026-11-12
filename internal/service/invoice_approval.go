@@ -164,12 +164,19 @@ func (s *Service) ReviewSpecialInvoice(ctx context.Context, p Principal, id stri
 		return "", err
 	}
 	defer tx.Rollback()
-	var applicant, snapshot string
-	if err = tx.QueryRowContext(ctx, `SELECT submitted_by,contract_snapshot_id FROM settlement_invoice_request WHERE id=? AND tenant_id=? AND status='SPECIAL_REVIEW' AND version=? FOR UPDATE`, id, p.TenantID, version).Scan(&applicant, &snapshot); err != nil {
+	var applicant, ordinaryApprover, snapshot string
+	if err = tx.QueryRowContext(ctx, `SELECT submitted_by,COALESCE(approved_by,''),contract_snapshot_id FROM settlement_invoice_request WHERE id=? AND tenant_id=? AND status='SPECIAL_REVIEW' AND version=? FOR UPDATE`, id, p.TenantID, version).Scan(&applicant, &ordinaryApprover, &snapshot); err != nil {
 		return "", ErrConflict
 	}
 	if applicant == p.UserID {
-		return "", ErrForbidden
+		return "", fmt.Errorf("%w: 申请人不能加签自己的开票申请", ErrForbidden)
+	}
+	// 两级审批必须由不同人完成：普通财务审核人不能同时担任总监加签人。
+	if ordinaryApprover == "" {
+		return "", fmt.Errorf("%w: 缺少普通审核人，不能完成总监加签", ErrConflict)
+	}
+	if ordinaryApprover == p.UserID {
+		return "", fmt.Errorf("%w: 普通审核人与总监加签必须不同人", ErrForbidden)
 	}
 	if err = s.RequireContractAccessTx(ctx, tx, p, "settlement.invoice.special_approve", snapshot); err != nil {
 		return "", err
