@@ -580,6 +580,18 @@ func (s *Service) ResolveContractRevisionHold(ctx context.Context, p Principal, 
 		if err = s.RequireContractAccessTx(ctx, tx, p, "settlement.revision.resolve", snapshot); err != nil {
 			return err
 		}
+		// 关单闸门：新快照下不能还有待确认计划或在途开票申请；
+		// 已开票红冲等已实现事实仍由财务在关单说明中确认（见核对报告）。
+		var blocking int
+		if err = tx.QueryRowContext(ctx, `SELECT
+			(SELECT COUNT(*) FROM settlement_receivable_plan WHERE tenant_id=? AND contract_snapshot_id=? AND confirmation_status<>'CONFIRMED')
+			+ (SELECT COUNT(*) FROM settlement_invoice_request WHERE tenant_id=? AND contract_snapshot_id=? AND status IN ('SUBMITTED','SPECIAL_REVIEW','ISSUE_PENDING','ISSUE_UNKNOWN'))`,
+			p.TenantID, snapshot, p.TenantID, snapshot).Scan(&blocking); err != nil {
+			return err
+		}
+		if blocking > 0 {
+			return fmt.Errorf("%w: 存在未确认的应收计划或在途开票申请，不能关闭修订工单", ErrConflict)
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE settlement_contract_revision_hold SET status='RESOLVED',resolution_reason=?,resolved_by=?,resolved_at=UTC_TIMESTAMP(3),updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND id=? AND status='PENDING_REVIEW'`, reason, p.UserID, p.TenantID, id); err != nil {
 		return err
