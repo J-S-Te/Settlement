@@ -46,7 +46,7 @@ func (s *Service) ApproveInvoiceRequest(ctx context.Context, p Principal, id str
 	return s.createApprovedInvoiceAttempt(ctx, tx, p, id, version)
 }
 
-// createApprovedInvoiceAttempt 创建已完成审批的执行任务。
+// 用途：创建已完成审批的执行任务，税控冲突保留明确公开拒绝。
 // 参数：ctx 上下文，tx 事务，p 审批主体，id 申请标识，version 当前版本。
 // 返回值：执行任务标识或错误；成功提交事务。
 func (s *Service) createApprovedInvoiceAttempt(ctx context.Context, tx *sql.Tx, p Principal, id string, version int) (string, error) {
@@ -58,7 +58,8 @@ func (s *Service) createApprovedInvoiceAttempt(ctx context.Context, tx *sql.Tx, 
 		return "", err
 	}
 	if providerConflicts != 0 {
-		return "", fmt.Errorf("%w: 税控结果存在冲突，禁止重新开票", ErrConflict)
+		return "", businessFeedback(ErrConflict, "INVOICE_PROVIDER_CONFLICT",
+			"税控结果存在冲突，禁止重新开票；请先核对税控结果与当前申请，勿重复提交开具")
 	}
 	attempt := newID()
 	channel := "MANUAL"
@@ -149,7 +150,7 @@ type ManualInvoiceInput struct {
 // RegisterManualInvoice 是安全的第一阶段适配器：可关闭
 // 已审批请求，无需将核心台账耦合到特定税控厂商。
 
-// ReviewSpecialInvoice 执行财务之后的总监加签并禁止申请人自审。
+// ReviewSpecialInvoice 用途：执行总监加签，保留既有异人审核门禁及安全拒绝。
 // 参数：ctx 上下文，p 总监主体，id 申请标识，version 预期版本，approve 决定，reason 拒绝原因。
 // 返回值：加签通过后的执行任务标识或错误。
 func (s *Service) ReviewSpecialInvoice(ctx context.Context, p Principal, id string, version int, approve bool, reason string) (string, error) {
@@ -164,15 +165,26 @@ func (s *Service) ReviewSpecialInvoice(ctx context.Context, p Principal, id stri
 		return "", err
 	}
 	defer tx.Rollback()
-	var applicant, snapshot string
-	if err = tx.QueryRowContext(ctx, `SELECT submitted_by,contract_snapshot_id FROM settlement_invoice_request WHERE id=? AND tenant_id=? AND status='SPECIAL_REVIEW' AND version=? FOR UPDATE`, id, p.TenantID, version).Scan(&applicant, &snapshot); err != nil {
+	var applicant, ordinaryApprover, snapshot string
+	if err = tx.QueryRowContext(ctx, `SELECT submitted_by,COALESCE(approved_by,''),contract_snapshot_id FROM settlement_invoice_request WHERE id=? AND tenant_id=? AND status='SPECIAL_REVIEW' AND version=? FOR UPDATE`, id, p.TenantID, version).Scan(&applicant, &ordinaryApprover, &snapshot); err != nil {
 		return "", ErrConflict
 	}
-	if applicant == p.UserID {
-		return "", ErrForbidden
-	}
+	// 先确认合同可见范围，避免向范围外主体披露申请人与审核记录。
 	if err = s.RequireContractAccessTx(ctx, tx, p, "settlement.invoice.special_approve", snapshot); err != nil {
 		return "", err
+	}
+	if applicant == p.UserID {
+		return "", businessFeedback(ErrForbidden, "INVOICE_APPLICANT_SPECIAL_REVIEW",
+			"申请人不能加签自己的开票申请，请由其他具备总监加签权限的人员处理")
+	}
+	// 两级审批必须由不同人完成：普通财务审核人不能同时担任总监加签人。
+	if ordinaryApprover == "" {
+		return "", businessFeedback(ErrConflict, "INVOICE_ORDINARY_REVIEW_REQUIRED",
+			"缺少普通审核人，不能完成总监加签；请先核对该申请的普通财务审核记录")
+	}
+	if ordinaryApprover == p.UserID {
+		return "", businessFeedback(ErrForbidden, "INVOICE_REVIEWER_SEPARATION",
+			"普通审核人与总监加签必须不同人，请由其他具备总监加签权限的人员处理")
 	}
 	state := "APPROVED"
 	if !approve {

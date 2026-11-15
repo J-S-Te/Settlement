@@ -68,13 +68,13 @@ func TestRefundRequiresIndependentApprovedCurrentState(t *testing.T) {
 		{"stale", "REFUND_PENDING", "REFUND_PENDING", "manager", 4, false, ErrConflict},
 		{"held", "HELD", "REFUND_PENDING", "manager", 3, false, ErrConflict},
 		{"unapproved", "REFUND_PENDING", "REFUND_PENDING", "", 3, false, ErrConflict},
-		{"self-approved", "REFUND_PENDING", "REFUND_PENDING", "accountant", 3, false, ErrConflict},
+		{"self-approved", "REFUND_PENDING", "REFUND_PENDING", "accountant", 3, false, ErrForbidden},
 		{"wrong-resolution", "REFUND_PENDING", "CARRY_FORWARD", "manager", 3, false, ErrConflict},
 		{"hidden", "", "", "", 0, true, ErrNotFound},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			rows := [][]driver.Value{{c.status, c.resolution, "accountant", "accountant", c.approver, "receipt", int64(c.version)}}
+			rows := [][]driver.Value{{c.status, c.resolution, "applicant", "resolver", c.approver, "receipt", int64(c.version)}}
 			if c.missing {
 				rows = nil
 			}
@@ -93,7 +93,7 @@ func TestRefundRequiresIndependentApprovedCurrentState(t *testing.T) {
 func TestRefundTransactionPreservesMoneyAndRollsBackAuditFailure(t *testing.T) {
 	for _, failAudit := range []bool{false, true} {
 		t.Run(map[bool]string{false: "confirmed", true: "audit-failure"}[failAudit], func(t *testing.T) {
-			steps := []scriptdb.Step{{Kind: "begin"}, {Kind: "query", SQL: "FOR UPDATE", Rows: [][]driver.Value{{"REFUND_PENDING", "REFUND_PENDING", "accountant", "accountant", "manager", "receipt", int64(3)}}}, {Kind: "query", SQL: "DATE_FORMAT(receipt_date", Rows: [][]driver.Value{{"2020-01-01"}}}, {Kind: "exec", SQL: "status='REFUND_CONFIRMED'"}, {Kind: "exec", SQL: "INSERT INTO settlement_outbox_event"}, {Kind: "exec", SQL: "INSERT INTO settlement_audit_event"}}
+			steps := []scriptdb.Step{{Kind: "begin"}, {Kind: "query", SQL: "FOR UPDATE", Rows: [][]driver.Value{{"REFUND_PENDING", "REFUND_PENDING", "applicant", "resolver", "manager", "receipt", int64(3)}}}, {Kind: "query", SQL: "DATE_FORMAT(receipt_date", Rows: [][]driver.Value{{"2020-01-01"}}}, {Kind: "exec", SQL: "status='REFUND_CONFIRMED'"}, {Kind: "exec", SQL: "INSERT INTO settlement_outbox_event"}, {Kind: "exec", SQL: "INSERT INTO settlement_audit_event"}}
 			auditFailure := errors.New("audit unavailable")
 			if failAudit {
 				steps[len(steps)-1].Err = auditFailure
@@ -114,7 +114,7 @@ func TestRefundTransactionPreservesMoneyAndRollsBackAuditFailure(t *testing.T) {
 // 参数：t 测试上下文。
 // 返回值：无；日期错误时不得保存事实或审计。
 func TestRefundCannotPrecedeReceiptDate(t *testing.T) {
-	db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "FOR UPDATE", Rows: [][]driver.Value{{"REFUND_PENDING", "REFUND_PENDING", "accountant", "accountant", "manager", "receipt", int64(3)}}}, scriptdb.Step{Kind: "query", SQL: "DATE_FORMAT(receipt_date", Rows: [][]driver.Value{{"2020-01-03"}}}, scriptdb.Step{Kind: "rollback"})
+	db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "FOR UPDATE", Rows: [][]driver.Value{{"REFUND_PENDING", "REFUND_PENDING", "applicant", "resolver", "manager", "receipt", int64(3)}}}, scriptdb.Step{Kind: "query", SQL: "DATE_FORMAT(receipt_date", Rows: [][]driver.Value{{"2020-01-03"}}}, scriptdb.Step{Kind: "rollback"})
 	if err := (&Service{DB: db}).ConfirmReceiptRefund(t.Context(), refundTestPrincipal(), "difference", refundTestInput()); !errors.Is(err, ErrInvalid) {
 		t.Fatal(err)
 	}
@@ -140,5 +140,22 @@ func TestFinanceQueryRejectsUnboundedServiceCalls(t *testing.T) {
 	query, err := financeRecordQuery(false, nil)
 	if err != nil || query.Limit != 100 || query.Offset != 0 {
 		t.Fatalf("legacy defaults=%+v err=%v", query, err)
+	}
+}
+
+// TestRefundRejectsConfirmerAsApplicantOrResolver 验证当前退款确认人不能是申请人或解决人。
+// 参数：t 测试上下文。
+// 返回值：无；利益相关人执行退款确认时未被拒绝则失败。
+func TestRefundRejectsConfirmerAsApplicantOrResolver(t *testing.T) {
+	for name, rows := range map[string][]driver.Value{
+		"applicant": {"REFUND_PENDING", "REFUND_PENDING", "accountant", "resolver", "manager", "receipt", int64(3)},
+		"resolver":  {"REFUND_PENDING", "REFUND_PENDING", "applicant", "accountant", "manager", "receipt", int64(3)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "FOR UPDATE", Rows: [][]driver.Value{rows}}, scriptdb.Step{Kind: "rollback"})
+			if err := (&Service{DB: db}).ConfirmReceiptRefund(t.Context(), refundTestPrincipal(), "difference", refundTestInput()); !errors.Is(err, ErrForbidden) {
+				t.Fatalf("want ErrForbidden got %v", err)
+			}
+		})
 	}
 }

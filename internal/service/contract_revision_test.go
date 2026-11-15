@@ -321,6 +321,7 @@ func TestResolveContractRevisionHoldWritesAudit(t *testing.T) {
 		scriptdb.Step{Kind: "query", SQL: "SELECT status,COALESCE(contract_snapshot_id,'') FROM settlement_contract_revision_hold", Rows: [][]driver.Value{{"PENDING_REVIEW", "snapshot-new"}}},
 		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state FROM settlement_contract_snapshot", Rows: [][]driver.Value{{"RELEASED"}}},
 		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state FROM settlement_contract_snapshot", Rows: [][]driver.Value{{"RELEASED"}}},
+		scriptdb.Step{Kind: "query", SQL: "settlement_receivable_plan", Rows: [][]driver.Value{{int64(0)}}},
 		scriptdb.Step{Kind: "exec", SQL: "UPDATE settlement_contract_revision_hold SET status='RESOLVED'"},
 		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_outbox_event", Args: &auditArgs},
 		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_audit_event"},
@@ -430,4 +431,23 @@ func TestIngestContractRevisionRemovesPendingInstallment(t *testing.T) {
 		t.Fatalf("删除分期结果=%+v", result)
 	}
 	assertRevisionAudit(t, removeAudit, "SETTLEMENT_PLAN_ADJUSTED", `"action":"REMOVED"`, `"installment_no":2`, `"old_amount":"50.00"`)
+}
+
+// TestResolveContractRevisionHoldRejectsOutstandingFacts 验证存在未确认计划或在途开票时不能关单。
+// 参数：t 测试上下文。
+// 返回值：无；闸门计数大于 0 时未被拒绝则失败。
+func TestResolveContractRevisionHoldRejectsOutstandingFacts(t *testing.T) {
+	db := scriptdb.Open(t,
+		scriptdb.Step{Kind: "begin"},
+		scriptdb.Step{Kind: "query", SQL: "SELECT status,COALESCE(contract_snapshot_id,'') FROM settlement_contract_revision_hold", Rows: [][]driver.Value{{"PENDING_REVIEW", "snapshot-new"}}},
+		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state FROM settlement_contract_snapshot", Rows: [][]driver.Value{{"RELEASED"}}},
+		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state FROM settlement_contract_snapshot", Rows: [][]driver.Value{{"RELEASED"}}},
+		scriptdb.Step{Kind: "query", SQL: "settlement_receivable_plan", Rows: [][]driver.Value{{int64(1)}}},
+		scriptdb.Step{Kind: "rollback"},
+	)
+	svc := &Service{DB: db}
+	p := Principal{TenantID: "tenant-a", UserID: "finance-manager", Permissions: map[string]bool{"settlement.revision.resolve": true}}
+	if err := svc.ResolveContractRevisionHold(context.Background(), p, "hold-1", "已按修订金额完成调整与红冲"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("want ErrConflict got %v", err)
+	}
 }

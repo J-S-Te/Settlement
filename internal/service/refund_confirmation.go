@@ -47,7 +47,7 @@ func (s *Service) ConfirmReceiptRefund(ctx context.Context, p Principal, id stri
 		return err
 	}
 	defer tx.Rollback()
-	if err = lockApprovedRefund(ctx, tx, p.TenantID, id, in.Version, completed); err != nil {
+	if err = lockApprovedRefund(ctx, tx, p.TenantID, id, in.Version, completed, p.UserID); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE settlement_receipt_difference
@@ -74,7 +74,7 @@ func (s *Service) ConfirmReceiptRefund(ctx context.Context, p Principal, id stri
 // lockApprovedRefund 锁定同租户差异与回款，核验独立审批和日期边界。
 // 参数：ctx 上下文，tx 当前事务，tenant 租户，id 差异，version 版本，completed UTC时间。
 // 返回值：不可见对象返回 ErrNotFound，状态冲突返回 ErrConflict，日期非法返回 ErrInvalid。
-func lockApprovedRefund(ctx context.Context, tx *sql.Tx, tenant, id string, version int, completed time.Time) error {
+func lockApprovedRefund(ctx context.Context, tx *sql.Tx, tenant, id string, version int, completed time.Time, userID string) error {
 	var status, resolution, applicant, resolver, approver, receipt string
 	var current int
 	err := tx.QueryRowContext(ctx, `SELECT status,resolution,requested_by,resolved_by,approved_by,receipt_id,version
@@ -88,6 +88,10 @@ func lockApprovedRefund(ctx context.Context, tx *sql.Tx, tenant, id string, vers
 	}
 	if current != version || status != "REFUND_PENDING" || resolution != "REFUND_PENDING" || strings.TrimSpace(approver) == "" || approver == applicant || approver == resolver {
 		return ErrConflict
+	}
+	// 退款完成确认必须由独立人员执行：当前确认人不能是申请人、解决人或差异审批人。
+	if userID == applicant || userID == resolver || userID == approver {
+		return ErrForbidden
 	}
 	var date string
 	err = tx.QueryRowContext(ctx, `SELECT DATE_FORMAT(receipt_date,'%Y-%m-%d') FROM settlement_receipt
