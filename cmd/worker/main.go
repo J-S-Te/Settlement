@@ -148,6 +148,7 @@ func main() {
 	// 所有后台循环都收拢到 loops，停机时先取消再按预算 join，
 	// 避免主流程返回后截断未完成的一次性任务（导出、归档、提醒、对账）。
 	loops := newLoopGroup()
+	loops.Go("audit_outbox_health", func() { reportOutboxHealth(ctx, db, platform, environment, slog.Default()) })
 	commercialGate, licenseErr := consumer.FromEnvironment("settlement")
 	if licenseErr != nil {
 		slog.Error("commercial license configuration failed")
