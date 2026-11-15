@@ -24,7 +24,14 @@ func TestFinanceApprovalStopsBeforeAttempt(t *testing.T) {
 // 参数：t 测试上下文。
 // 返回值：无。
 func TestSpecialReviewRejectsApplicant(t *testing.T) {
-	db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "status='SPECIAL_REVIEW'", Rows: [][]driver.Value{{"applicant", "reviewer", "snapshot"}}}, scriptdb.Step{Kind: "rollback"})
+	db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"},
+		scriptdb.Step{Kind: "query", SQL: "status='SPECIAL_REVIEW'",
+			Rows: [][]driver.Value{{"applicant", "reviewer", "snapshot"}}},
+		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state",
+			Rows: [][]driver.Value{{"RELEASED"}}},
+		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state",
+			Rows: [][]driver.Value{{"RELEASED"}}},
+		scriptdb.Step{Kind: "rollback"})
 	_, err := (&Service{DB: db}).ReviewSpecialInvoice(t.Context(), Principal{TenantID: "tenant", UserID: "applicant", Permissions: map[string]bool{"settlement.invoice.special_approve": true}}, "request", 2, true, "")
 	if !errors.Is(err, ErrForbidden) {
 		t.Fatal(err)
@@ -77,7 +84,14 @@ func TestDifferenceApproverCannotBeSubmitter(t *testing.T) {
 // 参数：t 测试上下文。
 // 返回值：无；同一人完成两级审批时失败。
 func TestSpecialReviewRejectsOrdinaryApprover(t *testing.T) {
-	db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "status='SPECIAL_REVIEW'", Rows: [][]driver.Value{{"applicant", "director", "snapshot"}}}, scriptdb.Step{Kind: "rollback"})
+	db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"},
+		scriptdb.Step{Kind: "query", SQL: "status='SPECIAL_REVIEW'",
+			Rows: [][]driver.Value{{"applicant", "director", "snapshot"}}},
+		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state",
+			Rows: [][]driver.Value{{"RELEASED"}}},
+		scriptdb.Step{Kind: "query", SQL: "SELECT migration_state",
+			Rows: [][]driver.Value{{"RELEASED"}}},
+		scriptdb.Step{Kind: "rollback"})
 	_, err := (&Service{DB: db}).ReviewSpecialInvoice(t.Context(), Principal{TenantID: "tenant", UserID: "director", Permissions: map[string]bool{"settlement.invoice.special_approve": true}}, "request", 2, true, "")
 	if !errors.Is(err, ErrForbidden) {
 		t.Fatal(err)

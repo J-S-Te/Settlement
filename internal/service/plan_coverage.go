@@ -183,15 +183,22 @@ func (s *Service) requirePlanCoverage(ctx context.Context, tx *sql.Tx, p Princip
 	}
 	// 合同金额上限保持原语义：合计不得超过合同金额，任何权限都不放松。
 	if decimalGreater(coverage.PlanTotal, coverage.ContractAmount) {
-		return coverage, fmt.Errorf("%w: 计划合计不能超过合同金额", ErrConflict)
+		return coverage, businessFeedback(ErrConflict, "PLAN_CONTRACT_LIMIT", fmt.Sprintf(
+			"计划合计 %s 不能超过合同金额 %s，请核对本次计划金额；财务审批权限不放宽合同金额上限",
+			coverage.PlanTotal, coverage.ContractAmount))
 	}
 	if !coverage.Exceeds {
 		return coverage, nil
 	}
 	if !p.Allows("settlement.finance.override") {
 		gapLimit, dropLimit := planCoverageThresholds()
-		return coverage, fmt.Errorf("%w: 计划覆盖差额超过阈值（差额 %s / %s%%，单期降幅 %s%%，阈值 %s%% / %s%%），需要财务负责人 override 权限", ErrConflict,
-			coverage.Gap, coverage.GapPercent, coverage.DropPercent, gapLimit.FloatString(2), dropLimit.FloatString(2))
+		drop := "未下调"
+		if coverage.DropPercent != "" {
+			drop = coverage.DropPercent + "%"
+		}
+		return coverage, businessFeedback(ErrConflict, "PLAN_COVERAGE_THRESHOLD", fmt.Sprintf(
+			"计划覆盖差额超过阈值（差额 %s / %s%%，单期降幅%s，阈值 %s%% / %s%%），需要结算财务负责人核对处理",
+			coverage.Gap, coverage.GapPercent, drop, gapLimit.FloatString(2), dropLimit.FloatString(2)))
 	}
 	return coverage, nil
 }

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -95,7 +96,8 @@ func (s *Service) AdjustPlan(ctx context.Context, p Principal, id string, in Pla
 	err = tx.QueryRowContext(ctx, `SELECT rp.contract_snapshot_id,DATE_FORMAT(rp.due_date,'%Y-%m-%d'),rp.planned_amount,r.id,r.received_allocated_amount+r.write_off_amount,r.original_amount FROM settlement_receivable_plan rp JOIN settlement_receivable r ON r.receivable_plan_id=rp.id AND r.tenant_id=rp.tenant_id WHERE rp.tenant_id=? AND rp.id=? AND rp.version=? AND rp.confirmation_status='CONFIRMED' FOR UPDATE`, p.TenantID, id, in.Version).Scan(&snapshot, &oldDate, &oldAmount, &receivable, &used, &original)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return ErrConflict
+			return businessFeedback(ErrConflict, "PLAN_STATE_CHANGED",
+				"当前收款计划不存在、版本已更新或尚未确认，请刷新列表后重新选择；本次调整未保存")
 		}
 		return err
 	}
@@ -103,14 +105,16 @@ func (s *Service) AdjustPlan(ctx context.Context, p Principal, id string, in Pla
 		return err
 	}
 	if decimalGreater(used, planned) {
-		return ErrConflict
+		return businessFeedback(ErrConflict, "PLAN_BELOW_ALLOCATED",
+			fmt.Sprintf("计划金额不能低于已核销及核减金额 %s，请核对本期已使用金额后调整", used))
 	}
 	var invoiced string
 	if err = tx.QueryRowContext(ctx, `SELECT invoiced_amount+COALESCE((SELECT SUM(reserved_amount-invoiced_amount-released_amount) FROM settlement_invoice_request_allocation a WHERE a.tenant_id=r.tenant_id AND a.receivable_id=r.id AND a.status='RESERVED'),0) FROM settlement_receivable r WHERE tenant_id=? AND id=? FOR UPDATE`, p.TenantID, receivable).Scan(&invoiced); err != nil {
 		return err
 	}
 	if decimalGreater(invoiced, planned) {
-		return ErrConflict
+		return businessFeedback(ErrConflict, "PLAN_BELOW_INVOICED",
+			fmt.Sprintf("计划金额不能低于已开票及预留金额 %s，请核对在途开票申请与已开发票", invoiced))
 	}
 	coverage, err := s.requirePlanCoverage(ctx, tx, p, snapshot, id, planned, oldAmount)
 	if err != nil {

@@ -2320,16 +2320,23 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 	return true
 }
 
-// respondError 用途：按结算权限、责任范围和错误契约处理请求。
-// 参数：包含当前请求、可信主体或显式服务依赖；不接受客户端声明扩大权限。
-// 返回值：返回处理器、主体或HTTP结果，错误保持失败关闭。
-// respondError 将真实业务错误映射为稳定HTTP契约，包括明确的历史恢复阻塞。
-// 参数：w为响应，err为业务错误。
-// 返回值：无，错误响应写入HTTP。
-// respondError 将业务拒绝映射为稳定HTTP错误，不泄露内部存储细节。
+// 用途：映射既有业务错误，只对明确安全载体公开具体原因和字段。
 // 参数：w为响应写入器，err为服务层返回的错误。
 // 返回值：无；输出可识别的错误码和用户提示。
 func respondError(w http.ResponseWriter, err error) {
+	if message, details, ok := service.BusinessFeedback(err); ok {
+		status, code := http.StatusBadRequest, "SETTLEMENT_INVALID_REQUEST"
+		if errors.Is(err, service.ErrConflict) {
+			status, code = http.StatusConflict, "SETTLEMENT_CONFLICT"
+		}
+		if errors.Is(err, service.ErrForbidden) {
+			status, code = http.StatusForbidden, "SETTLEMENT_FORBIDDEN"
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": code, "message": message, "details": details})
+		return
+	}
 	switch {
 	case errors.Is(err, service.ErrCreditSyncNotSubscribed):
 		fail(w, http.StatusConflict, "CREDIT_SYNC_NOT_SUBSCRIBED", "CRM信用联动未订阅，未发起投递，历史记录保留待核对")
