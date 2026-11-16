@@ -179,6 +179,15 @@ func (a *API) dashboardMetrics(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "SETTLEMENT_DASHBOARD_BEARER_INVALID", "机器令牌无效")
 		return
 	}
+	if strings.HasSuffix(r.URL.Path, "/stream") {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("Cache-Control", "no-store")
+		tracked := &metricResponseWriter{ResponseWriter: w}
+		if err := a.service.StreamDashboardMetrics(r.Context(), identity.TenantID, tracked); err != nil && !tracked.written {
+			fail(w, 503, "SETTLEMENT_DASHBOARD_SOURCE_UNAVAILABLE", "结算指标来源暂不可用，保留上次发布结果")
+		}
+		return
+	}
 	snapshot, e := a.service.DashboardMetrics(r.Context(), identity.TenantID)
 	if e != nil {
 		fail(w, 503, "SETTLEMENT_DASHBOARD_SOURCE_UNAVAILABLE", "结算指标来源暂不可用，保留上次发布结果")

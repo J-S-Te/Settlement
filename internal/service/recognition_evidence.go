@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -11,7 +10,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 type RecognitionEvidenceInput struct {
@@ -64,7 +62,7 @@ const recognitionEvidenceColumns = `id,organization_id,created_by,name,media_typ
 
 // UploadRecognitionEvidence 先持久化上传意图，再按固定请求身份上传绑定，失败可同键安全恢复。
 // 参数：ctx/p为当前授权，key为幂等键，identity为现有文件网关部署身份，gateway为真实适配器，in为文件及组织。
-// 返回值：只有网关上传绑定及本地提交成功才READY；任何失败保留可重试PENDING。
+// 返回值：本地提交成功才READY；失败保留恢复意图，失效证据清理后为REJECTED。
 func (s *Service) UploadRecognitionEvidence(ctx context.Context, p Principal, key string, identity InvoiceArchiveIdentity, gateway InvoiceArchiveGateway, in RecognitionEvidenceInput) (RecognitionEvidence, error) {
 	var empty RecognitionEvidence
 	if !recognitionAllowed(p, "settlement.recognition.record", in.OrganizationID) {
@@ -79,9 +77,6 @@ func (s *Service) UploadRecognitionEvidence(ctx context.Context, p Principal, ke
 	if e := validateRecognitionEvidenceInput(in); e != nil {
 		return empty, e
 	}
-	if _, _, e := s.verifyRecognitionDirectory(ctx, p, RecognitionInput{OrganizationID: in.OrganizationID, OrganizationWitnessID: in.OrganizationWitnessID}); e != nil {
-		return empty, e
-	}
 	if e := s.checkInvoiceArchiveLicense(ctx); e != nil {
 		return empty, e
 	}
@@ -91,52 +86,17 @@ func (s *Service) UploadRecognitionEvidence(ctx context.Context, p Principal, ke
 	}
 	hash := sha256.Sum256(in.Content)
 	checksum := hex.EncodeToString(hash[:])
+	if handled, err := s.replayEvidenceCleanup(ctx, p, key, identity, gateway, in, checksum); handled || err != nil {
+		return empty, err
+	}
+	if _, _, e := s.verifyRecognitionDirectory(ctx, p, RecognitionInput{OrganizationID: in.OrganizationID, OrganizationWitnessID: in.OrganizationWitnessID}); e != nil {
+		return empty, e
+	}
 	evidence, e := s.prepareRecognitionEvidence(ctx, p, key, identity, in, checksum)
 	if e != nil {
 		return empty, e
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	tx, e := s.DB.BeginTx(ctx, nil)
-	if e != nil {
-		return empty, e
-	}
-	defer tx.Rollback()
-	evidence, e = scanRecognitionEvidence(tx.QueryRowContext(ctx, `SELECT `+recognitionEvidenceColumns+` FROM settlement_recognition_evidence WHERE tenant_id=? AND id=? FOR UPDATE`, p.TenantID, evidence.ID))
-	if e != nil {
-		return empty, e
-	}
-	if evidence.ApplicationID != identity.ApplicationID || evidence.GatewayOrigin != identity.GatewayURL || evidence.OrganizationID != in.OrganizationID || evidence.CreatedBy != p.UserID {
-		return empty, ErrConflict
-	}
-	if evidence.Status == "READY" {
-		return evidence, s.commitInvoiceArchive(ctx, tx)
-	}
-	if evidence.Status != "PENDING" {
-		return empty, ErrConflict
-	}
-	file, e := gateway.Upload(ctx, "recognition-evidence-"+evidence.ID, identity.ApplicationID, "RECOGNITION_EVIDENCE", evidence.Name, evidence.MediaType, bytes.NewReader(in.Content))
-	if e != nil {
-		return empty, ErrDependency
-	}
-	if file == "" {
-		return empty, ErrDependency
-	}
-	if e = gateway.Bind(ctx, identity.ApplicationID, file, "settlement_recognition_evidence", evidence.ID, "EVIDENCE", evidence.Name); e != nil {
-		return empty, ErrDependency
-	}
-	if _, e = tx.ExecContext(ctx, `UPDATE settlement_recognition_evidence SET status='READY',file_id=?,updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND id=? AND status='PENDING'`, file, p.TenantID, evidence.ID); e != nil {
-		return empty, e
-	}
-	if e = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_RECOGNITION_EVIDENCE_READY", "settlement_recognition_evidence", evidence.ID, map[string]any{"actor_id": p.UserID, "organization_id": in.OrganizationID, "checksum": checksum, "byte_size": len(in.Content)}); e != nil {
-		return empty, e
-	}
-	if e = s.commitInvoiceArchive(ctx, tx); e != nil {
-		return empty, e
-	}
-	evidence.Status = "READY"
-	evidence.FileID = file
-	return evidence, nil
+	return s.uploadRecognitionEvidenceOperation(ctx, p, identity, gateway, in, evidence)
 }
 
 // prepareRecognitionEvidence 将操作者、组织、文件摘要与部署身份绑定到可恢复上传意图。
@@ -152,10 +112,7 @@ func (s *Service) prepareRecognitionEvidence(ctx context.Context, p Principal, k
 	if e = recognitionLock(ctx, tx, p.TenantID); e != nil {
 		return empty, e
 	}
-	request := struct {
-		Actor, Org, Witness, Name, Media, Checksum, App, Origin string
-		Size                                                    int
-	}{p.UserID, in.OrganizationID, in.OrganizationWitnessID, in.Name, in.MediaType, checksum, identity.ApplicationID, identity.GatewayURL, len(in.Content)}
+	request := recognitionEvidenceRequest(p, identity, in, checksum)
 	id, replay, e := claimIdempotency(ctx, tx, p.TenantID, "RECOGNITION_EVIDENCE_UPLOAD", key, newID(), request)
 	if e != nil {
 		return empty, e

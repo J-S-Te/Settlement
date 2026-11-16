@@ -139,3 +139,13 @@
 报销专用读取默认关闭，见`.env.example`的`SETTLEMENT_REIMBURSEMENT_COST_*`。启用后只从唯一报销权威源取得付款/全额冲正及批准快照中的费用项、费用性质、发生日和精确分摊；项目支出副本不会再累加。PREPAYMENT由逐项expense_nature确定，需要实际发生/摊销依据并独立确认，不能因付款自动计成本。同单旧付款冲正而原确认尚未独立冲回时，整单后续确认冻结；重付不会获得新的费用额度。
 
 业务入口`/api/v1/recognitions`及`/:id/submit|decision`，草稿PATCH带expected_version；读取真实limit/offset分页。机器`GET /internal/v1/dashboard/metrics`沿既有dashboard专用身份与READ_HISTORY，单RR事务输出最多10000行/8MiB，超限整体失败；未知旧报销付款明确列reimbursement_unknown，不猜填费用性质，也不抹掉已有确认。
+
+指标完整流新增 `GET /internal/v1/dashboard/metrics/stream`，沿用相同机器身份、可信租户和 `READ_HISTORY` 许可。旧 JSON 地址及其上限保留；新地址使用 NDJSON 的 begin/chunk/end，每块最多256行、每个事实JSON最多64KiB、每帧最多1MiB。确认账本按主键有界读取必要字段，冲回余额按批汇总；只有源RR事务成功提交才输出含总行数与SHA256的end。数析必须校验完整流、计数、摘要和EOF后原子发布新代次，截断、超限或依赖失败保留旧版本；仅真实404/405允许回退旧JSON。
+
+该流解决结算指标到数析的总包传输容量断点，不表示所有上游协议无限容量。报销到结算的独立 `ReadCosts` 完整候选快照仍保留既有上限：1000张单据、合计10000条冻结费用项、每单最多2000个效果及HTTP响应8MiB。超过上限或来源失败时整个指标采集失败，不吞掉现金历史、不放宽校验、不发布部分指标；数析保留上次成功版本。报销候选协议迁移不属于此次指标流改造。
+
+
+归档租约升级镜像声明 `com.basic-platform.runtime.epoch=1`：使用平台受控脚本，先备份并
+排空旧API/Worker，再执行新增迁移30与新写者。新协议可能写入后，不允许仅回退旧镜像
+或旧发布指针；保留备份、候选和网关绑定，按受控恢复处理。同代回滚仍按原流程执行。
+证据绑定后目录暂时不可用会保留PENDING及原幂等键供恢复；只有确定见证失效才执行退休。

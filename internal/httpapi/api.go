@@ -202,7 +202,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a.serveRecognitions(w, r) {
 		return
 	}
-	if r.URL.Path == "/internal/v1/dashboard/metrics" && r.Method == http.MethodGet {
+	if (r.URL.Path == "/internal/v1/dashboard/metrics" || r.URL.Path == "/internal/v1/dashboard/metrics/stream") && r.Method == http.MethodGet {
 		a.dashboardMetrics(w, r)
 		return
 	}

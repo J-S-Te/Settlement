@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -9,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -64,10 +62,9 @@ func scanArchiveEffect(row *sql.Row) (e archiveEffect, err error) {
 
 const archiveEffectColumns = `id,tax_invoice_id,document_type,checksum,original_name,media_type,application_id,gateway_origin,request_id,file_id,document_id,state`
 
-// UploadInvoiceDocument journals before external calls. The journal row lock is
-// held through archive COMMIT, so recovery observes the actual committed state
-// even when the caller loses the COMMIT response. It never infers rollback from
-// a transport error and never releases an ARCHIVED document.
+// UploadInvoiceDocument 持久化意图后通过独立操作代次上传，网关I/O不占用业务行锁。
+// 参数：ctx/p为可信请求，identity/g为原网关部署身份，in为文件与幂等键。
+// 返回值：本地文档与审计提交后返回标识和新建标记；失败意图可重试或退休恢复。
 func (s *Service) UploadInvoiceDocument(ctx context.Context, p Principal, identity InvoiceArchiveIdentity, g InvoiceArchiveGateway, in InvoiceArchiveInput) (string, bool, error) {
 	if !p.Allows("settlement.invoice.issue") {
 		return "", false, ErrForbidden
@@ -88,63 +85,12 @@ func (s *Service) UploadInvoiceDocument(ctx context.Context, p Principal, identi
 	if err != nil {
 		return "", false, err
 	}
-	// Bound total lock duration; the durable record remains recoverable if the
-	// request disconnects, the process dies, or an HTTP response arrives late.
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return "", false, err
-	}
-	defer tx.Rollback()
-	// Match preparation's invoice -> journal lock order, including the document
-	// foreign-key check, to avoid a retry/commit lock inversion.
-	var invoice string
-	if err = tx.QueryRowContext(ctx, `SELECT id FROM settlement_tax_invoice WHERE id=? AND tenant_id=? FOR UPDATE`, in.InvoiceID, p.TenantID).Scan(&invoice); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			err = ErrNotFound
-		}
-		return "", false, err
-	}
-	effect, err = scanArchiveEffect(tx.QueryRowContext(ctx, `SELECT `+archiveEffectColumns+` FROM settlement_invoice_archive_effect WHERE id=? AND tenant_id=? FOR UPDATE`, effect.id, p.TenantID))
-	if err != nil {
-		return "", false, err
-	}
-	if effect.app != identity.ApplicationID || effect.origin != identity.GatewayURL {
-		return "", false, ErrConflict
-	}
-	if err := s.checkInvoiceArchiveLicense(ctx); err != nil {
-		return "", false, err
-	}
-	if effect.state == "ARCHIVED" {
-		return effect.documentID, false, s.commitInvoiceArchive(ctx, tx)
-	}
-	if effect.state != "PENDING" {
-		return "", false, fmt.Errorf("%w: abandoned upload requires a new idempotency key", ErrConflict)
-	}
-	fileID, err := g.Upload(ctx, effect.requestID, effect.app, "INVOICE_DOCUMENT", effect.name, effect.mediaType, bytes.NewReader(in.Content))
-	if err != nil {
-		return "", false, fmt.Errorf("%w: upload: %w", ErrInvoiceArchiveGateway, err)
-	}
-	if fileID == "" {
-		return "", false, errors.New("invoice document upload returned an empty file identity")
-	}
-	if err := s.checkInvoiceArchiveLicense(ctx); err != nil {
-		return "", false, err
-	}
-	if err = g.Bind(ctx, effect.app, fileID, "tax_invoice", effect.invoiceID, "electronic_invoice", effect.name); err != nil {
-		return "", false, fmt.Errorf("%w: bind: %w", ErrInvoiceArchiveGateway, err)
-	}
-	documentID, err := archiveInvoiceDocumentTx(ctx, tx, p, effect.invoiceID, effect.documentType, effect.name, effect.mediaType, fileID, effect.checksum)
-	if err != nil {
-		return "", false, err
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_archive_effect SET state='ARCHIVED',file_id=?,document_id=?,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=? AND state='PENDING'`, fileID, documentID, effect.id, p.TenantID); err != nil {
-		return "", false, err
-	}
-	return documentID, true, s.commitInvoiceArchive(ctx, tx)
+	return s.uploadArchiveOperation(ctx, p, identity, g, in, effect, invoiceOperation)
 }
 
+// prepareInvoiceArchive 在短事务中保留文件摘要及原网关身份，防止重复归档。
+// 参数：ctx/p为可信请求，identity为部署身份，in为实际文件与幂等键。
+// 返回值：完整持久意图；键或来源冲突时拒绝。
 func (s *Service) prepareInvoiceArchive(ctx context.Context, p Principal, identity InvoiceArchiveIdentity, in InvoiceArchiveInput) (archiveEffect, error) {
 	// Nonexistent independent request keys must not acquire overlapping gap
 	// locks. The invoice row serializes content, and the unique key arbitrates
@@ -252,54 +198,9 @@ func (w *InvoiceArchiveWorker) RunOnce(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
+// recoverOne 通过持久退休代次恢复意图，外部退休与释放不持数据库行锁。
+// 参数：parent为恢复循环上下文。
+// 返回值：是否领取意图及退休、释放或本地持久化错误。
 func (w *InvoiceArchiveWorker) recoverOne(parent context.Context) (bool, error) {
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	defer cancel()
-	tx, err := w.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-	e, err := scanArchiveEffect(tx.QueryRowContext(ctx, `SELECT `+archiveEffectColumns+` FROM settlement_invoice_archive_effect WHERE tenant_id=? AND state='PENDING' AND available_at<=UTC_TIMESTAMP(3) ORDER BY available_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`, w.Identity.TenantID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	var fileID, status string
-	if e.app != w.Identity.ApplicationID || e.origin != w.Identity.GatewayURL {
-		err = errors.New("invoice archive recovery configuration differs from durable identity")
-	} else {
-		if w.CheckBusinessLicense != nil {
-			err = w.CheckBusinessLicense(ctx)
-		}
-		if err == nil {
-			fileID, status, err = w.Gateway.RetireUpload(ctx, e.requestID)
-		}
-		if err == nil && ((fileID == "" && status != "CANCELLED") || (e.fileID != "" && e.fileID != fileID)) {
-			err = errors.New("invoice archive retirement identity unresolved")
-		}
-		if err == nil && fileID != "" {
-			if w.CheckBusinessLicense != nil {
-				err = w.CheckBusinessLicense(ctx)
-			}
-			if err == nil {
-				err = w.Gateway.Release(ctx, e.app, fileID, "tax_invoice", e.invoiceID, "electronic_invoice")
-			}
-		}
-	}
-	if err != nil {
-		err = fmt.Errorf("invoice archive recovery %s: %w", e.id, err)
-		_, persistErr := tx.ExecContext(ctx, `UPDATE settlement_invoice_archive_effect SET attempts=attempts+1,available_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 30 SECOND),updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=?`, e.id, w.Identity.TenantID)
-		if persistErr != nil {
-			return false, errors.Join(err, persistErr)
-		}
-		return true, errors.Join(err, tx.Commit())
-	}
-	_, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_archive_effect SET state='RETIRED',file_id=?,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=? AND state='PENDING'`, fileID, e.id, w.Identity.TenantID)
-	if err != nil {
-		return false, err
-	}
-	return true, tx.Commit()
+	return recoverArchiveOperation(parent, w.DB, w.Identity, w.Gateway, w.CheckBusinessLicense, invoiceOperation)
 }

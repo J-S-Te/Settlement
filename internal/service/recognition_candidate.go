@@ -157,7 +157,7 @@ func (s *Service) RecognitionCandidates(ctx context.Context, p Principal, claimI
 		return nil, e
 	}
 	defer tx.Rollback()
-	records, e := recognitionRows(ctx, tx, p.TenantID)
+	records, e := recognitionClaimRows(ctx, tx, p.TenantID, claimID)
 	if e != nil {
 		return nil, e
 	}

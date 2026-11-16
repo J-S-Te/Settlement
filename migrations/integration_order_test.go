@@ -45,6 +45,7 @@ func TestMergedMigrationOrderPreservesPublishedHistory(t *testing.T) {
 		"000027_local_financial_baseline.sql",
 		"000028_recognition_ledger.sql",
 		"000029_recognition_evidence.sql",
+		"000030_archive_operation_leases.sql",
 	}
 	if strings.Join(tail, ",") != strings.Join(want, ",") {
 		t.Fatalf("central session and financial migrations order = %v, want %v", tail, want)

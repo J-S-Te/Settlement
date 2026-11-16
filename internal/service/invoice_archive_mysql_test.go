@@ -324,8 +324,9 @@ func TestMySQLInvoiceArchiveFailureRecoveryAndConcurrency(t *testing.T) {
 // transport outcome test, not a pretend successful database transaction.
 type lostCommitConnector struct {
 	driver.Connector
-	mu      sync.Mutex
-	commits int
+	mu             sync.Mutex
+	commits        int
+	archiveWritten bool
 }
 
 type loseArchiveHTTPResponse struct {
@@ -363,12 +364,29 @@ func (c *lostCommitConn) BeginTx(ctx context.Context, opts driver.TxOptions) (dr
 	tx, err := c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
 	return &lostCommitTx{tx, c.c}, err
 }
+
+// Prepare 识别实际归档事务，避免领取事务数量变化导致错误注入到错误阶段。
+// 参数：query为真实数据库准备执行的SQL。
+// 返回值：原驱动语句及数据库错误。
+func (c *lostCommitConn) Prepare(query string) (driver.Stmt, error) {
+	if strings.Contains(query, "SET state='ARCHIVED'") {
+		c.c.mu.Lock()
+		c.c.archiveWritten = true
+		c.c.mu.Unlock()
+	}
+	return c.Conn.Prepare(query)
+}
+
+// Commit 在真实归档事务提交后丢弃一次响应，模拟无法判断提交结果的运输失败。
+// 参数：无。
+// 返回值：注入的未知结果或原数据库提交错误。
 func (c *lostCommitTx) Commit() error {
 	err := c.Tx.Commit()
 	c.c.mu.Lock()
 	defer c.c.mu.Unlock()
 	c.c.commits++
-	if err == nil && c.c.commits == 2 {
+	if err == nil && c.c.archiveWritten {
+		c.c.archiveWritten = false
 		return errors.New("injected lost COMMIT response after real commit")
 	}
 	return err

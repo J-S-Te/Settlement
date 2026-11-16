@@ -14,6 +14,9 @@ import (
 	"github.com/j-s-te/settlement/internal/testutil/scriptdb"
 )
 
+// TestInvoiceArchiveRecoveryHTTPRetiresBeforeExactRelease 验证事务外退休先于精确释放且保持HTTP绑定身份。
+// 参数：t为受控HTTP与SQL边界测试上下文。
+// 返回值：无，错误退休、释放或丢失恢复意图时失败。
 func TestInvoiceArchiveRecoveryHTTPRetiresBeforeExactRelease(t *testing.T) {
 	for _, state := range []string{"CANCELLED", "WRITING", "READY", "FAILED", "REJECTED"} {
 		t.Run(state, func(t *testing.T) {
@@ -57,6 +60,7 @@ func TestInvoiceArchiveRecoveryHTTPRetiresBeforeExactRelease(t *testing.T) {
 			db := scriptdb.Open(t,
 				scriptdb.Step{Kind: "begin"},
 				scriptdb.Step{Kind: "query", SQL: "FOR UPDATE SKIP LOCKED", Rows: [][]driver.Value{{"effect", "invoice", "ELECTRONIC_INVOICE", "checksum", "invoice.pdf", "application/pdf", "settlement", server.URL, "request", "", "", "PENDING"}}},
+				scriptdb.Step{Kind: "exec", SQL: "operation_token="}, scriptdb.Step{Kind: "commit"}, scriptdb.Step{Kind: "begin"},
 				scriptdb.Step{Kind: "exec", SQL: "state='RETIRED'"}, scriptdb.Step{Kind: "commit"},
 			)
 			worker := &InvoiceArchiveWorker{DB: db, Identity: InvoiceArchiveIdentity{TenantID: "tenant", ApplicationID: "settlement", GatewayURL: server.URL}, Gateway: gateway}
@@ -145,6 +149,9 @@ func TestInvoiceArchiveRecoveryHonorsLicenseBeforeDatabase(t *testing.T) {
 	}
 }
 
+// TestInvoiceArchiveRecoveryPersistsUnconfirmedGatewayFailure 验证网关或许可失败保留可恢复意图。
+// 参数：t为受控HTTP与SQL边界测试上下文。
+// 返回值：无，错误退休、释放或丢失恢复意图时失败。
 func TestInvoiceArchiveRecoveryPersistsUnconfirmedGatewayFailure(t *testing.T) {
 	for _, stage := range []string{"retire", "unconfirmed-retire", "release", "license-expired-after-retire"} {
 		t.Run(stage, func(t *testing.T) {
@@ -167,7 +174,7 @@ func TestInvoiceArchiveRecoveryPersistsUnconfirmedGatewayFailure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "FOR UPDATE SKIP LOCKED", Rows: [][]driver.Value{{"effect", "invoice", "ELECTRONIC_INVOICE", "checksum", "invoice.pdf", "application/pdf", "settlement", server.URL, "request", "", "", "PENDING"}}}, scriptdb.Step{Kind: "exec", SQL: "attempts=attempts+1"}, scriptdb.Step{Kind: "commit"})
+			db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "FOR UPDATE SKIP LOCKED", Rows: [][]driver.Value{{"effect", "invoice", "ELECTRONIC_INVOICE", "checksum", "invoice.pdf", "application/pdf", "settlement", server.URL, "request", "", "", "PENDING"}}}, scriptdb.Step{Kind: "exec", SQL: "operation_token="}, scriptdb.Step{Kind: "commit"}, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "exec", SQL: "attempts=attempts+1"}, scriptdb.Step{Kind: "commit"})
 			worker := &InvoiceArchiveWorker{DB: db, Identity: InvoiceArchiveIdentity{TenantID: "tenant", ApplicationID: "settlement", GatewayURL: server.URL}, Gateway: gateway}
 			if stage == "license-expired-after-retire" {
 				worker.CheckBusinessLicense = func(context.Context) error {
