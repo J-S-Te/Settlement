@@ -242,6 +242,7 @@ func main() {
 		archiveRecovery.Gateway = exporter.Gateway
 	}
 	receiptRecovery := &service.ReceiptArchiveWorker{DB: db, Identity: archiveRecovery.Identity, Gateway: archiveRecovery.Gateway, CheckBusinessLicense: checkBusiness}
+	evidenceRecovery := &service.RecognitionEvidenceRecoveryWorker{DB: db, Identity: archiveRecovery.Identity, Gateway: archiveRecovery.Gateway, CheckBusinessLicense: checkBusiness}
 	if exporter.GatewayMode == "dual" || exporter.GatewayMode == "required" {
 		loops.Go("receipt_archive_recovery", func() {
 			ticker := time.NewTicker(10 * time.Second)
@@ -252,6 +253,9 @@ func main() {
 				}
 				if err := archiveRecovery.RunOnce(ctx); err != nil && ctx.Err() == nil {
 					slog.Error("invoice archive recovery failed", "error", err)
+				}
+				if err := evidenceRecovery.RunOnce(ctx); err != nil && ctx.Err() == nil {
+					slog.Error("recognition evidence recovery failed", "error", err)
 				}
 				select {
 				case <-ctx.Done():

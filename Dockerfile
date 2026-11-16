@@ -26,7 +26,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/settlement-api ./c
 
 FROM alpine:3.22@sha256:d406446bc05b82480756ce8f1287964d28768c23955fa9480d2a74a2eae7a654
 ARG APP_VERSION
-LABEL org.opencontainers.image.version=${APP_VERSION} com.basic-platform.license.protocol="1"
+LABEL org.opencontainers.image.version=${APP_VERSION} com.basic-platform.license.protocol="1" com.basic-platform.runtime.epoch="1"
 RUN apk add --no-cache ca-certificates tzdata && addgroup -S settlement && adduser -S -G settlement settlement && mkdir -p /var/lib/commercial-license && chown settlement:settlement /var/lib/commercial-license
 COPY --from=build /out/settlement-* /usr/local/bin/
 USER settlement

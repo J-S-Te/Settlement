@@ -60,6 +60,7 @@ func TestReceiptArchiveRecoveryHTTPRetiresBeforeExactRelease(t *testing.T) {
 			db := scriptdb.Open(t,
 				scriptdb.Step{Kind: "begin"},
 				scriptdb.Step{Kind: "query", SQL: "FOR UPDATE SKIP LOCKED", Rows: [][]driver.Value{{"effect", "invoice", "RECEIPT_IMAGE", "checksum", "invoice.pdf", "application/pdf", "settlement", server.URL, "request", "", "", "PENDING"}}},
+				scriptdb.Step{Kind: "exec", SQL: "operation_token="}, scriptdb.Step{Kind: "commit"}, scriptdb.Step{Kind: "begin"},
 				scriptdb.Step{Kind: "exec", SQL: "state='RETIRED'"}, scriptdb.Step{Kind: "commit"},
 			)
 			worker := &ReceiptArchiveWorker{DB: db, Identity: InvoiceArchiveIdentity{TenantID: "tenant", ApplicationID: "settlement", GatewayURL: server.URL}, Gateway: gateway}
@@ -183,7 +184,7 @@ func TestReceiptArchiveRecoveryPersistsUnconfirmedGatewayFailure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "FOR UPDATE SKIP LOCKED", Rows: [][]driver.Value{{"effect", "invoice", "RECEIPT_IMAGE", "checksum", "invoice.pdf", "application/pdf", "settlement", server.URL, "request", "", "", "PENDING"}}}, scriptdb.Step{Kind: "exec", SQL: "attempts=attempts+1"}, scriptdb.Step{Kind: "commit"})
+			db := scriptdb.Open(t, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "query", SQL: "FOR UPDATE SKIP LOCKED", Rows: [][]driver.Value{{"effect", "invoice", "RECEIPT_IMAGE", "checksum", "invoice.pdf", "application/pdf", "settlement", server.URL, "request", "", "", "PENDING"}}}, scriptdb.Step{Kind: "exec", SQL: "operation_token="}, scriptdb.Step{Kind: "commit"}, scriptdb.Step{Kind: "begin"}, scriptdb.Step{Kind: "exec", SQL: "attempts=attempts+1"}, scriptdb.Step{Kind: "commit"})
 			worker := &ReceiptArchiveWorker{DB: db, Identity: InvoiceArchiveIdentity{TenantID: "tenant", ApplicationID: "settlement", GatewayURL: server.URL}, Gateway: gateway}
 			if stage == "license-expired-after-retire" {
 				worker.CheckBusinessLicense = func(context.Context) error {

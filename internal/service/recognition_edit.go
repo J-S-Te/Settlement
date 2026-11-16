@@ -91,7 +91,7 @@ func (s *Service) UpdateRecognition(ctx context.Context, p Principal, id, key st
 			return empty, e
 		}
 	} else if row.SourceClaimID != "" {
-		records, e := recognitionRows(ctx, tx, p.TenantID)
+		records, e := recognitionClaimRows(ctx, tx, p.TenantID, row.SourceClaimID)
 		if e != nil {
 			return empty, e
 		}

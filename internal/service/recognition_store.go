@@ -167,7 +167,7 @@ func (s *Service) CreateRecognition(ctx context.Context, p Principal, key string
 			return empty, e
 		}
 	} else if in.SourceClaimID != "" {
-		records, e := recognitionRows(ctx, tx, p.TenantID)
+		records, e := recognitionClaimRows(ctx, tx, p.TenantID, row.SourceClaimID)
 		if e != nil {
 			return empty, e
 		}
@@ -292,7 +292,7 @@ func (s *Service) validateRecognitionReversal(ctx context.Context, tx *sql.Tx, p
 	row.OrganizationName = original.OrganizationName
 	row.IdentityName = original.IdentityName
 	row.ProjectName = original.ProjectName
-	records, e := recognitionRows(ctx, tx, p.TenantID)
+	records, e := recognitionReversalRows(ctx, tx, p.TenantID, original.ID)
 	if e != nil {
 		return e
 	}
@@ -391,11 +391,11 @@ func (s *Service) TransitionRecognition(ctx context.Context, p Principal, id, ac
 		}
 	}
 	if row.Status == "CONFIRMED" {
-		records, e := recognitionRows(ctx, tx, p.TenantID)
-		if e != nil {
-			return empty, e
-		}
 		if row.OriginalID != "" {
+			records, e := recognitionReversalRows(ctx, tx, p.TenantID, row.OriginalID)
+			if e != nil {
+				return empty, e
+			}
 			original, e := loadRecognition(ctx, tx, p.TenantID, row.OriginalID)
 			if e != nil {
 				return empty, e
@@ -404,6 +404,10 @@ func (s *Service) TransitionRecognition(ctx context.Context, p Principal, id, ac
 				return empty, e
 			}
 		} else if row.SourceClaimID != "" {
+			records, e := recognitionClaimRows(ctx, tx, p.TenantID, row.SourceClaimID)
+			if e != nil {
+				return empty, e
+			}
 			if e = checkRecognitionCandidate(p, row, claim, records); e != nil {
 				return empty, e
 			}
