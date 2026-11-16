@@ -185,6 +185,20 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 通用写审计兜底：已认证写请求写租户审计；未认证写请求不能伪造租户，
+	// 统一上报平台全局 security_event。
+	if a.shouldAuditHTTP(r) && (a.genericAuditEnabled() || a.cfg.AuditDestinationConfigured) {
+		p, authErr := a.principal(r)
+		if authErr != nil || strings.TrimSpace(p.TenantID) == "" || strings.TrimSpace(p.UserID) == "" {
+			recorder := &auditStatusWriter{ResponseWriter: w}
+			w = recorder
+			defer func() { a.reportSecurityEvent(r, requestID, recorder.Status()) }()
+		} else if a.genericAuditEnabled() {
+			recorder := &auditStatusWriter{ResponseWriter: w}
+			w = recorder
+			defer func() { a.auditHTTP(r, p, requestID, recorder.Status()) }()
+		}
+	}
 	if a.serveRecognitions(w, r) {
 		return
 	}

@@ -115,6 +115,10 @@ type Config struct {
 	// 不输出凭据值；供 /readyz、/metrics 暴露“目的地缺失”而不是静默积压。
 	AuditDestinationConfigured        bool
 	NotificationDestinationConfigured bool
+	// AuditClientID/AuditClientSecret 供 API 认证失败时直接上报全局 security_event；
+	// 只从环境读取，不输出、不写日志。
+	AuditClientID     string
+	AuditClientSecret string
 }
 
 // AuditDestinationRequired 解析审计目的地是否必开（BIZ-XAPI-10）。
@@ -240,8 +244,9 @@ func Load() (Config, error) {
 		return c, auditRequiredErr
 	}
 	c.AuditDestinationRequired = auditDestinationRequired
-	c.AuditDestinationConfigured = strings.TrimSpace(os.Getenv("SETTLEMENT_AUDIT_CLIENT_ID")) != "" &&
-		strings.TrimSpace(os.Getenv("SETTLEMENT_AUDIT_CLIENT_SECRET")) != ""
+	c.AuditClientID = strings.TrimSpace(os.Getenv("SETTLEMENT_AUDIT_CLIENT_ID"))
+	c.AuditClientSecret = strings.TrimSpace(os.Getenv("SETTLEMENT_AUDIT_CLIENT_SECRET"))
+	c.AuditDestinationConfigured = c.AuditClientID != "" && c.AuditClientSecret != ""
 	c.NotificationDestinationConfigured = strings.TrimSpace(os.Getenv("SETTLEMENT_NOTIFICATION_CLIENT_ID")) != "" &&
 		strings.TrimSpace(os.Getenv("SETTLEMENT_NOTIFICATION_CLIENT_SECRET")) != ""
 	var err error
