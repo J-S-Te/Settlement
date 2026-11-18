@@ -603,7 +603,9 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 func (a *API) me(w http.ResponseWriter, r *http.Request) {
 	p, err := a.principal(r)
 	if err != nil {
-		if errors.Is(err, platform.ErrUnauthenticated) {
+		if errors.Is(err, service.ErrForbidden) {
+			fail(w, http.StatusForbidden, "SETTLEMENT_FORBIDDEN", "当前身份没有结算系统授权")
+		} else if errors.Is(err, platform.ErrUnauthenticated) {
 			fail(w, http.StatusUnauthorized, "SETTLEMENT_UNAUTHENTICATED", "登录已失效，请重新登录")
 		} else {
 			fail(w, http.StatusServiceUnavailable, "SETTLEMENT_IDENTITY_UNAVAILABLE", "身份服务暂不可用")
@@ -2295,7 +2297,9 @@ func (a *API) readNotification(w http.ResponseWriter, r *http.Request) {
 func (a *API) user(w http.ResponseWriter, r *http.Request, permission string) (service.Principal, bool) {
 	p, err := a.principal(r)
 	if err != nil {
-		if errors.Is(err, platform.ErrUnauthenticated) {
+		if errors.Is(err, service.ErrForbidden) {
+			fail(w, http.StatusForbidden, "SETTLEMENT_FORBIDDEN", "当前身份没有结算系统授权")
+		} else if errors.Is(err, platform.ErrUnauthenticated) {
 			fail(w, http.StatusUnauthorized, "SETTLEMENT_UNAUTHENTICATED", "登录已失效，请重新登录")
 		} else {
 			fail(w, http.StatusServiceUnavailable, "SETTLEMENT_IDENTITY_UNAVAILABLE", "身份服务暂不可用")

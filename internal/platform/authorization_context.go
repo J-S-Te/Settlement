@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/j-s-te/settlement/authz"
+	"github.com/j-s-te/settlement/internal/authorizationrefresh"
+	"github.com/j-s-te/settlement/internal/service"
 )
 
 // authorizationContext 是基础平台依据 访问令牌 返回的、结算系统专属授权上下文。
@@ -79,38 +81,37 @@ func settlementCatalogValuePresent(values []string, expected string) bool {
 	return found
 }
 
-// resolveAuthorization 从基础平台读取并校验当前应用的授权快照。
-//
-//	resolveAuthorization 调用基础平台授权上下文接口，验证令牌对应的应用、环境和权限。
-//	非 200 响应、响应体过大或字段不符合契约时均返回错误，不使用请求头权限信息兜底。
-//
-// 参数：ctx为调用上下文与取消边界。
-//
-//	token为待验证的服务器端令牌。
-//
-// 返回值：与该调用匹配的核验或持久化结果；失败保留原有错误语义。
+// resolveAuthorization 在线读取当前应用授权并传播页面新鲜读取要求。
+// 参数：ctx 为请求上下文，token 为服务端持有的访问令牌。
+// 返回值：当前授权快照或认证、授权、依赖分类错误。
 func (a *Authenticator) resolveAuthorization(ctx context.Context, token string) (authorizationContext, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.cfg.PlatformBaseURL, "/")+"/oauth2/authorization-context", nil)
 	if err != nil {
-		return authorizationContext{}, err
+		return authorizationContext{}, fmt.Errorf("%w: %v", ErrSessionUnavailable, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	if authorizationrefresh.Forced(ctx) {
+		req.Header.Set(authorizationrefresh.Header, "1")
+	}
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return authorizationContext{}, err
+		return authorizationContext{}, fmt.Errorf("%w: %v", ErrSessionUnavailable, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if resp.StatusCode == http.StatusUnauthorized {
 			return authorizationContext{}, ErrUnauthenticated
 		}
-		return authorizationContext{}, fmt.Errorf("authorization HTTP %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusForbidden {
+			return authorizationContext{}, service.ErrForbidden
+		}
+		return authorizationContext{}, fmt.Errorf("%w: HTTP %d", ErrSessionUnavailable, resp.StatusCode)
 	}
 	var value authorizationContext
 	decoder := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&value); err != nil {
-		return authorizationContext{}, err
+		return authorizationContext{}, fmt.Errorf("%w: %v", ErrSessionUnavailable, err)
 	}
 	return value, nil
 }

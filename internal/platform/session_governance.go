@@ -179,6 +179,9 @@ func (a *Authenticator) rotateCentralSession(ctx context.Context, hash []byte) e
 // 参数：ctx为请求，tx为持锁事务，hash为当前Cookie摘要，cause为刷新或中央校验错误。
 // 返回值：空主体及准确错误；撤销写回失败保持依赖不可用。
 func (a *Authenticator) centralFailure(ctx context.Context, tx *sql.Tx, hash []byte, cause error) (service.Principal, error) {
+	if errors.Is(cause, service.ErrForbidden) {
+		return service.Principal{}, service.ErrForbidden
+	}
 	if !errors.Is(cause, ErrUnauthenticated) {
 		return service.Principal{}, ErrSessionUnavailable
 	}
