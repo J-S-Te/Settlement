@@ -153,6 +153,13 @@ func (s *Service) ApproveReceiptDifference(ctx context.Context, p Principal, id 
 	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_DIFFERENCE_APPROVED", "receipt_difference", id, map[string]any{"actor_id": p.UserID, "resolution": resolution}); err != nil {
 		return err
 	}
+	if err = enqueueApprovalResult(ctx, tx, p.TenantID, approvalResultNotice{
+		recipient: applicant, eventType: "SETTLEMENT_DIFFERENCE_APPROVED",
+		subject: "回款差异处置", approved: true, referenceType: "receipt_difference",
+		referenceID: id, targetURL: "/settlement/finance",
+	}); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 

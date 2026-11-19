@@ -113,12 +113,24 @@ func nativeInvoiceApproval(t *testing.T, ctx context.Context, s *Service, baseli
 	if attempt, err := s.ApproveInvoiceRequest(ctx, reviewer, request, 1); err != nil || attempt != "" {
 		t.Fatalf("first approval skipped director: %q %v", attempt, err)
 	}
+	if _, err := s.ReviewSpecialInvoice(ctx, director, request, 2, false, "试验加签驳回"); err != nil {
+		t.Fatal(err)
+	}
+	assertNativeInvoiceResultNotice(t, ctx, s, applicant, request, "开票申请已驳回")
+	request, err = s.CreateInvoiceRequest(ctx, applicant, "native-invoice-request-retry", input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt, err := s.ApproveInvoiceRequest(ctx, reviewer, request, 1); err != nil || attempt != "" {
+		t.Fatalf("first approval skipped director: %q %v", attempt, err)
+	}
 	if _, err := s.ReviewSpecialInvoice(ctx, reviewer, request, 2, true, ""); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("reviewer acquired director capability: %v", err)
 	}
 	if attempt, err := s.ReviewSpecialInvoice(ctx, director, request, 2, true, ""); err != nil || attempt == "" {
 		t.Fatalf("director approval failed: %q %v", attempt, err)
 	}
+	assertNativeInvoiceResultNotice(t, ctx, s, applicant, request, "开票申请已通过")
 	invoice, err := s.RegisterManualInvoice(ctx, applicant, request, ManualInvoiceInput{
 		InvoiceCode: "QA-NATIVE", InvoiceNo: "QA-001", IssueDate: "2026-11-04",
 		SellerProfile: map[string]any{"name": "QA人工票据登记方"}})
@@ -126,6 +138,33 @@ func nativeInvoiceApproval(t *testing.T, ctx context.Context, s *Service, baseli
 		t.Fatal(err)
 	}
 	return invoice
+}
+
+// assertNativeInvoiceResultNotice 核对平台通知的唯一收件人、内容和安全深链。
+// 参数：t、ctx 为测试上下文，s 为隔离服务，applicant、request、title 为预期终决数据。
+// 返回值：无；重复通知或错误事件载荷会让测试失败。
+func assertNativeInvoiceResultNotice(t *testing.T, ctx context.Context, s *Service, applicant Principal, request, title string) {
+	t.Helper()
+	var count int
+	var eventID, payload, state string
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(event_id),''),
+COALESCE(MAX(CAST(payload_json AS CHAR)),''),COALESCE(MAX(status),'') FROM settlement_outbox_event
+WHERE tenant_id=? AND destination='PLATFORM_NOTIFICATION' AND aggregate_id=?`,
+		applicant.TenantID, request).Scan(&count, &eventID, &payload, &state)
+	if err != nil || count != 1 || state != "PENDING" || len(eventID) != 32 || eventID[0] != 'N' {
+		t.Fatalf("审批结果通知数量或主键错误: count=%d state=%q event=%q err=%v", count, state, eventID, err)
+	}
+	var notice struct {
+		EventID    string   `json:"event_id"`
+		Title      string   `json:"title"`
+		Target     string   `json:"target_url"`
+		Recipients []string `json:"recipient_user_ids"`
+	}
+	if err := json.Unmarshal([]byte(payload), &notice); err != nil || notice.EventID != eventID ||
+		notice.Title != title || notice.Target != "/settlement/invoices?request_id="+request ||
+		len(notice.Recipients) != 1 || notice.Recipients[0] != applicant.UserID {
+		t.Fatalf("审批结果通知载荷错误: %+v %v", notice, err)
+	}
 }
 
 // nativeInvoicePDF 构造结构完整的单页合成PDF，不引用真实业务票据。

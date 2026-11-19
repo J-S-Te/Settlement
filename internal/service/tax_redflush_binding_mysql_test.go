@@ -41,6 +41,14 @@ func seedRedFlushBinding(t *testing.T, db *sql.DB, tenant string) (string, strin
 	if err = svc.ReviewInvoiceRedFlush(t.Context(), Principal{TenantID: tenant, UserID: "reviewer"}, id, true, InvoiceRedFlushReviewInput{Version: 1}); err != nil {
 		t.Fatal(err)
 	}
+	var count int
+	err = db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM settlement_outbox_event
+WHERE tenant_id=? AND destination='PLATFORM_NOTIFICATION' AND aggregate_id=? AND
+event_type='SETTLEMENT_INVOICE_RED_FLUSH_APPROVED' AND
+JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.recipient_user_ids[0]'))='applicant'`, tenant, id).Scan(&count)
+	if err != nil || count != 1 {
+		t.Fatalf("红冲结果通知=%d，错误=%v", count, err)
+	}
 	var attempt string
 	if err = db.QueryRow(`SELECT id FROM settlement_invoice_red_flush_attempt WHERE red_flush_request_id=?`, id).Scan(&attempt); err != nil {
 		t.Fatal(err)

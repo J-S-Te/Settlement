@@ -222,6 +222,7 @@ func TestRejectInvoiceRequestKeepsUnversionedPrincipalBehaviour(t *testing.T) {
 		scriptdb.Step{Kind: "exec", SQL: "UPDATE settlement_invoice_request_allocation SET released_amount"},
 		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_outbox_event"},
 		scriptdb.Step{Kind: "exec", SQL: "INSERT INTO settlement_audit_event"},
+		scriptdb.Step{Kind: "exec", SQL: "'PLATFORM_NOTIFICATION'"},
 		scriptdb.Step{Kind: "commit"},
 	)
 	if err := (&Service{DB: db}).RejectInvoiceRequest(t.Context(), Principal{TenantID: "tenant", UserID: "reviewer"}, "request-1", 1, "资料不全"); err != nil {
