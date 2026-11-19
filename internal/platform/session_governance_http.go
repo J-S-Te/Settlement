@@ -9,6 +9,7 @@ import (
 	"time"
 
 	provider "github.com/coreos/go-oidc/v3/oidc"
+	"github.com/j-s-te/settlement/internal/service"
 	"golang.org/x/oauth2"
 )
 
@@ -100,7 +101,9 @@ func (a *Authenticator) lifecycle(w http.ResponseWriter, r *http.Request, intera
 	}
 	if _, err := a.Authenticate(r.Context(), r); err != nil {
 		status := 503
-		if errors.Is(err, ErrUnauthenticated) {
+		if errors.Is(err, service.ErrForbidden) {
+			status = 403
+		} else if errors.Is(err, ErrUnauthenticated) {
 			status = 401
 		}
 		http.Error(w, "session unavailable", status)
@@ -119,7 +122,9 @@ func (a *Authenticator) lifecycle(w http.ResponseWriter, r *http.Request, intera
 	state, err := a.readCentral(r.Context(), row, interact)
 	if err != nil {
 		status := 503
-		if errors.Is(err, ErrUnauthenticated) {
+		if errors.Is(err, service.ErrForbidden) {
+			status = 403
+		} else if errors.Is(err, ErrUnauthenticated) {
 			status = 401
 		}
 		http.Error(w, "session unavailable", status)
