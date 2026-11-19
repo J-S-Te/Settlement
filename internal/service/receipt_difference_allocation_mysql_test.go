@@ -193,6 +193,13 @@ func TestMySQLReceiptDifferenceApprovalKeepsBoundaries(t *testing.T) {
 			if err := svc.ApproveReceiptDifference(t.Context(), approver, id, 2); !errors.Is(err, ErrConflict) {
 				t.Fatalf("重复审批: %v", err)
 			}
+			var notifications int
+			if err := db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM settlement_outbox_event
+WHERE tenant_id=? AND aggregate_id=? AND destination='PLATFORM_NOTIFICATION' AND
+JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.recipient_user_ids[0]'))=?`,
+				p.TenantID, id, p.UserID).Scan(&notifications); err != nil || notifications != 1 {
+				t.Fatalf("差异处置结果通知=%d，错误=%v", notifications, err)
+			}
 			assertDifferenceReceipt(t, db, p.TenantID, receipt, c.balance, "AVAILABLE", c.version)
 			var state string
 			var version int

@@ -8,6 +8,9 @@ import (
 	"strings"
 )
 
+// ReviewInvoiceRedFlush 由独立财务审批人终审红冲申请，并通知申请人。
+// 参数：ctx 为请求上下文，p 为审批人，id 为红冲申请，approve 为决定，in 包含版本和意见。
+// 返回值：权限、状态、持久化或投递记录错误，成功时为 nil。
 func (s *Service) ReviewInvoiceRedFlush(ctx context.Context, p Principal, id string, approve bool, in InvoiceRedFlushReviewInput) error {
 	if in.Version < 1 {
 		return fmt.Errorf("%w: version is required", ErrInvalid)
@@ -82,6 +85,21 @@ func (s *Service) ReviewInvoiceRedFlush(ctx context.Context, p Principal, id str
 		if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_INVOICE_RED_FLUSH_REJECTED", "invoice_red_flush_request", id, map[string]any{"actor_id": p.UserID, "invoice_id": invoiceID, "reason": reason, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
 			return err
 		}
+	}
+	var requestID string
+	if err = tx.QueryRowContext(ctx, `SELECT invoice_request_id FROM settlement_tax_invoice
+WHERE tenant_id=? AND id=?`, p.TenantID, invoiceID).Scan(&requestID); err != nil {
+		return err
+	}
+	eventType := "SETTLEMENT_INVOICE_RED_FLUSH_REJECTED"
+	if approve {
+		eventType = "SETTLEMENT_INVOICE_RED_FLUSH_APPROVED"
+	}
+	if err = enqueueApprovalResult(ctx, tx, p.TenantID, approvalResultNotice{
+		recipient: requestedBy, eventType: eventType, subject: "红冲申请", approved: approve,
+		referenceType: "invoice_red_flush_request", referenceID: id, targetURL: invoiceResultURL(requestID),
+	}); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

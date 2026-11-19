@@ -43,13 +43,13 @@ func (s *Service) ApproveInvoiceRequest(ctx context.Context, p Principal, id str
 		}
 		return "", tx.Commit()
 	}
-	return s.createApprovedInvoiceAttempt(ctx, tx, p, id, version)
+	return s.createApprovedInvoiceAttempt(ctx, tx, p, id, applicant, version)
 }
 
 // 用途：创建已完成审批的执行任务，税控冲突保留明确公开拒绝。
-// 参数：ctx 上下文，tx 事务，p 审批主体，id 申请标识，version 当前版本。
+// 参数：ctx 上下文，tx 审批事务，p 审批人，id 申请标识，applicant 申请人，version 当前版本。
 // 返回值：执行任务标识或错误；成功提交事务。
-func (s *Service) createApprovedInvoiceAttempt(ctx context.Context, tx *sql.Tx, p Principal, id string, version int) (string, error) {
+func (s *Service) createApprovedInvoiceAttempt(ctx context.Context, tx *sql.Tx, p Principal, id, applicant string, version int) (string, error) {
 	var err error
 	// 与较早明确失败矛盾的迟到成功必须
 	// 对账，不能随后重新尝试开具。
@@ -97,6 +97,9 @@ func (s *Service) createApprovedInvoiceAttempt(ctx context.Context, tx *sql.Tx, 
 	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_INVOICE_APPROVED", "invoice_request", id, map[string]any{"actor_id": p.UserID, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
 		return "", err
 	}
+	if err = enqueueInvoiceApprovalOutcome(ctx, tx, p.TenantID, id, applicant, true); err != nil {
+		return "", err
+	}
 	return attempt, tx.Commit()
 }
 
@@ -135,6 +138,9 @@ func (s *Service) RejectInvoiceRequest(ctx context.Context, p Principal, id stri
 		return err
 	}
 	if err = outbox(ctx, tx, p.TenantID, "PLATFORM_AUDIT", "SETTLEMENT_INVOICE_REJECTED", "invoice_request", id, map[string]any{"actor_id": p.UserID, "reason": reason, "result": "SUCCESS", "risk_level": "HIGH"}); err != nil {
+		return err
+	}
+	if err = enqueueInvoiceApprovalOutcome(ctx, tx, p.TenantID, id, applicant, false); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -197,12 +203,15 @@ func (s *Service) ReviewSpecialInvoice(ctx context.Context, p Principal, id stri
 		return "", err
 	}
 	if approve {
-		return s.createApprovedInvoiceAttempt(ctx, tx, p, id, version)
+		return s.createApprovedInvoiceAttempt(ctx, tx, p, id, applicant, version)
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_request SET status='REJECTED',rejection_reason=?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND tenant_id=?`, reason, id, p.TenantID); err != nil {
 		return "", err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE settlement_invoice_request_allocation SET released_amount=reserved_amount,status='RELEASED' WHERE tenant_id=? AND invoice_request_id=? AND status='RESERVED'`, p.TenantID, id); err != nil {
+		return "", err
+	}
+	if err = enqueueInvoiceApprovalOutcome(ctx, tx, p.TenantID, id, applicant, false); err != nil {
 		return "", err
 	}
 	return "", tx.Commit()
