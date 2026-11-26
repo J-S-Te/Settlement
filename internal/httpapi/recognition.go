@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -78,7 +79,7 @@ func (a *API) serveRecognitions(w http.ResponseWriter, r *http.Request) bool {
 		if e != nil {
 			recognitionError(w, e)
 		} else {
-			write(w, 200, row)
+			write(w, 200, a.recognitionApplicantResponses(r.Context(), p, []service.Recognition{row})[0])
 		}
 		return true
 	}
@@ -115,7 +116,7 @@ func (a *API) recognitionCollection(w http.ResponseWriter, r *http.Request, p se
 			recognitionError(w, e)
 			return
 		}
-		write(w, 200, map[string]any{"items": items, "limit": limit, "offset": offset, "reimbursement_configured": a.service.ReimbursementCosts != nil, "source_environment": a.service.RecognitionEnvironment, "basis": "本系统已登记财务确认；付款/预付不自动生成成本，历史未登记不代表零"})
+		write(w, 200, map[string]any{"items": a.recognitionApplicantResponses(r.Context(), p, items), "limit": limit, "offset": offset, "reimbursement_configured": a.service.ReimbursementCosts != nil, "source_environment": a.service.RecognitionEnvironment, "basis": "本系统已登记财务确认；付款/预付不自动生成成本，历史未登记不代表零"})
 	case "POST":
 		var in service.RecognitionInput
 		if !decode(w, r, &in) {
@@ -216,4 +217,29 @@ func recognitionError(w http.ResponseWriter, err error) {
 		return
 	}
 	respondError(w, err)
+}
+
+// recognitionApplicantResponse 为只读 API 投影附加已核验姓名。
+type recognitionApplicantResponse struct {
+	service.Recognition
+	ApplicantName string `json:"applicant_name,omitempty"`
+}
+
+// recognitionApplicantResponses 补齐已授权财务记录的申请人姓名。
+// 参数：ctx 为请求上下文，p 为当前主体，items 为服务端已完成组织范围过滤的记录。
+// 返回值：完整原记录及可获取的申请人姓名；保留提交人与草稿创建人的区分。
+func (a *API) recognitionApplicantResponses(ctx context.Context, p service.Principal, items []service.Recognition) []recognitionApplicantResponse {
+	ids := make([]string, len(items))
+	for index, item := range items {
+		ids[index] = item.SubmittedBy
+		if ids[index] == "" {
+			ids[index] = item.CreatedBy
+		}
+	}
+	names := a.approvalApplicantNames(ctx, p, ids)
+	result := make([]recognitionApplicantResponse, len(items))
+	for index, item := range items {
+		result[index] = recognitionApplicantResponse{Recognition: item, ApplicantName: names[ids[index]]}
+	}
+	return result
 }

@@ -1509,6 +1509,7 @@ func (a *API) listInvoiceRequests(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err)
 		return
 	}
+	a.decorateApprovalApplicants(r.Context(), p, items, "submitted_by")
 	write(w, http.StatusOK, items)
 }
 
@@ -1750,7 +1751,9 @@ func (a *API) taxInvoiceDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	var redFlush any
 	if redErr == nil {
-		redFlush = map[string]any{"id": redFlushID, "status": redFlushStatus, "reason_detail": redFlushReason, "review_reason": redFlushReviewReason, "version": redFlushVersion, "can_review": redFlushStatus == "SUBMITTED" && redFlushRequestedBy != p.UserID && p.Allows("settlement.invoice.approve")}
+		item := map[string]any{"id": redFlushID, "status": redFlushStatus, "reason_detail": redFlushReason, "requested_by": redFlushRequestedBy, "review_reason": redFlushReviewReason, "version": redFlushVersion, "can_review": redFlushStatus == "SUBMITTED" && redFlushRequestedBy != p.UserID && p.Allows("settlement.invoice.approve")}
+		a.decorateApprovalApplicants(r.Context(), p, []map[string]any{item}, "requested_by")
+		redFlush = item
 	}
 	write(w, http.StatusOK, basis.decorate(map[string]any{"id": invoiceID, "invoice_request_id": requestID, "request_no": requestNo, "invoice_code": code, "invoice_no": number, "contract_no": contract, "buyer_name": buyerName, "buyer_tax_no_masked": maskTaxNo(buyerTaxNo), "seller_name": sellerName, "invoice_type": kind, "amount_excl_tax": excl, "tax_amount": tax, "amount_incl_tax": incl, "issue_date": issueDate, "status": status, "issued_by_channel": channel, "document_count": len(documents), "documents": documents, "red_flush_request": redFlush, "items": invoiceDetailLinePayloads(items), "items_source": itemsSource, "request_items": invoiceDetailLinePayloads(requestLines)}))
 }

@@ -121,6 +121,7 @@ func (a *API) roleDifferences(w http.ResponseWriter, r *http.Request) {
 			}
 			items, err = a.service.ListFinanceRecords(r.Context(), p, false, query)
 			if err == nil {
+				a.decorateApprovalApplicants(r.Context(), p, items, "requested_by")
 				write(w, http.StatusOK, map[string]any{"items": items})
 				return
 			}
