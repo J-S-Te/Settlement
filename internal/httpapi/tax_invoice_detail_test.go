@@ -268,3 +268,30 @@ func TestTaxInvoiceDetailPreservesFinancialBasis(t *testing.T) {
 		})
 	}
 }
+
+// TestTaxInvoiceDetailReturnsRedFlushApplicant 验证红冲详情公开既有申请人的身份和姓名。
+// 参数：t 为真实 HTTP 处理器与脚本数据库的测试上下文。
+// 返回值：无；申请人字段缺失或复核回避失效时失败。
+func TestTaxInvoiceDetailReturnsRedFlushApplicant(t *testing.T) {
+	header := taxDetailHeaderRow("invoice-a", "request-a", "REQ-1", "CODE", "NO", "ELECTRONIC_NORMAL",
+		"100.00", "6.00", "106.00", "ISSUED", "TAX_ADAPTER")
+	steps := taxDetailQueries(header, nil, nil)
+	steps[len(steps)-1].rows = [][]driver.Value{{"red-a", "SUBMITTED", "红冲原因", "dev-finance", "", int64(1)}}
+	response := requestTaxInvoiceDetail(t, "invoice-a", steps)
+	var body struct {
+		Data struct {
+			RedFlush struct {
+				RequestedBy   string `json:"requested_by"`
+				ApplicantName string `json:"applicant_name"`
+				CanReview     bool   `json:"can_review"`
+			} `json:"red_flush_request"`
+		} `json:"data"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil {
+		t.Fatalf("无法读取红冲详情：%d %s", response.Code, response.Body.String())
+	}
+	if applicant := body.Data.RedFlush; applicant.RequestedBy != "dev-finance" ||
+		applicant.ApplicantName != "本地结算管理员" || applicant.CanReview {
+		t.Fatalf("红冲申请人详情或本人回避错误：%+v", applicant)
+	}
+}
