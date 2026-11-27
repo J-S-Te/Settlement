@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/j-s-te/settlement/internal/authorizationrefresh"
 	"github.com/j-s-te/settlement/internal/config"
 	"github.com/j-s-te/settlement/internal/service"
 	central "github.com/j-s-te/settlement/internal/sessiongovernance"
@@ -294,10 +295,11 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/settlement/"+strings.TrimLeft(returnPath, "/"), http.StatusFound)
 }
 
-// Authenticate 用途：核验独立会话、令牌与当前授权，空闲期限统一使用数据库UTC时钟。
-// 参数：ctx 为请求上下文，r 为携带不透明会话Cookie的请求。
-// 返回值：返回可信业务主体；失效或校验失败返回认证错误。
+// Authenticate 校验本应用会话并在线读取当前授权。
+// 参数：ctx 为请求上下文，r 携带本应用 Cookie 和可选刷新标记。
+// 返回值：当前主体；认证、授权拒绝和依赖故障保留各自错误语义。
 func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (service.Principal, error) {
+	ctx = authorizationrefresh.FromRequest(ctx, r)
 	if a.central != nil {
 		return a.authenticateCentral(ctx, r)
 	}
@@ -315,8 +317,11 @@ func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (serv
   AND last_seen_at>DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ? MICROSECOND)`,
 		digest(cookie.Value), a.cfg.OIDCSessionIdleTTL.Microseconds(),
 	).Scan(&tenant, &identity, &principalJSON, &tokenCipher)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return service.Principal{}, ErrUnauthenticated
+	}
+	if err != nil {
+		return service.Principal{}, ErrSessionUnavailable
 	}
 	tokenJSON, err := a.decrypt(tokenCipher)
 	if err != nil {
@@ -328,6 +333,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (serv
 	}
 
 	authz, err := a.resolveAuthorization(ctx, token.AccessToken)
+	if err != nil {
+		return service.Principal{}, err
+	}
 	platformSubjectID, subjectErr := canonicalSubjectID(authz.SubjectID, authz.IdentityID)
 	compatibilityErr := validateSettlementCatalogCompatibility(authz)
 	if err != nil || subjectErr != nil || compatibilityErr != nil || authz.TenantID != tenant || platformSubjectID != identity || authz.ClientID != a.cfg.OIDCClientID || authz.ApplicationCode != "settlement" || authz.EnvironmentCode != a.cfg.OIDCEnvironmentCode {
@@ -338,7 +346,15 @@ func (a *Authenticator) Authenticate(ctx context.Context, r *http.Request) (serv
 		return service.Principal{}, ErrUnauthenticated
 	}
 	current := principal(authz, oidcClaims{IdentityID: identity, PersonID: stored.PersonID, Name: stored.DisplayName, PreferredUsername: stored.Username})
-	_, _ = a.db.ExecContext(ctx, `UPDATE settlement_oidc_session SET principal_json=?,authorization_revision=?,authorization_checked_at=UTC_TIMESTAMP(3),last_seen_at=UTC_TIMESTAMP(3) WHERE session_id_hash=?`, mustJSON(current), authz.AuthorizationRevision, digest(cookie.Value))
+	idleUpdate := ""
+	if !authorizationrefresh.Forced(ctx) {
+		// 旧模式以 last_seen_at 计算空闲期限，授权重读不等于用户交互。
+		idleUpdate = ",last_seen_at=UTC_TIMESTAMP(3)"
+	}
+	_, _ = a.db.ExecContext(ctx, `UPDATE settlement_oidc_session SET principal_json=?,`+
+		`authorization_revision=?,authorization_checked_at=UTC_TIMESTAMP(3)`+
+		idleUpdate+` WHERE session_id_hash=?`, mustJSON(current), authz.AuthorizationRevision,
+		digest(cookie.Value))
 	return current, nil
 }
 func (a *Authenticator) Logout(w http.ResponseWriter, r *http.Request) {
